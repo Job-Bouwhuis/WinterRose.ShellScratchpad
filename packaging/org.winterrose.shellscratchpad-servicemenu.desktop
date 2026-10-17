@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Service
+Name=Shell Scratchpad
+Comment=Open Shell Scratchpad in the selected directory
+MimeType=inode/directory;
+Actions=openShellScratchpad;
+Icon=shell-scratchpad
+
+[Desktop Action openShellScratchpad]
+Name=Open Shell Scratchpad
+Icon=shell-scratchpad
+Exec=shell-scratchpad --working-directory %f

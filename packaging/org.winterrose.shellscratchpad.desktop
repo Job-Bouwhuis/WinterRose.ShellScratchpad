@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Shell Scratchpad
+GenericName=Bash Script Scratchpad
+Comment=Run Bash scripts with interactive input and save executable scripts
+Exec=shell-scratchpad
+Icon=shell-scratchpad
+Terminal=false
+Categories=Development;Utility;
+Keywords=bash;shell;script;terminal;scratchpad;
