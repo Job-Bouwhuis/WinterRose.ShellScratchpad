@@ -22,6 +22,14 @@ add_executable(shell-scratchpad
     src/main.cpp
     src/editor/CodeEditor.h
     src/editor/CodeEditor.cpp
+    src/completion/CompletionController.h
+    src/completion/CompletionController.cpp
+    src/snippets/SnippetStore.h
+    src/snippets/SnippetStore.cpp
+    src/snippets/SnippetManagerDialog.h
+    src/snippets/SnippetManagerDialog.cpp
+    src/snippets/SnippetCreateDialog.h
+    src/snippets/SnippetCreateDialog.cpp
     src/syntax/SyntaxHighlighter.h
     src/syntax/SyntaxHighlighter.cpp
     src/syntax/SyntaxColorSettings.h

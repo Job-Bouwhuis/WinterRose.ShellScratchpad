@@ -110,6 +110,10 @@ void CodeEditor::changeEvent(QEvent *event)
 
 void CodeEditor::mousePressEvent(QMouseEvent *event)
 {
+    if (!snippetPointCursors.isEmpty()) {
+        snippetPointCursors.clear();
+        activeSnippetPoint = -1;
+    }
     if (event->button() == Qt::LeftButton) {
         for (auto it = collapsedBlocks.cbegin(); it != collapsedBlocks.cend(); ++it) {
             const QTextBlock opener = document()->findBlockByNumber(*it);
@@ -211,6 +215,28 @@ void CodeEditor::paintEvent(QPaintEvent *event)
 
 void CodeEditor::keyPressEvent(QKeyEvent *event)
 {
+    if (activeSnippetPoint >= 0 && !snippetPointCursors.isEmpty()) {
+        if (event->key() == Qt::Key_Escape) {
+            snippetPointCursors.clear();
+            activeSnippetPoint = -1;
+            event->accept();
+            return;
+        }
+        if ((event->key() == Qt::Key_Tab || event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) &&
+            event->modifiers() == Qt::NoModifier) {
+            ++activeSnippetPoint;
+            if (activeSnippetPoint < snippetPointCursors.size()) {
+                setTextCursor(snippetPointCursors.at(activeSnippetPoint));
+            } else {
+                snippetPointCursors.clear();
+                activeSnippetPoint = -1;
+                setTextCursor(snippetEndCursor);
+            }
+            event->accept();
+            return;
+        }
+    }
+
     if (virtualAfterFoldBlock < 0 || !foldRegions.contains(virtualAfterFoldBlock)) {
         QPlainTextEdit::keyPressEvent(event);
         return;
@@ -248,6 +274,41 @@ void CodeEditor::keyPressEvent(QKeyEvent *event)
     setCursorWidth(normalCursorWidth);
     setTextCursor(insertion);
     event->accept();
+}
+
+void CodeEditor::insertSnippet(const QString &source, const QVector<QPair<int, int>> &highlightPoints)
+{
+    snippetPointCursors.clear();
+    activeSnippetPoint = -1;
+    virtualAfterFoldBlock = -1;
+    setCursorWidth(normalCursorWidth);
+
+    QTextCursor insertion = textCursor();
+    const int START = insertion.selectionStart();
+    insertion.insertText(source);
+    const int END = START + source.size();
+    snippetEndCursor = QTextCursor(document());
+    snippetEndCursor.setPosition(END);
+
+    QVector<QPair<int, int>> orderedPoints = highlightPoints;
+    std::stable_sort(orderedPoints.begin(), orderedPoints.end(), [](const auto &left, const auto &right) {
+        return left.first < right.first;
+    });
+    for (const auto &point : orderedPoints) {
+        if (point.first < 0 || point.second < 0 || point.first + point.second > source.size())
+            continue;
+        QTextCursor selection(document());
+        selection.setPosition(START + point.first);
+        selection.setPosition(START + point.first + point.second, QTextCursor::KeepAnchor);
+        snippetPointCursors.append(selection);
+    }
+    if (snippetPointCursors.isEmpty()) {
+        setTextCursor(snippetEndCursor);
+        return;
+    }
+    activeSnippetPoint = 0;
+    setTextCursor(snippetPointCursors.first());
+    setFocus();
 }
 
 void CodeEditor::rebuildFoldRegions()

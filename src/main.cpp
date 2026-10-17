@@ -45,6 +45,7 @@
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QMimeData>
 #include <QPlainTextEdit>
 #include <QProcess>
 #include <QProcessEnvironment>
@@ -77,6 +78,10 @@
 #include "syntax/SyntaxDebugDialog.h"
 #include "syntax/SyntaxColorDialog.h"
 #include "editor/CodeEditor.h"
+#include "completion/CompletionController.h"
+#include "snippets/SnippetManagerDialog.h"
+#include "snippets/SnippetCreateDialog.h"
+#include "snippets/SnippetStore.h"
 
 #include <cerrno>
 #include <csignal>
@@ -515,6 +520,8 @@ public:
             if (index == 0) {
                 QSettings().setValue(QStringLiteral("runProfiles/active"), QString());
                 directoryEdit->setText(defaultWorkingDirectory);
+                if (!applyingScriptRunProfile)
+                    saveScriptRunProfile(QString());
                 return;
             }
             if (index < 0)
@@ -527,6 +534,8 @@ public:
                     if (!PATH.isEmpty())
                         directoryEdit->setText(PATH);
                     QSettings().setValue(QStringLiteral("runProfiles/active"), NAME);
+                    if (!applyingScriptRunProfile)
+                        saveScriptRunProfile(NAME);
                     break;
                 }
             }
@@ -547,11 +556,13 @@ public:
             QStringLiteral("#!/usr/bin/env bash\nset -euo pipefail\n\n# Paste or write your script here…"));
         scriptEdit->setTabChangesFocus(false);
         scriptEdit->setLineWrapMode(QPlainTextEdit::NoWrap);
+        scriptEdit->setContextMenuPolicy(Qt::CustomContextMenu);
         scriptEdit->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
         scriptEdit->setPlainText(QStringLiteral(
             "echo \"Hello, World!\"\n"));
         scriptEdit->document()->setModified(false);
         new ShellScratchpad::Syntax::SyntaxHighlighter(scriptEdit);
+        completionController = new ShellScratchpad::Completion::CompletionController(scriptEdit, scriptEdit);
         scriptLayout->addWidget(scriptHeading);
         scriptLayout->addWidget(scriptEdit, 1);
 
@@ -709,6 +720,48 @@ public:
         process.setProcessChannelMode(QProcess::MergedChannels);
         connect(&process, &QProcess::started, this, [this]() { closeRunHistoryWriteEnd(); });
         connect(runButton, &QPushButton::clicked, this, [this]() { runScript(); });
+        connect(scriptEdit, &QWidget::customContextMenuRequested, this, [this](const QPoint &position) {
+            const bool HAS_SELECTION = scriptEdit->textCursor().hasSelection();
+            QMenu contextMenu(scriptEdit);
+
+            QAction *paste = contextMenu.addAction(QStringLiteral("Paste"));
+            paste->setEnabled(QApplication::clipboard()->mimeData()->hasText());
+            connect(paste, &QAction::triggered, scriptEdit, &QPlainTextEdit::paste);
+
+            QAction *execute = contextMenu.addAction(QStringLiteral("Execute"));
+            connect(execute, &QAction::triggered, this, [this]() { runScript(); });
+
+            if (HAS_SELECTION) {
+                contextMenu.addSeparator();
+                QAction *executeSelection = contextMenu.addAction(QStringLiteral("Execute Selection"));
+                connect(executeSelection, &QAction::triggered, this, [this]() { runScript(true); });
+                QAction *copy = contextMenu.addAction(QStringLiteral("Copy"));
+                connect(copy, &QAction::triggered, scriptEdit, &QPlainTextEdit::copy);
+                QAction *createSnippet = contextMenu.addAction(QStringLiteral("Create Snippet"));
+                connect(createSnippet, &QAction::triggered, this, [this]() {
+                    QString code = scriptEdit->textCursor().selectedText();
+                    code.replace(QChar::ParagraphSeparator, QLatin1Char('\n'));
+                    ShellScratchpad::Snippets::SnippetCreateDialog dialog(code, this);
+                    if (dialog.exec() != QDialog::Accepted)
+                        return;
+                    if (completionController)
+                        completionController->refreshSnippets();
+                    statusBar()->showMessage(QStringLiteral("Snippet saved"), 3000);
+                });
+            }
+
+            contextMenu.addSeparator();
+            QAction *undo = contextMenu.addAction(QStringLiteral("Undo"));
+            undo->setEnabled(scriptEdit->document()->isUndoAvailable());
+            connect(undo, &QAction::triggered, scriptEdit, &QPlainTextEdit::undo);
+            QAction *redo = contextMenu.addAction(QStringLiteral("Redo"));
+            redo->setEnabled(scriptEdit->document()->isRedoAvailable());
+            connect(redo, &QAction::triggered, scriptEdit, &QPlainTextEdit::redo);
+            QAction *selectAll = contextMenu.addAction(QStringLiteral("Select All"));
+            connect(selectAll, &QAction::triggered, scriptEdit, &QPlainTextEdit::selectAll);
+
+            contextMenu.exec(scriptEdit->viewport()->mapToGlobal(position));
+        });
         connect(stopButton, &QPushButton::clicked, this, [this]() { stopScript(); });
         connect(outputFindEdit, &QLineEdit::textChanged, this, [this]() { refreshOutputView(); });
         scriptEdit->installEventFilter(this);
@@ -803,10 +856,11 @@ protected:
         if (watched == scriptEdit && event->type() == QEvent::KeyPress) {
             auto *keyEvent = static_cast<QKeyEvent *>(event);
             const Qt::KeyboardModifiers MODIFIERS = keyEvent->modifiers();
-            if ((keyEvent->key() == Qt::Key_Return || keyEvent->key() == Qt::Key_Enter) &&
-                MODIFIERS == Qt::ControlModifier) {
+            const bool IS_ENTER = keyEvent->key() == Qt::Key_Return || keyEvent->key() == Qt::Key_Enter;
+            if (IS_ENTER && (MODIFIERS == Qt::ControlModifier || MODIFIERS == Qt::ShiftModifier)) {
                 QTextCursor cursor = scriptEdit->textCursor();
-                cursor.movePosition(QTextCursor::StartOfBlock);
+                const bool INSERT_ABOVE = MODIFIERS == Qt::ControlModifier;
+                cursor.movePosition(INSERT_ABOVE ? QTextCursor::StartOfBlock : QTextCursor::EndOfBlock);
                 const QString CURRENT_LINE = cursor.block().text();
                 qsizetype indentationLength = 0;
                 while (indentationLength < CURRENT_LINE.size() &&
@@ -815,10 +869,15 @@ protected:
                     ++indentationLength;
                 const QString INDENTATION = CURRENT_LINE.left(indentationLength);
                 cursor.insertBlock();
-                const QTextBlock NEW_BLOCK = cursor.block().previous();
-                QTextCursor newLineCursor(NEW_BLOCK);
-                newLineCursor.insertText(INDENTATION);
-                scriptEdit->setTextCursor(newLineCursor);
+                if (INSERT_ABOVE) {
+                    const QTextBlock NEW_BLOCK = cursor.block().previous();
+                    QTextCursor newLineCursor(NEW_BLOCK);
+                    newLineCursor.insertText(INDENTATION);
+                    scriptEdit->setTextCursor(newLineCursor);
+                } else {
+                    cursor.insertText(INDENTATION);
+                    scriptEdit->setTextCursor(cursor);
+                }
                 return true;
             }
         }
@@ -870,6 +929,7 @@ private:
     QLabel *runDurationLabel = nullptr;
     QProcess process;
     QPointer<ShellScratchpad::Syntax::SyntaxDebugDialog> syntaxDebugDialog;
+    QPointer<ShellScratchpad::Completion::CompletionController> completionController;
     QPointer<QAction> showOutputAction;
     KeyChordDispatcher *keyChordDispatcher = nullptr;
     QTimer killTimer;
@@ -908,6 +968,7 @@ private:
     bool shellCheckCurrent = false;
     bool runAfterShellCheck = false;
     bool runSelectionAfterShellCheck = false;
+    bool applyingScriptRunProfile = false;
     int currentHistoryLineOffset = 0;
     QString latestDraftSnapshot;
     bool recoveryEnabled = false;
@@ -1059,6 +1120,14 @@ private:
         viewMenu->addAction(diagnosticsDock->toggleViewAction());
 
         QMenu *toolsMenu = menuBar()->addMenu(QStringLiteral("&Tools"));
+        QAction *snippetsAction = toolsMenu->addAction(QStringLiteral("Snippets…"));
+        connect(snippetsAction, &QAction::triggered, this, [this]() {
+            ShellScratchpad::Snippets::SnippetManagerDialog dialog(this);
+            dialog.exec();
+            if (completionController)
+                completionController->refreshSnippets();
+        });
+        toolsMenu->addSeparator();
         QAction *codeStyleAction = toolsMenu->addAction(QStringLiteral("Code Style…"));
         connect(codeStyleAction, &QAction::triggered, this, [this]() {
             ShellScratchpad::Syntax::SyntaxColorDialog dialog(this);
@@ -1073,8 +1142,11 @@ private:
             syntaxDebugDialog->activateWindow();
         });
         QAction *refreshCommandCacheAction = toolsMenu->addAction(QStringLiteral("Refresh Command Cache"));
-        refreshCommandCacheAction->setEnabled(false);
-        refreshCommandCacheAction->setToolTip(QStringLiteral("Command lookup caching has not been implemented yet."));
+        connect(refreshCommandCacheAction, &QAction::triggered, this, [this]() {
+            if (completionController)
+                completionController->refreshCommandCache();
+            statusBar()->showMessage(QStringLiteral("Command suggestions refreshed from PATH"), 3000);
+        });
         QAction *runHistoryAction = toolsMenu->addAction(QStringLiteral("Run History…"));
         connect(runHistoryAction, &QAction::triggered, this, [this]() { showRunHistory(); });
         QAction *outputBookmarksAction = toolsMenu->addAction(QStringLiteral("Output Bookmarks…"));
@@ -1161,6 +1233,7 @@ private:
             return false;
         clearOutput();
         currentScriptPath = QFileInfo(path).absoluteFilePath();
+        applyScriptRunProfile(currentScriptPath);
         scriptEdit->setPlainText(CONTENT);
         placeCaretAtEndOfFirstLine();
         scriptEdit->document()->setModified(false);
@@ -1620,6 +1693,8 @@ df -ih
         if (ANSWER != QMessageBox::Yes)
             return;
         currentScriptPath = draft.value(QStringLiteral("path")).toString();
+        if (!currentScriptPath.isEmpty())
+            applyScriptRunProfile(currentScriptPath);
         scriptEdit->setPlainText(CONTENT);
         scriptEdit->document()->setModified(true);
         updateWindowTitle();
@@ -1828,6 +1903,7 @@ df -ih
 
         statusBar()->showMessage(QStringLiteral("Saved executable script: %1").arg(path), 5000);
         currentScriptPath = QFileInfo(path).absoluteFilePath();
+        saveScriptRunProfile(runProfileCombo->currentIndex() > 0 ? runProfileCombo->currentText() : QString());
         scriptEdit->document()->setModified(false);
         recoveryTimer.stop();
         clearRecoveryDraft();
@@ -1880,6 +1956,79 @@ df -ih
     QJsonArray storedRunProfiles() const
     {
         return QJsonArray::fromVariantList(QSettings().value(QStringLiteral("runProfiles/items")).toList());
+    }
+
+    QString normalizedScriptPath(const QString &path) const
+    {
+        const QFileInfo INFO(path);
+        const QString CANONICAL = INFO.canonicalFilePath();
+        return QDir::cleanPath(CANONICAL.isEmpty() ? INFO.absoluteFilePath() : CANONICAL);
+    }
+
+    QString savedScriptRunProfile(const QString &path) const
+    {
+        if (path.isEmpty())
+            return QString();
+        const QString IDENTITY = normalizedScriptPath(path);
+        const QJsonArray OVERRIDES = QJsonArray::fromVariantList(
+            QSettings().value(QStringLiteral("runProfiles/scriptOverrides")).toList());
+        for (const QJsonValue &value : OVERRIDES) {
+            const QJsonObject ENTRY = value.toObject();
+            if (normalizedScriptPath(ENTRY.value(QStringLiteral("path")).toString()) == IDENTITY)
+                return ENTRY.value(QStringLiteral("profile")).toString();
+        }
+        return QString();
+    }
+
+    void saveScriptRunProfile(const QString &profileName)
+    {
+        if (currentScriptPath.isEmpty())
+            return;
+        const QString IDENTITY = normalizedScriptPath(currentScriptPath);
+        QJsonArray updated;
+        const QJsonArray existing = QJsonArray::fromVariantList(
+            QSettings().value(QStringLiteral("runProfiles/scriptOverrides")).toList());
+        for (const QJsonValue &value : existing) {
+            const QJsonObject ENTRY = value.toObject();
+            if (normalizedScriptPath(ENTRY.value(QStringLiteral("path")).toString()) != IDENTITY)
+                updated.append(value);
+        }
+        if (!profileName.isEmpty()) {
+            updated.append(QJsonObject{{QStringLiteral("path"), IDENTITY},
+                                       {QStringLiteral("profile"), profileName}});
+        }
+        QSettings().setValue(QStringLiteral("runProfiles/scriptOverrides"), updated.toVariantList());
+    }
+
+    void applyScriptRunProfile(const QString &path)
+    {
+        if (!runProfileCombo)
+            return;
+        const QString PROFILE_NAME = savedScriptRunProfile(path);
+        int index = PROFILE_NAME.isEmpty() ? 0 : runProfileCombo->findText(PROFILE_NAME, Qt::MatchFixedString);
+        if (index < 0) {
+            index = 0;
+            saveScriptRunProfile(QString());
+        }
+        applyingScriptRunProfile = true;
+        runProfileCombo->setCurrentIndex(index);
+        if (index == 0) {
+            directoryEdit->setText(defaultWorkingDirectory);
+            QSettings().setValue(QStringLiteral("runProfiles/active"), QString());
+        } else {
+            const QString NAME = runProfileCombo->itemText(index);
+            for (const QJsonValue &value : storedRunProfiles()) {
+                const QJsonObject PROFILE = value.toObject();
+                if (PROFILE.value(QStringLiteral("name")).toString() == NAME) {
+                    const QString DIRECTORY = PROFILE.value(QStringLiteral("directory")).toString();
+                    if (!DIRECTORY.isEmpty())
+                        directoryEdit->setText(DIRECTORY);
+                    QSettings().setValue(QStringLiteral("runProfiles/active"), NAME);
+                    break;
+                }
+            }
+        }
+        applyingScriptRunProfile = false;
     }
 
     QJsonObject selectedRunProfile() const
@@ -2670,8 +2819,8 @@ int main(int argc, char *argv[])
 {
     QApplication application(argc, argv);
     QGuiApplication::setDesktopFileName(QStringLiteral("org.winterrose.shellscratchpad"));
-    QCoreApplication::setApplicationName(QStringLiteral("Shell Scratchpad"));
     QCoreApplication::setOrganizationName(QStringLiteral("WinterRose"));
+    QCoreApplication::setApplicationName(QStringLiteral("ShellScratchpad"));
     QCoreApplication::setApplicationVersion(QStringLiteral("2.0.0-dev.1"));
     application.setWindowIcon(QIcon::fromTheme(QStringLiteral("shell-scratchpad")));
 

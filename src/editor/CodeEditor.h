@@ -2,7 +2,10 @@
 
 #include <QPlainTextEdit>
 #include <QMap>
+#include <QPair>
 #include <QSet>
+#include <QTextCursor>
+#include <QVector>
 
 class QWidget;
 class QMouseEvent;
@@ -21,6 +24,7 @@ public:
     void handleGutterClick(int y);
     void collapseAllSections();
     void expandAllSections();
+    void insertSnippet(const QString &source, const QVector<QPair<int, int>> &highlightPoints);
 
 protected:
     void resizeEvent(QResizeEvent *event) override;
@@ -43,5 +47,8 @@ private:
     int selectedFoldBlock = -1;
     int virtualAfterFoldBlock = -1;
     int normalCursorWidth = 1;
+    QVector<QTextCursor> snippetPointCursors;
+    QTextCursor snippetEndCursor;
+    int activeSnippetPoint = -1;
 };
 }
