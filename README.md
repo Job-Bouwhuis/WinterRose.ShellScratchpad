@@ -52,7 +52,7 @@ cmake --build build -j"$(nproc)"
 
 The main Bash editor now applies syntax colors while you type. Its background is dark gray; the rest of the app continues to follow the KDE theme. The **Tools → Syntax Debugger…** window remains available for inspecting tokenizer tokens.
 
-The menu bar provides File, Edit, Script, View, Tools, Window, and Help menus. It includes script file actions, standard editing and find commands, run/stop actions, output/layout/zoom controls, multiple-window navigation, keyboard shortcuts, and About information. Code Style is present but not connected yet; command-cache refresh is disabled until command lookup caching is implemented. Ctrl+S is intentionally unbound.
+The menu bar provides File, Edit, Script, View, Tools, Window, and Help menus. It includes script file actions, standard editing and find commands, run/stop actions, output/layout/zoom controls, multiple-window navigation, keyboard shortcuts, and About information. **Tools → Code Style…** opens syntax color preferences; changes are saved in `config/syntax-colors.ini` next to the executable and apply immediately to open editors. Ctrl+S is intentionally unbound.
 
 The tokenizer recognizes comments, string delimiters/content, variable and special-parameter expansions, escapes, command/arithmetic substitution starts, shell operators/redirections, and context-classified words such as commands, builtins, keywords, assignments, options, paths, and arguments. Command classification is heuristic: it does not yet resolve executables from PATH, understand aliases or functions, or parse all Bash grammar. Token analysis runs synchronously for now.
 

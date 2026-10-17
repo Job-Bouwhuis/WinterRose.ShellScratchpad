@@ -22,6 +22,10 @@ add_executable(shell-scratchpad
     src/main.cpp
     src/syntax/SyntaxHighlighter.h
     src/syntax/SyntaxHighlighter.cpp
+    src/syntax/SyntaxColorSettings.h
+    src/syntax/SyntaxColorSettings.cpp
+    src/syntax/SyntaxColorDialog.h
+    src/syntax/SyntaxColorDialog.cpp
     src/syntax/SyntaxDebugDialog.h
     src/syntax/SyntaxDebugDialog.cpp
 )

@@ -44,6 +44,7 @@
 
 #include "syntax/SyntaxHighlighter.h"
 #include "syntax/SyntaxDebugDialog.h"
+#include "syntax/SyntaxColorDialog.h"
 
 #include <cerrno>
 #include <csignal>
@@ -555,7 +556,7 @@ private:
         undoAction->setShortcut(QKeySequence::Undo);
         connect(undoAction, &QAction::triggered, scriptEdit, &QPlainTextEdit::undo);
         QAction *redoAction = editMenu->addAction(QStringLiteral("Redo"));
-        redoAction->setShortcut(QKeySequence::Redo);
+        redoAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+Y")));
         connect(redoAction, &QAction::triggered, scriptEdit, &QPlainTextEdit::redo);
         editMenu->addSeparator();
         QAction *cutAction = editMenu->addAction(QStringLiteral("Cut"));
@@ -621,7 +622,10 @@ private:
 
         QMenu *toolsMenu = menuBar()->addMenu(QStringLiteral("&Tools"));
         QAction *codeStyleAction = toolsMenu->addAction(QStringLiteral("Code Style…"));
-        codeStyleAction->setToolTip(QStringLiteral("Code style preferences are not implemented yet."));
+        connect(codeStyleAction, &QAction::triggered, this, [this]() {
+            ShellScratchpad::Syntax::SyntaxColorDialog dialog(this);
+            dialog.exec();
+        });
         QAction *debuggerAction = toolsMenu->addAction(QStringLiteral("Syntax Debugger…"));
         connect(debuggerAction, &QAction::triggered, this, [this]() {
             if (!syntaxDebugDialog)

@@ -1,6 +1,7 @@
 #include "SyntaxHighlighter.h"
 
 #include "SyntaxTokenizer.h"
+#include "SyntaxColorSettings.h"
 
 #include <QColor>
 #include <QPlainTextEdit>
@@ -15,29 +16,23 @@ namespace
 QTextCharFormat formatForToken(TokenKind kind)
 {
     QTextCharFormat format;
+    const QColor COLOR = SyntaxColorSettings::instance()->color(kind);
+    if (COLOR.isValid())
+        format.setForeground(COLOR);
     switch (kind) {
-    case TokenKind::Comment: format.setForeground(QColor(QStringLiteral("#8bc98b"))); break;
-    case TokenKind::StringDelimiter:
-    case TokenKind::StringContent: format.setForeground(QColor(QStringLiteral("#e6c07b"))); break;
-    case TokenKind::Variable: format.setForeground(QColor(QStringLiteral("#56c8c8"))); break;
-    case TokenKind::SpecialParameter: format.setForeground(QColor(QStringLiteral("#61afef"))); break;
-    case TokenKind::EscapeSequence: format.setForeground(QColor(QStringLiteral("#c678dd"))); break;
-    case TokenKind::Command: format.setForeground(QColor(QStringLiteral("#61afef"))); format.setFontWeight(QFont::DemiBold); break;
-    case TokenKind::Builtin: format.setForeground(QColor(QStringLiteral("#56b6c2"))); format.setFontWeight(QFont::DemiBold); break;
-    case TokenKind::Keyword: format.setForeground(QColor(QStringLiteral("#c678dd"))); format.setFontWeight(QFont::DemiBold); break;
-    case TokenKind::AssignmentName: format.setForeground(QColor(QStringLiteral("#e5c07b"))); break;
-    case TokenKind::Option: format.setForeground(QColor(QStringLiteral("#d19a66"))); break;
-    case TokenKind::Path: format.setForeground(QColor(QStringLiteral("#98c379"))); break;
-    case TokenKind::Redirection: format.setForeground(QColor(QStringLiteral("#e06c75"))); break;
-    case TokenKind::Operator: format.setForeground(QColor(QStringLiteral("#abb2bf"))); break;
-    case TokenKind::Number: format.setForeground(QColor(QStringLiteral("#d19a66"))); break;
+    case TokenKind::Command:
+    case TokenKind::Builtin:
+    case TokenKind::Keyword:
+        format.setFontWeight(QFont::DemiBold);
+        break;
     case TokenKind::CommandSubstitutionStart:
     case TokenKind::ArithmeticExpansionStart:
     case TokenKind::BacktickCommandSubstitutionDelimiter:
-        format.setForeground(QColor(QStringLiteral("#c678dd")));
         break;
     case TokenKind::Argument:
     case TokenKind::Word:
+        break;
+    default:
         break;
     }
     return format;
@@ -49,6 +44,8 @@ SyntaxHighlighter::SyntaxHighlighter(QPlainTextEdit *editor)
 {
     tokens = SyntaxTokenizer::tokenize(editor->toPlainText());
     setParent(editor);
+    connect(SyntaxColorSettings::instance(), &SyntaxColorSettings::colorsChanged,
+            this, &QSyntaxHighlighter::rehighlight);
     connect(editor, &QPlainTextEdit::textChanged, this, [this, editor]() {
         // Applying formats can emit another textChanged notification; ignore that nested signal.
         if (rehighlighting)
