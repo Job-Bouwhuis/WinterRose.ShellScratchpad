@@ -2,12 +2,18 @@
 
 #include <QCoreApplication>
 #include <QDir>
+#include <QFile>
+#include <QFileInfo>
 #include <QSettings>
+#include <QStandardPaths>
 
 namespace ShellScratchpad::Syntax
 {
 namespace
 {
+const QString HERE_DOC_BACKGROUND_KEY = QStringLiteral("hereDocBackground");
+const QColor DEFAULT_HERE_DOC_BACKGROUND(QStringLiteral("#353d4b"));
+
 QString colorKey(TokenKind kind)
 {
     return QString::number(static_cast<int>(kind));
@@ -35,7 +41,7 @@ QMap<int, QColor> SyntaxColorSettings::defaults()
         {static_cast<int>(TokenKind::AssignmentName), QColor(QStringLiteral("#e5c07b"))},
         {static_cast<int>(TokenKind::Option), QColor(QStringLiteral("#d19a66"))},
         {static_cast<int>(TokenKind::Path), QColor(QStringLiteral("#98c379"))},
-        {static_cast<int>(TokenKind::Argument), QColor()},
+        {static_cast<int>(TokenKind::Argument), QColor(QStringLiteral("#bf6466"))},
         {static_cast<int>(TokenKind::Word), QColor()}
     };
 }
@@ -47,11 +53,14 @@ SyntaxColorSettings *SyntaxColorSettings::instance()
 }
 
 SyntaxColorSettings::SyntaxColorSettings(QObject *parent)
-    : QObject(parent), colors(defaults())
+    : QObject(parent), colors(defaults()), hereDocBackgroundColor(DEFAULT_HERE_DOC_BACKGROUND)
 {
-    const QString CONFIG_DIR = QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("config"));
-    QDir().mkpath(CONFIG_DIR);
-    QSettings settings(QDir(CONFIG_DIR).filePath(QStringLiteral("syntax-colors.ini")), QSettings::IniFormat);
+    const QString SETTINGS_PATH = settingsFilePath();
+    QSettings settings(SETTINGS_PATH, QSettings::IniFormat);
+    const QColor SAVED_HERE_DOC_BACKGROUND(settings.value(HERE_DOC_BACKGROUND_KEY,
+                                                           DEFAULT_HERE_DOC_BACKGROUND.name()).toString());
+    if (SAVED_HERE_DOC_BACKGROUND.isValid())
+        hereDocBackgroundColor = SAVED_HERE_DOC_BACKGROUND;
     for (auto it = colors.begin(); it != colors.end(); ++it) {
         const QString VALUE = settings.value(colorKey(static_cast<TokenKind>(it.key())), it.value().name()).toString();
         const QColor COLOR(VALUE);
@@ -67,6 +76,11 @@ QColor SyntaxColorSettings::color(TokenKind kind) const
     return colors.value(static_cast<int>(kind));
 }
 
+QColor SyntaxColorSettings::hereDocBackground() const
+{
+    return hereDocBackgroundColor;
+}
+
 void SyntaxColorSettings::setColor(TokenKind kind, const QColor &colorValue)
 {
     if (!colorValue.isValid())
@@ -76,18 +90,27 @@ void SyntaxColorSettings::setColor(TokenKind kind, const QColor &colorValue)
     emit colorsChanged();
 }
 
+void SyntaxColorSettings::setHereDocBackground(const QColor &colorValue)
+{
+    if (!colorValue.isValid())
+        return;
+    hereDocBackgroundColor = colorValue;
+    save();
+    emit colorsChanged();
+}
+
 void SyntaxColorSettings::restoreDefaults()
 {
     colors = defaults();
+    hereDocBackgroundColor = DEFAULT_HERE_DOC_BACKGROUND;
     save();
     emit colorsChanged();
 }
 
 void SyntaxColorSettings::save()
 {
-    const QString CONFIG_DIR = QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("config"));
-    QDir().mkpath(CONFIG_DIR);
-    QSettings settings(QDir(CONFIG_DIR).filePath(QStringLiteral("syntax-colors.ini")), QSettings::IniFormat);
+    QSettings settings(settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(HERE_DOC_BACKGROUND_KEY, hereDocBackgroundColor.name());
     for (auto it = colors.cbegin(); it != colors.cend(); ++it) {
         if (it.value().isValid())
             settings.setValue(colorKey(static_cast<TokenKind>(it.key())), it.value().name());
@@ -95,5 +118,17 @@ void SyntaxColorSettings::save()
             settings.remove(colorKey(static_cast<TokenKind>(it.key())));
     }
     settings.sync();
+}
+
+QString SyntaxColorSettings::settingsFilePath()
+{
+    const QString CONFIG_DIR = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+    QDir().mkpath(CONFIG_DIR);
+    const QString NEW_PATH = QDir(CONFIG_DIR).filePath(QStringLiteral("syntax-colors.ini"));
+    const QString OLD_PATH = QDir(QCoreApplication::applicationDirPath())
+                                 .filePath(QStringLiteral("config/syntax-colors.ini"));
+    if (!QFileInfo::exists(NEW_PATH) && QFileInfo::exists(OLD_PATH))
+        QFile::copy(OLD_PATH, NEW_PATH);
+    return NEW_PATH;
 }
 }

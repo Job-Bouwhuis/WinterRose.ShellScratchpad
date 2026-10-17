@@ -20,6 +20,8 @@ target_compile_options(shell-scratchpad-syntax PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(shell-scratchpad
     src/main.cpp
+    src/editor/CodeEditor.h
+    src/editor/CodeEditor.cpp
     src/syntax/SyntaxHighlighter.h
     src/syntax/SyntaxHighlighter.cpp
     src/syntax/SyntaxColorSettings.h
@@ -50,4 +52,5 @@ install(FILES packaging/shell-scratchpad.svg
         DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps)
 
 install(FILES packaging/org.winterrose.shellscratchpad-servicemenu.desktop
+        packaging/org.winterrose.shellscratchpad-script-servicemenu.desktop
         DESTINATION ${CMAKE_INSTALL_DATADIR}/kio/servicemenus)

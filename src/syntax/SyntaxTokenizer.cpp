@@ -92,6 +92,105 @@ bool startsOperator(const QString &source, qsizetype offset, QString *matched = 
     return false;
 }
 
+bool parseHereDocDelimiter(const QString &source, qsizetype start, QString *delimiter)
+{
+    while (start < source.size() && (source.at(start) == QLatin1Char(' ') ||
+                                     source.at(start) == QLatin1Char('\t')))
+        ++start;
+    if (start >= source.size() || source.at(start) == QLatin1Char('\n'))
+        return false;
+
+    if (source.at(start) == QLatin1Char('\'') || source.at(start) == QLatin1Char('"')) {
+        const QChar QUOTE = source.at(start++);
+        while (start < source.size() && source.at(start) != QLatin1Char('\n')) {
+            if (source.at(start) == QUOTE)
+                return !delimiter->isEmpty();
+            if (source.at(start) == QLatin1Char('\\') && start + 1 < source.size() &&
+                source.at(start + 1) != QLatin1Char('\n'))
+                ++start;
+            delimiter->append(source.at(start++));
+        }
+        return false;
+    }
+
+    while (start < source.size()) {
+        const QChar CHARACTER = source.at(start);
+        if (CHARACTER.isSpace() || CHARACTER == QLatin1Char(';') || CHARACTER == QLatin1Char('|') ||
+            CHARACTER == QLatin1Char('&') || CHARACTER == QLatin1Char('<') || CHARACTER == QLatin1Char('>'))
+            break;
+        if (CHARACTER == QLatin1Char('\\') && start + 1 < source.size() &&
+            source.at(start + 1) != QLatin1Char('\n'))
+            ++start;
+        delimiter->append(source.at(start++));
+    }
+    return !delimiter->isEmpty();
+}
+
+QVector<SyntaxToken> findHereDocSpans(const QString &source,
+                                      const QVector<SyntaxToken> &tokens)
+{
+    QVector<SyntaxToken> spans;
+    qsizetype nextBodyOffset = 0;
+    for (const SyntaxToken &token : tokens) {
+        const bool IS_IN_HEREDOC_BODY = std::any_of(spans.cbegin(), spans.cend(), [&token](const SyntaxToken &span) {
+            return token.startOffset >= span.startOffset &&
+                   token.startOffset < span.startOffset + span.length;
+        });
+        if (token.kind != TokenKind::Redirection || IS_IN_HEREDOC_BODY)
+            continue;
+        const QString OPERATOR_TEXT = source.mid(token.startOffset, token.length);
+        if (OPERATOR_TEXT != QStringLiteral("<<") && OPERATOR_TEXT != QStringLiteral("<<-"))
+            continue;
+
+        QString delimiter;
+        bool stripTabs = OPERATOR_TEXT == QStringLiteral("<<-");
+        if (!parseHereDocDelimiter(source, token.startOffset + token.length, &delimiter))
+            continue;
+
+        const qsizetype lineEnd = source.indexOf(QLatin1Char('\n'), token.startOffset);
+        qsizetype bodyStart = lineEnd < 0 ? source.size() : lineEnd + 1;
+        bodyStart = qMax(bodyStart, nextBodyOffset);
+        qsizetype lineStart = bodyStart;
+        qsizetype bodyEnd = source.size();
+        bool foundTerminator = false;
+        while (lineStart < source.size()) {
+            qsizetype currentLineEnd = source.indexOf(QLatin1Char('\n'), lineStart);
+            if (currentLineEnd < 0)
+                currentLineEnd = source.size();
+            QString currentLine = source.mid(lineStart, currentLineEnd - lineStart);
+            if (currentLine.endsWith(QLatin1Char('\r')))
+                currentLine.chop(1);
+            if (stripTabs) {
+                while (currentLine.startsWith(QLatin1Char('\t')))
+                    currentLine.remove(0, 1);
+            }
+            if (currentLine == delimiter) {
+                bodyEnd = currentLineEnd < source.size() ? currentLineEnd + 1 : currentLineEnd;
+                foundTerminator = true;
+                break;
+            }
+            lineStart = currentLineEnd < source.size() ? currentLineEnd + 1 : source.size();
+        }
+
+        if (bodyEnd > bodyStart) {
+            int line = 1;
+            int column = 1;
+            for (qsizetype index = 0; index < bodyStart; ++index) {
+                if (source.at(index) == QLatin1Char('\n')) {
+                    ++line;
+                    column = 1;
+                } else {
+                    ++column;
+                }
+            }
+            spans.append(SyntaxToken{bodyStart, bodyEnd - bodyStart, line, column,
+                                     TokenKind::HereDocContent});
+        }
+        nextBodyOffset = foundTerminator ? bodyEnd : source.size();
+    }
+    return spans;
+}
+
 class Lexer final
 {
 public:
@@ -513,6 +612,10 @@ QVector<SyntaxToken> SyntaxTokenizer::tokenize(const QString &source)
         }
         result.append(classified);
     }
+    result += findHereDocSpans(source, LEXICAL_TOKENS);
+    std::stable_sort(result.begin(), result.end(), [](const SyntaxToken &left, const SyntaxToken &right) {
+        return left.startOffset < right.startOffset;
+    });
     return result;
 }
 
@@ -539,6 +642,7 @@ QString tokenKindName(TokenKind kind)
     case TokenKind::Option: return QStringLiteral("Option");
     case TokenKind::Path: return QStringLiteral("Path");
     case TokenKind::Argument: return QStringLiteral("Argument / value");
+    case TokenKind::HereDocContent: return QStringLiteral("Here-document content");
     }
     return QStringLiteral("Unknown");
 }

@@ -52,29 +52,29 @@ install_prerequisites() {
     case "${distro_id}" in
         fedora)
             say "Installing build prerequisites with DNF"
-            "${RUN_AS_ROOT[@]}" dnf install -y gcc-c++ cmake qt6-qtbase-devel
+            "${RUN_AS_ROOT[@]}" dnf install -y gcc-c++ cmake qt6-qtbase-devel ShellCheck
             ;;
         ubuntu|debian|linuxmint|pop)
             say "Installing build prerequisites with APT"
             "${RUN_AS_ROOT[@]}" apt-get update
-            "${RUN_AS_ROOT[@]}" apt-get install -y build-essential cmake qt6-base-dev
+            "${RUN_AS_ROOT[@]}" apt-get install -y build-essential cmake qt6-base-dev shellcheck
             ;;
         opensuse-tumbleweed|opensuse-leap|sles)
             say "Installing build prerequisites with Zypper"
-            "${RUN_AS_ROOT[@]}" zypper --non-interactive install gcc-c++ cmake qt6-base-devel
+            "${RUN_AS_ROOT[@]}" zypper --non-interactive install gcc-c++ cmake qt6-base-devel ShellCheck
             ;;
         arch|manjaro|endeavouros)
             say "Installing build prerequisites with Pacman"
-            "${RUN_AS_ROOT[@]}" pacman -S --needed --noconfirm base-devel cmake qt6-base
+            "${RUN_AS_ROOT[@]}" pacman -S --needed --noconfirm base-devel cmake qt6-base shellcheck
             ;;
         *)
             if [[ "${distro_like}" == *fedora* ]] && command -v dnf >/dev/null 2>&1; then
                 say "Installing build prerequisites with DNF"
-                "${RUN_AS_ROOT[@]}" dnf install -y gcc-c++ cmake qt6-qtbase-devel
+                "${RUN_AS_ROOT[@]}" dnf install -y gcc-c++ cmake qt6-qtbase-devel ShellCheck
             elif [[ "${distro_like}" == *debian* ]] && command -v apt-get >/dev/null 2>&1; then
                 say "Installing build prerequisites with APT"
                 "${RUN_AS_ROOT[@]}" apt-get update
-                "${RUN_AS_ROOT[@]}" apt-get install -y build-essential cmake qt6-base-dev
+                "${RUN_AS_ROOT[@]}" apt-get install -y build-essential cmake qt6-base-dev shellcheck
             else
                 fail "Unsupported distribution '${ID:-unknown}'. Install a C++ compiler, CMake, and Qt 6 Widgets development files, then run this script again after adapting the package-install section."
             fi
@@ -116,6 +116,7 @@ cmake --install "${BUILD_DIR}" --prefix "${INSTALL_PREFIX}"
 APP_EXECUTABLE="${INSTALL_PREFIX}/bin/shell-scratchpad"
 DESKTOP_FILE="${INSTALL_PREFIX}/share/applications/org.winterrose.shellscratchpad.desktop"
 SERVICE_MENU_FILE="${INSTALL_PREFIX}/share/kio/servicemenus/org.winterrose.shellscratchpad-servicemenu.desktop"
+SCRIPT_SERVICE_MENU_FILE="${INSTALL_PREFIX}/share/kio/servicemenus/org.winterrose.shellscratchpad-script-servicemenu.desktop"
 
 if [[ -x "${APP_EXECUTABLE}" && -f "${DESKTOP_FILE}" ]]; then
     # Desktop Entry files do not expand shell variables. Store the concrete path
@@ -126,11 +127,28 @@ if [[ -x "${APP_EXECUTABLE}" && -f "${DESKTOP_FILE}" ]]; then
             gsub(/\\/, "\\\\", exec_path)
             gsub(/"/, "\\\"", exec_path)
         }
-        /^Exec=/ { print "Exec=\"" exec_path "\""; next }
+        /^Exec=/ { print "Exec=\"" exec_path "\" %f"; next }
         { print }
     ' "${DESKTOP_FILE}" > "${DESKTOP_TEMP}"
     install -m 0644 "${DESKTOP_TEMP}" "${DESKTOP_FILE}"
     rm -f -- "${DESKTOP_TEMP}"
+fi
+
+if [[ -x "${APP_EXECUTABLE}" && -f "${SCRIPT_SERVICE_MENU_FILE}" ]]; then
+    SCRIPT_SERVICE_MENU_TEMP="$(mktemp)"
+    awk -v exec_path="${APP_EXECUTABLE}" '
+        BEGIN {
+            gsub(/\\/, "\\\\", exec_path)
+            gsub(/"/, "\\\"", exec_path)
+        }
+        /^Exec=shell-scratchpad %f$/ {
+            print "Exec=\"" exec_path "\" %f"
+            next
+        }
+        { print }
+    ' "${SCRIPT_SERVICE_MENU_FILE}" > "${SCRIPT_SERVICE_MENU_TEMP}"
+    install -m 0755 "${SCRIPT_SERVICE_MENU_TEMP}" "${SCRIPT_SERVICE_MENU_FILE}"
+    rm -f -- "${SCRIPT_SERVICE_MENU_TEMP}"
 fi
 
 if [[ -x "${APP_EXECUTABLE}" && -f "${SERVICE_MENU_FILE}" ]]; then
@@ -167,6 +185,7 @@ printf 'Run it now with: "%s"\n' "${APP_EXECUTABLE}"
 printf 'It should also appear in the KDE application launcher as: %s\n' "${APP_NAME}"
 printf 'Dolphin context menu: right-click a directory and choose "Open Shell Scratchpad".\n'
 printf 'The working directory will be pre-filled with the selected directory.\n'
+printf 'Dolphin script menu: right-click a .sh file and choose "Open in Shell Scratchpad".\n'
 printf '\nBuild directory: %s\n' "${BUILD_DIR}"
 printf 'Install prefix:  %s\n' "${INSTALL_PREFIX}"
 printf '\nNote: Shell scripts run with your normal user permissions. Review commands before running them.\n'

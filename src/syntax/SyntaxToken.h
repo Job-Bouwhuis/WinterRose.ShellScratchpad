@@ -26,7 +26,8 @@ enum class TokenKind
     AssignmentName,
     Option,
     Path,
-    Argument
+    Argument,
+    HereDocContent
 };
 
 struct SyntaxToken

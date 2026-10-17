@@ -3,6 +3,7 @@
 #include "SyntaxTokenizer.h"
 
 #include <QAbstractItemView>
+#include <QComboBox>
 #include <QFontDatabase>
 #include <QHeaderView>
 #include <QHBoxLayout>
@@ -35,6 +36,16 @@ SyntaxDebugDialog::SyntaxDebugDialog(QPlainTextEdit *sourceEditor, QWidget *pare
     auto *BUTTON_ROW = new QHBoxLayout();
     auto *LOAD_BUTTON = new QPushButton(QStringLiteral("Load current script"), this);
     BUTTON_ROW->addWidget(LOAD_BUTTON);
+    auto *EXAMPLES = new QComboBox(this);
+    EXAMPLES->addItem(QStringLiteral("Load tokenizer example…"));
+    EXAMPLES->addItem(QStringLiteral("Command, options, assignments and flow"),
+        QStringLiteral("#!/usr/bin/env bash\nset -euo pipefail\n\nBUILD_MODE=Release\nexport BUILD_MODE\n\nif [ -d \"$HOME/.cache\" ]; then\n    echo \"Cache directory exists\"\nfi\n\nsudo dnf install -y qt6-qtbase-devel && echo \"Done\"\n"));
+    EXAMPLES->addItem(QStringLiteral("Quotes, variables, comments and heredoc"),
+        QStringLiteral("MESSAGE=\"Hello, $USER\" # double-quoted expansion\nprintf '%s\\n' \"$MESSAGE\"\n\ncat <<EOF\nThis is a heredoc for $USER.\nEOF\n\n# A standalone comment\n"));
+    EXAMPLES->addItem(QStringLiteral("Pipelines and redirections"),
+        QStringLiteral("find /var/log -type f 2>/dev/null | grep -n \"error\" >> results.txt\nstatus=$?\n"));
+    BUTTON_ROW->addWidget(new QLabel(QStringLiteral("Examples"), this));
+    BUTTON_ROW->addWidget(EXAMPLES);
     BUTTON_ROW->addStretch(1);
     LAYOUT->addLayout(BUTTON_ROW);
 
@@ -67,6 +78,11 @@ SyntaxDebugDialog::SyntaxDebugDialog(QPlainTextEdit *sourceEditor, QWidget *pare
     connect(LOAD_BUTTON, &QPushButton::clicked, this, [this]() {
         if (this->sourceEditor)
             testEditor->setPlainText(this->sourceEditor->toPlainText());
+    });
+    connect(EXAMPLES, qOverload<int>(&QComboBox::currentIndexChanged), this, [this, EXAMPLES](int index) {
+        if (index > 0)
+            testEditor->setPlainText(EXAMPLES->itemData(index).toString());
+        EXAMPLES->setCurrentIndex(0);
     });
     connect(testEditor, &QPlainTextEdit::textChanged, this, [this]() { analyzeCurrentText(); });
     connect(tokenTable, &QTableWidget::cellClicked, this,
