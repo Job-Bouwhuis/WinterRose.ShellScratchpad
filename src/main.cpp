@@ -23,6 +23,7 @@
 #include <QFormLayout>
 #include <QFontDatabase>
 #include <QHash>
+#include <QHeaderView>
 #include <QHBoxLayout>
 #include <QInputDialog>
 #include <QIcon>
@@ -32,6 +33,7 @@
 #include <QKeyEvent>
 #include <QList>
 #include <QListWidget>
+#include <QTreeWidget>
 #include <QLineEdit>
 #include <QElapsedTimer>
 #include <QMetaObject>
@@ -369,6 +371,29 @@ __sspad_debug() {
     local __sspad_action
     while IFS= read -r -u 196 __sspad_action; do
         case "$__sspad_action" in
+            e:*)
+                local __sspad_expression __sspad_result_file __sspad_result_status __sspad_encoded_result
+                __sspad_expression="$(builtin printf '%s' "${__sspad_action#e:}" | command base64 -d 2>/dev/null)"
+                __sspad_result_file="$(command mktemp 2>/dev/null)"
+                if [[ -z "$__sspad_result_file" ]]; then
+                    __sspad_result_status=125
+                    __sspad_encoded_result="$(builtin printf '%s' 'Could not create a temporary result file' | command base64 -w0)"
+                else
+                    trap - DEBUG
+                    if builtin eval "$__sspad_expression" >"$__sspad_result_file" 2>&1; then
+                        __sspad_result_status=0
+                    else
+                        __sspad_result_status=$?
+                    fi
+                    trap '__sspad_debug "$BASH_COMMAND"' DEBUG
+                    __sspad_encoded_result="$(command base64 -w0 <"$__sspad_result_file" 2>/dev/null)"
+                    command rm -f -- "$__sspad_result_file"
+                fi
+                builtin printf 'E\t%s\t%s\n' "$__sspad_result_status" "$__sspad_encoded_result" >&196
+                __sspad_encoded_variables="$(builtin declare -p 2>/dev/null | command base64 -w0 2>/dev/null)"
+                builtin printf 'V\t%s\n' "$__sspad_encoded_variables" >&196
+                builtin printf 'R\n' >&196
+                ;;
             c)
                 __SSPAD_DEBUG_MODE=run
                 __SSPAD_DEBUG_SKIP_LINE=$__sspad_user_line
@@ -658,11 +683,16 @@ public:
         splitter->setChildrenCollapsible(false);
         splitter->setHandleWidth(7);
 
-        auto *scriptPanel = new QWidget(splitter);
+        scriptSideSplitter = new QSplitter(Qt::Horizontal, splitter);
+        scriptSideSplitter->setChildrenCollapsible(false);
+        auto *scriptPanel = new QWidget(scriptSideSplitter);
         auto *scriptLayout = new QVBoxLayout(scriptPanel);
         scriptLayout->setContentsMargins(0, 0, 0, 0);
         scriptLayout->setSpacing(6);
         auto *scriptHeading = new QLabel(QStringLiteral("Bash script"), scriptPanel);
+        debuggerBanner = new QLabel(scriptPanel);
+        debuggerBanner->setVisible(false);
+        debuggerBanner->setStyleSheet(QStringLiteral("QLabel { background: #8f2525; color: white; font-weight: bold; padding: 6px; border-radius: 3px; }"));
         scriptEdit = new ShellScratchpad::CodeEditor(scriptPanel);
         scriptEdit->setObjectName(QStringLiteral("scriptEdit"));
         scriptEdit->setPlaceholderText(
@@ -699,6 +729,7 @@ public:
         });
         refreshCompletionProfileVariables();
         scriptLayout->addWidget(scriptHeading);
+        scriptLayout->addWidget(debuggerBanner);
         scriptSearchRow = new QWidget(scriptPanel);
         auto *scriptSearchLayout = new QHBoxLayout(scriptSearchRow);
         scriptSearchLayout->setContentsMargins(0, 0, 0, 0);
@@ -749,7 +780,35 @@ public:
         scriptFindEdit->installEventFilter(this);
         scriptLayout->addWidget(scriptEdit, 1);
 
-        outputPanel = new QWidget(splitter);
+        variablesPanel = new QWidget(scriptSideSplitter);
+        auto *variablesLayout = new QVBoxLayout(variablesPanel);
+        variablesLayout->setContentsMargins(5, 0, 0, 0);
+        auto *variablesHeading = new QLabel(QStringLiteral("Paused Bash variables"), variablesPanel);
+        variablesFilter = new QLineEdit(variablesPanel);
+        variablesFilter->setPlaceholderText(QStringLiteral("Filter variables"));
+        variablesTree = new QTreeWidget(variablesPanel);
+        variablesTree->setColumnCount(3);
+        variablesTree->setHeaderLabels({QStringLiteral("Name"), QStringLiteral("Flags"), QStringLiteral("Value / declaration")});
+        variablesTree->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+        variablesTree->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+        variablesTree->header()->setSectionResizeMode(2, QHeaderView::Stretch);
+        variablesTree->setRootIsDecorated(false);
+        variablesTree->setAlternatingRowColors(true);
+        variablesTree->setToolTip(QStringLiteral("Variables captured from the current Bash execution context. Values use Bash's declaration representation."));
+        variablesLayout->addWidget(variablesHeading);
+        variablesLayout->addWidget(variablesFilter);
+        variablesLayout->addWidget(variablesTree, 1);
+        variablesPanel->hide();
+        connect(variablesFilter, &QLineEdit::textChanged, this, [this]() { refreshDebuggerVariableTree(); });
+        scriptSideSplitter->addWidget(scriptPanel);
+        scriptSideSplitter->addWidget(variablesPanel);
+        scriptSideSplitter->setStretchFactor(0, 3);
+        scriptSideSplitter->setStretchFactor(1, 1);
+        scriptSideSplitter->setSizes({760, 280});
+
+        outputSideSplitter = new QSplitter(Qt::Horizontal, splitter);
+        outputSideSplitter->setChildrenCollapsible(false);
+        outputPanel = new QWidget(outputSideSplitter);
         auto *outputLayout = new QVBoxLayout(outputPanel);
         outputLayout->setContentsMargins(0, 0, 0, 0);
         outputLayout->setSpacing(6);
@@ -818,8 +877,36 @@ public:
         outputLayout->addWidget(outputSearchRow);
         outputLayout->addWidget(outputEdit, 1);
 
-        splitter->addWidget(scriptPanel);
-        splitter->addWidget(outputPanel);
+        immediatePanel = new QWidget(outputSideSplitter);
+        auto *immediateLayout = new QVBoxLayout(immediatePanel);
+        immediateLayout->setContentsMargins(5, 0, 0, 0);
+        auto *immediateHeading = new QLabel(QStringLiteral("Immediate"), immediatePanel);
+        immediateHeading->setToolTip(QStringLiteral("Evaluate a Bash expression in the paused script process. Assignments and other side effects persist."));
+        immediateOutputEdit = new QPlainTextEdit(immediatePanel);
+        immediateOutputEdit->setReadOnly(true);
+        immediateOutputEdit->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+        immediateOutputEdit->setPlaceholderText(QStringLiteral("Results from expressions run in the paused Bash process appear here."));
+        auto *immediateEntryRow = new QHBoxLayout();
+        immediateInputEdit = new QLineEdit(immediatePanel);
+        immediateInputEdit->setPlaceholderText(QStringLiteral("Bash expression or command…"));
+        immediateInputEdit->setToolTip(QStringLiteral("Runs in the live paused shell; assignments and side effects persist."));
+        immediateRunButton = new QPushButton(QStringLiteral("Run"), immediatePanel);
+        immediateEntryRow->addWidget(immediateInputEdit, 1);
+        immediateEntryRow->addWidget(immediateRunButton);
+        immediateLayout->addWidget(immediateHeading);
+        immediateLayout->addWidget(immediateOutputEdit, 1);
+        immediateLayout->addLayout(immediateEntryRow);
+        immediatePanel->hide();
+        connect(immediateRunButton, &QPushButton::clicked, this, [this]() { evaluateImmediate(); });
+        connect(immediateInputEdit, &QLineEdit::returnPressed, this, [this]() { evaluateImmediate(); });
+        outputSideSplitter->addWidget(outputPanel);
+        outputSideSplitter->addWidget(immediatePanel);
+        outputSideSplitter->setStretchFactor(0, 2);
+        outputSideSplitter->setStretchFactor(1, 1);
+        outputSideSplitter->setSizes({650, 350});
+
+        splitter->addWidget(scriptSideSplitter);
+        splitter->addWidget(outputSideSplitter);
         splitter->setStretchFactor(0, 3);
         splitter->setStretchFactor(1, 2);
         pageLayout->addWidget(splitter, 1);
@@ -1125,6 +1212,10 @@ public:
             debuggerEnabled = false;
             debuggerPaused = false;
             debuggerVariables.clear();
+            pendingImmediateExpression.clear();
+            debuggerBanner->hide();
+            variablesPanel->hide();
+            immediatePanel->hide();
             if (completionController)
                 completionController->setRuntimeVariables({});
             updateDebuggerActions();
@@ -1160,6 +1251,10 @@ public:
                 closeDebuggerSocket();
                 debuggerEnabled = false;
                 debuggerPaused = false;
+                pendingImmediateExpression.clear();
+                debuggerBanner->hide();
+                variablesPanel->hide();
+                immediatePanel->hide();
                 scriptEdit->setReadOnly(false);
                 scriptEdit->setDebugLine(0);
                 updateDebuggerActions();
@@ -1320,6 +1415,16 @@ private:
     QAction *outputFindCaseSensitiveAction = nullptr;
     QWidget *outputPanel = nullptr;
     QSplitter *splitter = nullptr;
+    QSplitter *scriptSideSplitter = nullptr;
+    QSplitter *outputSideSplitter = nullptr;
+    QWidget *variablesPanel = nullptr;
+    QLabel *debuggerBanner = nullptr;
+    QLineEdit *variablesFilter = nullptr;
+    QTreeWidget *variablesTree = nullptr;
+    QWidget *immediatePanel = nullptr;
+    QPlainTextEdit *immediateOutputEdit = nullptr;
+    QLineEdit *immediateInputEdit = nullptr;
+    QPushButton *immediateRunButton = nullptr;
     QLineEdit *directoryEdit = nullptr;
     QString defaultWorkingDirectory;
     QComboBox *runProfileCombo = nullptr;
@@ -1370,6 +1475,7 @@ private:
     bool debuggerPaused = false;
     int debuggerCurrentDepth = 0;
     QHash<QString, QString> debuggerVariables;
+    QString pendingImmediateExpression;
     QStringList runHistoryEntries;
     QList<int> runHistorySourceLines;
     QByteArray runHistoryBuffer;
@@ -3076,8 +3182,101 @@ df -ih
         debuggerPaused = false;
         scriptEdit->setDebugLine(0);
         runStatusLabel->setText(QStringLiteral("Running"));
+        debuggerBanner->setText(QStringLiteral("DEBUG MODE — running until the next breakpoint"));
+        debuggerBanner->setStyleSheet(QStringLiteral("QLabel { background: #805c12; color: white; font-weight: bold; padding: 6px; border-radius: 3px; }"));
         statusBar()->showMessage(QStringLiteral("Running under debugger…"));
         updateDebuggerActions();
+    }
+
+    void evaluateImmediate()
+    {
+        if (!debuggerEnabled || !debuggerPaused || debuggerSocketDescriptor < 0 || !immediateInputEdit)
+            return;
+        const QString EXPRESSION = immediateInputEdit->text();
+        if (EXPRESSION.trimmed().isEmpty())
+            return;
+        const QByteArray ENCODED = EXPRESSION.toUtf8().toBase64(QByteArray::Base64Encoding);
+        const QByteArray MESSAGE = QByteArray("e:") + ENCODED + '\n';
+        const ssize_t WRITTEN = ::send(debuggerSocketDescriptor, MESSAGE.constData(),
+                                       static_cast<size_t>(MESSAGE.size()), MSG_NOSIGNAL);
+        if (WRITTEN != MESSAGE.size()) {
+            statusBar()->showMessage(QStringLiteral("Could not send expression to the paused Bash process"), 3000);
+            return;
+        }
+        pendingImmediateExpression = EXPRESSION;
+        immediateOutputEdit->appendPlainText(QStringLiteral("> %1").arg(EXPRESSION));
+        immediateInputEdit->clear();
+        immediateInputEdit->setEnabled(false);
+        immediateRunButton->setEnabled(false);
+    }
+
+    void refreshDebuggerVariableTree()
+    {
+        if (!variablesTree)
+            return;
+        variablesTree->clear();
+        const QString FILTER = variablesFilter ? variablesFilter->text().trimmed() : QString();
+        static const QRegularExpression DECLARATION(
+            QStringLiteral(R"(^declare\s+(\S+)\s+([^=\s]+)(?:=(.*))?$)"));
+        QSet<QString> SCRIPT_VARIABLES;
+        if (completionController) {
+            for (const auto &symbol : completionController->scriptSymbols()) {
+                if (symbol.kind == ShellScratchpad::Completion::CompletionController::ScriptSymbol::Kind::Variable)
+                    SCRIPT_VARIABLES.insert(symbol.name);
+            }
+        }
+        QSet<QString> PROFILE_VARIABLES;
+        const QJsonObject PROFILE_OVERRIDES = selectedRunProfile().value(QStringLiteral("environment")).toObject();
+        for (auto it = PROFILE_OVERRIDES.begin(); it != PROFILE_OVERRIDES.end(); ++it)
+            PROFILE_VARIABLES.insert(it.key());
+
+        auto addGroup = [this, &FILTER](const QString &title, const QSet<QString> &candidates) {
+            QStringList names;
+            for (const QString &name : candidates) {
+                if (debuggerVariables.contains(name))
+                    names.append(name);
+            }
+            names.sort(Qt::CaseInsensitive);
+            QList<QTreeWidgetItem *> rows;
+            for (const QString &name : names) {
+                const QString RAW = debuggerVariables.value(name);
+                if (!FILTER.isEmpty() && !name.contains(FILTER, Qt::CaseInsensitive)
+                    && !RAW.contains(FILTER, Qt::CaseInsensitive))
+                    continue;
+                const auto MATCH = DECLARATION.match(RAW);
+                const QString FLAGS = MATCH.hasMatch() ? MATCH.captured(1) : QString();
+                QString value = MATCH.hasMatch() ? MATCH.captured(3) : RAW;
+                if (value.isEmpty() && MATCH.hasMatch() && !RAW.contains(QLatin1Char('=')))
+                    value = QStringLiteral("(unset)");
+                auto *item = new QTreeWidgetItem({name, FLAGS, value});
+                item->setToolTip(2, RAW);
+                rows.append(item);
+            }
+            if (rows.isEmpty() && !FILTER.isEmpty())
+                return;
+            auto *group = new QTreeWidgetItem(variablesTree, {QStringLiteral("%1 (%2)").arg(title).arg(rows.size())});
+            group->setFirstColumnSpanned(true);
+            group->setFlags(group->flags() & ~Qt::ItemIsSelectable);
+            for (QTreeWidgetItem *row : rows)
+                group->addChild(row);
+            group->setExpanded(true);
+        };
+
+        addGroup(QStringLiteral("Script-local variables"), SCRIPT_VARIABLES);
+        QSet<QString> PROFILE_ONLY_VARIABLES;
+        for (const QString &name : PROFILE_VARIABLES) {
+            if (!SCRIPT_VARIABLES.contains(name))
+                PROFILE_ONLY_VARIABLES.insert(name);
+        }
+        QSet<QString> remaining;
+        for (auto it = debuggerVariables.cbegin(); it != debuggerVariables.cend(); ++it) {
+            if (!SCRIPT_VARIABLES.contains(it.key()) && !PROFILE_VARIABLES.contains(it.key()))
+                remaining.insert(it.key());
+        }
+        addGroup(QStringLiteral("Execution profile overrides"), PROFILE_ONLY_VARIABLES);
+        addGroup(QStringLiteral("Other variables"), remaining);
+        if (variablesTree->columnWidth(0) < 120)
+            variablesTree->setColumnWidth(0, 130);
     }
 
     void updateDebuggerActions()
@@ -3087,6 +3286,8 @@ df -ih
         if (debugStepOverAction) debugStepOverAction->setEnabled(PAUSED);
         if (debugStepInAction) debugStepInAction->setEnabled(PAUSED);
         if (debugStepOutAction) debugStepOutAction->setEnabled(PAUSED && debuggerCurrentDepth > 1);
+        if (immediateInputEdit) immediateInputEdit->setEnabled(PAUSED && pendingImmediateExpression.isEmpty());
+        if (immediateRunButton) immediateRunButton->setEnabled(PAUSED && pendingImmediateExpression.isEmpty());
     }
 
     void readDebuggerSocket()
@@ -3121,6 +3322,7 @@ df -ih
                 const int LINE = FIELDS[1].toInt();
                 const QString COMMAND = QString::fromUtf8(QByteArray::fromBase64(FIELDS[3]));
                 debuggerVariables.clear();
+                refreshDebuggerVariableTree();
                 if (completionController)
                     completionController->setRuntimeVariables({});
                 const QTextBlock currentBlock = scriptEdit->document()->findBlockByNumber(LINE - 1);
@@ -3131,6 +3333,8 @@ df -ih
                     scriptEdit->centerCursor();
                 }
                 runStatusLabel->setText(QStringLiteral("Paused at line %1").arg(LINE));
+                debuggerBanner->setText(QStringLiteral("BREAK MODE — paused before line %1").arg(LINE));
+                debuggerBanner->setStyleSheet(QStringLiteral("QLabel { background: #a52a2a; color: white; font-weight: bold; padding: 6px; border-radius: 3px; }"));
                 statusBar()->showMessage(QStringLiteral("Paused at line %1: %2").arg(LINE).arg(COMMAND));
                 updateDebuggerActions();
             } else if (FIELDS[0] == "V" && FIELDS.size() >= 2) {
@@ -3149,6 +3353,19 @@ df -ih
             } else if (FIELDS[0] == "R") {
                 if (completionController)
                     completionController->setRuntimeVariables(debuggerVariables);
+                refreshDebuggerVariableTree();
+                if (!pendingImmediateExpression.isEmpty()) {
+                    pendingImmediateExpression.clear();
+                    updateDebuggerActions();
+                }
+            } else if (FIELDS[0] == "E" && FIELDS.size() >= 3) {
+                const int EXIT_CODE = FIELDS[1].toInt();
+                const QByteArray RESULT = QByteArray::fromBase64(FIELDS[2]);
+                QString display = QString::fromLocal8Bit(RESULT);
+                if (display.isEmpty())
+                    display = QStringLiteral("(no output)");
+                immediateOutputEdit->appendPlainText(display);
+                immediateOutputEdit->appendPlainText(QStringLiteral("[exit status: %1]").arg(EXIT_CODE));
             }
         }
     }
@@ -3342,6 +3559,16 @@ df -ih
         debuggerPaused = false;
         debuggerCurrentDepth = 0;
         debuggerVariables.clear();
+        pendingImmediateExpression.clear();
+        debuggerBanner->setVisible(DEBUGGING_ENABLED);
+        variablesPanel->setVisible(DEBUGGING_ENABLED);
+        immediatePanel->setVisible(DEBUGGING_ENABLED);
+        if (DEBUGGING_ENABLED) {
+            debuggerBanner->setText(QStringLiteral("DEBUG MODE — running until the next breakpoint"));
+            debuggerBanner->setStyleSheet(QStringLiteral("QLabel { background: #805c12; color: white; font-weight: bold; padding: 6px; border-radius: 3px; }"));
+            immediateOutputEdit->clear();
+        }
+        refreshDebuggerVariableTree();
         if (completionController)
             completionController->setRuntimeVariables({});
         updateDebuggerActions();
