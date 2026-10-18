@@ -14,17 +14,15 @@ namespace ShellScratchpad::Syntax
 {
 namespace
 {
-QTextCharFormat formatForToken(TokenKind kind, bool inHereDoc = false)
+QTextCharFormat formatForToken(TokenKind kind)
 {
     QTextCharFormat format;
     const QColor COLOR = SyntaxColorSettings::instance()->color(kind);
     if (COLOR.isValid())
         format.setForeground(COLOR);
-    if (inHereDoc)
-        format.setBackground(SyntaxColorSettings::instance()->hereDocBackground());
     switch (kind) {
     case TokenKind::HereDocContent:
-        format.setBackground(SyntaxColorSettings::instance()->hereDocBackground());
+        format.setForeground(SyntaxColorSettings::instance()->color(TokenKind::StringContent));
         break;
     case TokenKind::Command:
     case TokenKind::Builtin:
@@ -76,9 +74,8 @@ void SyntaxHighlighter::highlightBlock(const QString &text)
         const qsizetype END = qMin(TOKEN_END, BLOCK_END);
         if (START >= END)
             continue;
-        setFormat(static_cast<int>(START - BLOCK_START),
-                  static_cast<int>(END - START),
-                  formatForToken(TOKEN.kind));
+        QTextCharFormat format = formatForToken(TokenKind::HereDocContent);
+        setFormat(static_cast<int>(START - BLOCK_START), static_cast<int>(END - START), format);
     }
     for (const SyntaxToken &TOKEN : tokens) {
         if (TOKEN.kind == TokenKind::HereDocContent)
@@ -92,9 +89,10 @@ void SyntaxHighlighter::highlightBlock(const QString &text)
             return span.kind == TokenKind::HereDocContent && TOKEN.startOffset < span.startOffset + span.length &&
                    TOKEN_END > span.startOffset;
         });
-        setFormat(static_cast<int>(START - BLOCK_START),
-                  static_cast<int>(END - START),
-                  formatForToken(TOKEN.kind, IN_HEREDOC));
+        if (IN_HEREDOC)
+            continue;
+        setFormat(static_cast<int>(START - BLOCK_START), static_cast<int>(END - START),
+                  formatForToken(TOKEN.kind));
     }
 }
 }

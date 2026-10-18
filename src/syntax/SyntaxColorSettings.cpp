@@ -11,9 +11,6 @@ namespace ShellScratchpad::Syntax
 {
 namespace
 {
-const QString HERE_DOC_BACKGROUND_KEY = QStringLiteral("hereDocBackground");
-const QColor DEFAULT_HERE_DOC_BACKGROUND(QStringLiteral("#353d4b"));
-
 QString colorKey(TokenKind kind)
 {
     return QString::number(static_cast<int>(kind));
@@ -53,14 +50,10 @@ SyntaxColorSettings *SyntaxColorSettings::instance()
 }
 
 SyntaxColorSettings::SyntaxColorSettings(QObject *parent)
-    : QObject(parent), colors(defaults()), hereDocBackgroundColor(DEFAULT_HERE_DOC_BACKGROUND)
+    : QObject(parent), colors(defaults())
 {
     const QString SETTINGS_PATH = settingsFilePath();
     QSettings settings(SETTINGS_PATH, QSettings::IniFormat);
-    const QColor SAVED_HERE_DOC_BACKGROUND(settings.value(HERE_DOC_BACKGROUND_KEY,
-                                                           DEFAULT_HERE_DOC_BACKGROUND.name()).toString());
-    if (SAVED_HERE_DOC_BACKGROUND.isValid())
-        hereDocBackgroundColor = SAVED_HERE_DOC_BACKGROUND;
     for (auto it = colors.begin(); it != colors.end(); ++it) {
         const QString VALUE = settings.value(colorKey(static_cast<TokenKind>(it.key())), it.value().name()).toString();
         const QColor COLOR(VALUE);
@@ -76,11 +69,6 @@ QColor SyntaxColorSettings::color(TokenKind kind) const
     return colors.value(static_cast<int>(kind));
 }
 
-QColor SyntaxColorSettings::hereDocBackground() const
-{
-    return hereDocBackgroundColor;
-}
-
 void SyntaxColorSettings::setColor(TokenKind kind, const QColor &colorValue)
 {
     if (!colorValue.isValid())
@@ -90,19 +78,9 @@ void SyntaxColorSettings::setColor(TokenKind kind, const QColor &colorValue)
     emit colorsChanged();
 }
 
-void SyntaxColorSettings::setHereDocBackground(const QColor &colorValue)
-{
-    if (!colorValue.isValid())
-        return;
-    hereDocBackgroundColor = colorValue;
-    save();
-    emit colorsChanged();
-}
-
 void SyntaxColorSettings::restoreDefaults()
 {
     colors = defaults();
-    hereDocBackgroundColor = DEFAULT_HERE_DOC_BACKGROUND;
     save();
     emit colorsChanged();
 }
@@ -110,7 +88,6 @@ void SyntaxColorSettings::restoreDefaults()
 void SyntaxColorSettings::save()
 {
     QSettings settings(settingsFilePath(), QSettings::IniFormat);
-    settings.setValue(HERE_DOC_BACKGROUND_KEY, hereDocBackgroundColor.name());
     for (auto it = colors.cbegin(); it != colors.cend(); ++it) {
         if (it.value().isValid())
             settings.setValue(colorKey(static_cast<TokenKind>(it.key())), it.value().name());

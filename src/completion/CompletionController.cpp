@@ -2,11 +2,13 @@
 
 #include "editor/CodeEditor.h"
 #include "syntax/SyntaxTokenizer.h"
+#include "util/FuzzyMatcher.h"
 
 #include <QDir>
 #include <QFileInfo>
 #include <QKeyEvent>
 #include <QListWidget>
+#include <QMouseEvent>
 #include <QMap>
 #include <QPlainTextEdit>
 #include <QProcessEnvironment>
@@ -19,6 +21,8 @@
 #include <QTextCursor>
 #include <QToolTip>
 #include <QTimer>
+
+#include <algorithm>
 
 namespace ShellScratchpad::Completion
 {
@@ -243,15 +247,54 @@ CompletionController::CompletionController(QPlainTextEdit *targetEditor, QObject
 
     connect(editor, &QPlainTextEdit::textChanged, this, [this]() { updateSuggestions(); });
     connect(editor, &QPlainTextEdit::cursorPositionChanged, this, [this]() { updateSuggestions(); });
-    connect(popup, &QListWidget::currentRowChanged, this, [this](int) { showSelectedDescription(); });
+    selectedDescriptionTimer.setSingleShot(true);
+    selectedDescriptionTimer.setInterval(40);
+    connect(&selectedDescriptionTimer, &QTimer::timeout, this, [this]() { showSelectedDescription(); });
+    connect(popup, &QListWidget::currentRowChanged, this, [this](int) {
+        QToolTip::hideText();
+        if (popup->isVisible())
+            selectedDescriptionTimer.start();
+    });
     connect(popup, &QListWidget::itemClicked, this, [this](QListWidgetItem *) { acceptCurrentSuggestion(); });
     editor->installEventFilter(this);
+    editor->setMouseTracking(true);
+    editor->viewport()->setMouseTracking(true);
+    editor->viewport()->installEventFilter(this);
+    hoverDescriptionTimer.setSingleShot(true);
+    hoverDescriptionTimer.setInterval(500);
+    connect(&hoverDescriptionTimer, &QTimer::timeout, this, [this]() { showHoverDescription(); });
     refreshCommandCache();
     refreshSnippets();
 }
 
 bool CompletionController::eventFilter(QObject *watched, QEvent *event)
 {
+    if (watched == editor && event->type() == QEvent::FocusOut) {
+        selectedDescriptionTimer.stop();
+        popup->hide();
+        hoverDescriptionTimer.stop();
+        hoverTokenStart = -1;
+        hoverDescription.clear();
+        QToolTip::hideText();
+    }
+    if (watched == editor->viewport()) {
+        if (event->type() == QEvent::MouseMove) {
+            auto *mouseEvent = static_cast<QMouseEvent *>(event);
+            updateHoverTarget(mouseEvent->pos());
+        } else if (event->type() == QEvent::Leave || event->type() == QEvent::MouseButtonPress) {
+            hoverDescriptionTimer.stop();
+            hoverTokenStart = -1;
+            hoverDescription.clear();
+            QToolTip::hideText();
+        }
+    }
+    if (watched == editor && event->type() == QEvent::KeyPress) {
+        // Keep hover help away while the user is typing, then let it return
+        // after the same quiet interval used for the initial hover.
+        QToolTip::hideText();
+        if (hoverTokenStart >= 0)
+            hoverDescriptionTimer.start();
+    }
     if (watched == editor && event->type() == QEvent::KeyPress && popup->isVisible()) {
         auto *key = static_cast<QKeyEvent *>(event);
         if (key->key() == Qt::Key_Down || key->key() == Qt::Key_Up) {
@@ -279,6 +322,136 @@ bool CompletionController::eventFilter(QObject *watched, QEvent *event)
         }
     }
     return QObject::eventFilter(watched, event);
+}
+
+QString CompletionController::descriptionForTokenAt(const QPoint &position, qsizetype *tokenStart) const
+{
+    if (tokenStart)
+        *tokenStart = -1;
+    if (!editor)
+        return {};
+    const QString SOURCE = editor->toPlainText();
+    const QTextCursor CURSOR = editor->cursorForPosition(position);
+    qsizetype offset = CURSOR.position();
+    if (offset == SOURCE.size() && offset > 0)
+        --offset;
+    const QVector<Syntax::SyntaxToken> TOKENS = Syntax::SyntaxTokenizer::tokenize(SOURCE);
+    const Syntax::SyntaxToken *hovered = nullptr;
+    for (const auto &token : TOKENS) {
+        if (offset >= token.startOffset && offset < token.startOffset + token.length) {
+            hovered = &token;
+            break;
+        }
+    }
+    if (!hovered)
+        return {};
+    if (tokenStart)
+        *tokenStart = hovered->startOffset;
+
+    QString command;
+    for (const auto &token : TOKENS) {
+        if (token.startOffset > hovered->startOffset)
+            break;
+        if (token.kind == Syntax::TokenKind::Operator) {
+            const QString OPERATOR = SOURCE.mid(token.startOffset, token.length);
+            if (OPERATOR == QStringLiteral(";") || OPERATOR == QStringLiteral("&&") ||
+                OPERATOR == QStringLiteral("||") || OPERATOR == QStringLiteral("|") ||
+                OPERATOR == QStringLiteral("|&"))
+                command.clear();
+        } else if (token.kind == Syntax::TokenKind::Command || token.kind == Syntax::TokenKind::Builtin) {
+            command = SOURCE.mid(token.startOffset, token.length);
+        }
+    }
+
+    const QString TEXT = SOURCE.mid(hovered->startOffset, hovered->length);
+    switch (hovered->kind) {
+    case Syntax::TokenKind::Command:
+        return commandDescription(TEXT);
+    case Syntax::TokenKind::Builtin:
+        return builtinDescription(TEXT);
+    case Syntax::TokenKind::Keyword: {
+        static const QHash<QString, QString> DESCRIPTIONS = {
+            {QStringLiteral("if"), QStringLiteral("Run a conditional branch when its test succeeds.")},
+            {QStringLiteral("then"), QStringLiteral("Begin the body of a conditional branch.")},
+            {QStringLiteral("elif"), QStringLiteral("Test another conditional branch.")},
+            {QStringLiteral("else"), QStringLiteral("Begin the fallback branch of a conditional.")},
+            {QStringLiteral("fi"), QStringLiteral("End an if statement.")},
+            {QStringLiteral("for"), QStringLiteral("Repeat a command block for each value in a list.")},
+            {QStringLiteral("while"), QStringLiteral("Repeat a command block while its test succeeds.")},
+            {QStringLiteral("until"), QStringLiteral("Repeat a command block until its test succeeds.")},
+            {QStringLiteral("do"), QStringLiteral("Begin the body of a loop.")},
+            {QStringLiteral("done"), QStringLiteral("End a loop.")},
+            {QStringLiteral("case"), QStringLiteral("Match a value against a list of patterns.")},
+            {QStringLiteral("esac"), QStringLiteral("End a case statement.")},
+            {QStringLiteral("in"), QStringLiteral("Introduce a list of values or case patterns.")},
+            {QStringLiteral("function"), QStringLiteral("Declare a shell function.")},
+            {QStringLiteral("select"), QStringLiteral("Create a menu loop over a list of values.")},
+            {QStringLiteral("time"), QStringLiteral("Measure the time taken by a command.")},
+            {QStringLiteral("coproc"), QStringLiteral("Run a command asynchronously with a coprocess.")}
+        };
+        return DESCRIPTIONS.value(TEXT);
+    }
+    case Syntax::TokenKind::Option:
+        return optionDescription(command.section(QLatin1Char('/'), -1).toLower(), TEXT);
+    case Syntax::TokenKind::SpecialParameter: {
+        static const QHash<QString, QString> DESCRIPTIONS = {
+            {QStringLiteral("$?"), QStringLiteral("Exit status of the most recently completed command.")},
+            {QStringLiteral("$#"), QStringLiteral("Number of positional parameters passed to the script or function.")},
+            {QStringLiteral("$@"), QStringLiteral("All positional parameters, preserved as separate words when quoted.")},
+            {QStringLiteral("$*"), QStringLiteral("All positional parameters, joined into a single word when quoted.")},
+            {QStringLiteral("$$"), QStringLiteral("Process ID of the current shell.")},
+            {QStringLiteral("$!"), QStringLiteral("Process ID of the most recently backgrounded job.")}
+        };
+        return DESCRIPTIONS.value(TEXT);
+    }
+    case Syntax::TokenKind::Redirection:
+        if (TEXT.startsWith(QStringLiteral("<<")))
+            return QStringLiteral("Read a here-document until its delimiter.");
+        if (TEXT == QStringLiteral(">>") || TEXT == QStringLiteral("&>>"))
+            return QStringLiteral("Append command output to a file.");
+        if (TEXT.contains(QLatin1Char('>')))
+            return QStringLiteral("Redirect command output.");
+        return QStringLiteral("Redirect command input.");
+    case Syntax::TokenKind::Operator:
+        if (TEXT == QStringLiteral("&&")) return QStringLiteral("Run the next command only if this command succeeds.");
+        if (TEXT == QStringLiteral("||")) return QStringLiteral("Run the next command only if this command fails.");
+        if (TEXT == QStringLiteral("|")) return QStringLiteral("Send this command's output to the next command's input.");
+        if (TEXT == QStringLiteral(";")) return QStringLiteral("Separate commands in the same statement.");
+        return {};
+    default:
+        return {};
+    }
+}
+
+void CompletionController::updateHoverTarget(const QPoint &position)
+{
+    hoverPosition = position;
+    qsizetype tokenStart = -1;
+    const QString DESCRIPTION = descriptionForTokenAt(position, &tokenStart);
+    if (tokenStart != hoverTokenStart) {
+        hoverTokenStart = tokenStart;
+        hoverDescription = DESCRIPTION;
+        hoverDescriptionTimer.stop();
+        QToolTip::hideText();
+        if (tokenStart >= 0 && !DESCRIPTION.isEmpty())
+            hoverDescriptionTimer.start();
+    } else {
+        hoverDescription = DESCRIPTION;
+        if (QToolTip::isVisible() && !DESCRIPTION.isEmpty())
+            QToolTip::showText(editor->viewport()->mapToGlobal(position), DESCRIPTION, editor->viewport());
+    }
+}
+
+void CompletionController::showHoverDescription()
+{
+    if (hoverTokenStart < 0 || hoverDescription.isEmpty() || popup->isVisible())
+        return;
+    qsizetype currentTokenStart = -1;
+    const QString DESCRIPTION = descriptionForTokenAt(hoverPosition, &currentTokenStart);
+    if (currentTokenStart != hoverTokenStart || DESCRIPTION.isEmpty())
+        return;
+    hoverDescription = DESCRIPTION;
+    QToolTip::showText(editor->viewport()->mapToGlobal(hoverPosition), DESCRIPTION, editor->viewport());
 }
 
 void CompletionController::refreshCommandCache()
@@ -319,6 +492,13 @@ void CompletionController::refreshCommandCache()
 void CompletionController::refreshSnippets()
 {
     snippets = Snippets::SnippetStore::loadAll();
+    snippets += Snippets::SnippetStore::builtInSnippets();
+    updateSuggestions();
+}
+
+void CompletionController::setProfileEnvironmentVariables(const QStringList &names)
+{
+    profileEnvironmentVariables = names;
     updateSuggestions();
 }
 
@@ -376,13 +556,166 @@ QString CompletionController::commandDescription(const QString &command) const
     return QStringLiteral("Executable found in the current PATH. No local manual-page summary was found.");
 }
 
+void CompletionController::refreshScriptSymbols(const QString &source)
+{
+    knownScriptSymbols.clear();
+    const QVector<Syntax::SyntaxToken> TOKENS = Syntax::SyntaxTokenizer::tokenize(source);
+    auto isIdentifier = [](const QString &name) {
+        static const QRegularExpression IDENTIFIER(QStringLiteral(R"(^[A-Za-z_][A-Za-z0-9_]*$)"));
+        return IDENTIFIER.match(name).hasMatch();
+    };
+    auto isInNonCodeText = [&TOKENS](qsizetype offset) {
+        for (const Syntax::SyntaxToken &token : TOKENS) {
+            if (offset >= token.startOffset && offset < token.startOffset + token.length)
+                return token.kind == Syntax::TokenKind::Comment ||
+                       token.kind == Syntax::TokenKind::StringContent ||
+                       token.kind == Syntax::TokenKind::StringDelimiter ||
+                       token.kind == Syntax::TokenKind::HereDocContent;
+        }
+        return false;
+    };
+    QSet<qsizetype> functionOffsets;
+    auto addSymbol = [this, &source](const QString &name, ScriptSymbol::Kind kind, qsizetype offset,
+                                     bool readOnly = false) {
+        if (name.isEmpty() || offset < 0 || offset >= source.size())
+            return;
+        QString value;
+        if (kind == ScriptSymbol::Kind::Variable &&
+            source.mid(offset + name.size(), 1) == QLatin1String("=")) {
+            qsizetype valueStart = offset + name.size() + 1;
+            qsizetype valueEnd = valueStart;
+            QChar quote;
+            while (valueEnd < source.size()) {
+                const QChar character = source.at(valueEnd);
+                if (character == QLatin1Char('\\') && valueEnd + 1 < source.size()) {
+                    valueEnd += 2;
+                    continue;
+                }
+                if (!quote.isNull()) {
+                    if (character == quote)
+                        quote = QChar();
+                } else if (character == QLatin1Char('\'') || character == QLatin1Char('"')) {
+                    quote = character;
+                } else if (character.isSpace() || character == QLatin1Char(';') ||
+                           character == QLatin1Char('&') || character == QLatin1Char('|')) {
+                    break;
+                }
+                ++valueEnd;
+            }
+            value = source.mid(valueStart, valueEnd - valueStart);
+        }
+        for (ScriptSymbol &existing : knownScriptSymbols) {
+            if (existing.kind == kind && existing.declarationOffset == offset && existing.name == name) {
+                existing.readOnly = existing.readOnly || readOnly;
+                if (existing.value.isEmpty())
+                    existing.value = value;
+                return;
+            }
+        }
+        int line = 1;
+        int column = 1;
+        for (qsizetype index = 0; index < offset; ++index) {
+            if (source.at(index) == QLatin1Char('\n')) {
+                ++line;
+                column = 1;
+            } else {
+                ++column;
+            }
+        }
+        knownScriptSymbols.append(ScriptSymbol{name, kind, offset, line, column, readOnly, value});
+    };
+
+    for (const Syntax::SyntaxToken &token : TOKENS) {
+        if (token.kind == Syntax::TokenKind::AssignmentName && !isInNonCodeText(token.startOffset)) {
+            const QString NAME = source.mid(token.startOffset, token.length);
+            if (isIdentifier(NAME)) {
+                addSymbol(NAME, ScriptSymbol::Kind::Variable, token.startOffset);
+            }
+        }
+    }
+
+    static const QSet<QString> DECLARATIONS = {
+        QStringLiteral("declare"), QStringLiteral("typeset"), QStringLiteral("export"),
+        QStringLiteral("local"), QStringLiteral("readonly"), QStringLiteral("read")
+    };
+    for (qsizetype index = 0; index < TOKENS.size(); ++index) {
+        const Syntax::SyntaxToken &declaration = TOKENS.at(index);
+        const QString DECLARATION = source.mid(declaration.startOffset, declaration.length);
+        if (declaration.kind != Syntax::TokenKind::Builtin || !DECLARATIONS.contains(DECLARATION))
+            continue;
+        bool readOnlyDeclaration = DECLARATION == QLatin1String("readonly");
+        bool previousWasEquals = false;
+        for (qsizetype next = index + 1; next < TOKENS.size(); ++next) {
+            const Syntax::SyntaxToken &candidate = TOKENS.at(next);
+            if (candidate.line != declaration.line || candidate.kind == Syntax::TokenKind::Comment)
+                break;
+            const QString TEXT = source.mid(candidate.startOffset, candidate.length);
+            if (candidate.kind == Syntax::TokenKind::Operator) {
+                if (TEXT == QStringLiteral(";") || TEXT == QStringLiteral("&&") ||
+                    TEXT == QStringLiteral("||") || TEXT == QStringLiteral("|"))
+                    break;
+                previousWasEquals = TEXT == QStringLiteral("=");
+                continue;
+            }
+            if ((DECLARATION == QLatin1String("declare") || DECLARATION == QLatin1String("typeset")) &&
+                candidate.kind == Syntax::TokenKind::Option && TEXT.size() > 1 && TEXT.mid(1).contains(QLatin1Char('r')))
+                readOnlyDeclaration = true;
+            if (!previousWasEquals && (candidate.kind == Syntax::TokenKind::AssignmentName ||
+                                       candidate.kind == Syntax::TokenKind::Argument ||
+                                       candidate.kind == Syntax::TokenKind::Word) &&
+                isIdentifier(TEXT) && !isInNonCodeText(candidate.startOffset)) {
+                addSymbol(TEXT, ScriptSymbol::Kind::Variable, candidate.startOffset, readOnlyDeclaration);
+            }
+            previousWasEquals = false;
+        }
+    }
+
+    // Bash supports both `function name { ... }` and `name() { ... }` forms.
+    static const QRegularExpression FUNCTION_DECLARATION(
+        QStringLiteral(R"((?:^|[;\n]\s*)(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\))?\s*\{)"));
+    auto functionMatches = FUNCTION_DECLARATION.globalMatch(source);
+    while (functionMatches.hasNext()) {
+        const auto MATCH = functionMatches.next();
+        const qsizetype OFFSET = MATCH.capturedStart(1);
+        if (isInNonCodeText(OFFSET) || functionOffsets.contains(OFFSET))
+            continue;
+        addSymbol(MATCH.captured(1), ScriptSymbol::Kind::Function, OFFSET);
+        functionOffsets.insert(OFFSET);
+    }
+    for (ScriptSymbol &symbol : knownScriptSymbols) {
+        if (symbol.kind != ScriptSymbol::Kind::Variable || !symbol.readOnly || !symbol.value.isEmpty())
+            continue;
+        const ScriptSymbol *latestValue = nullptr;
+        for (const ScriptSymbol &candidate : knownScriptSymbols) {
+            if (candidate.kind == ScriptSymbol::Kind::Variable && candidate.name == symbol.name &&
+                candidate.declarationOffset < symbol.declarationOffset && !candidate.value.isEmpty() &&
+                (!latestValue || candidate.declarationOffset > latestValue->declarationOffset))
+                latestValue = &candidate;
+        }
+        if (latestValue)
+            symbol.value = latestValue->value;
+    }
+}
+
 void CompletionController::updateSuggestions()
 {
     if (!editor)
         return;
     const QString SOURCE = editor->toPlainText();
+    refreshScriptSymbols(SOURCE);
     const QTextCursor CURSOR = editor->textCursor();
     const qsizetype POSITION = CURSOR.position();
+    const QVector<Syntax::SyntaxToken> DOCUMENT_TOKENS = Syntax::SyntaxTokenizer::tokenize(SOURCE);
+    const bool IN_HEREDOC = std::any_of(DOCUMENT_TOKENS.cbegin(), DOCUMENT_TOKENS.cend(),
+        [POSITION](const Syntax::SyntaxToken &token) {
+            return token.kind == Syntax::TokenKind::HereDocContent &&
+                   POSITION >= token.startOffset && POSITION <= token.startOffset + token.length;
+        });
+    if (IN_HEREDOC) {
+        popup->hide();
+        QToolTip::hideText();
+        return;
+    }
     if (CURSOR.hasSelection()) {
         popup->hide();
         QToolTip::hideText();
@@ -463,10 +796,8 @@ void CompletionController::updateSuggestions()
     }
 
     currentSuggestions.clear();
-    auto append = [this, &PREFIX](const QString &text, const QString &description, const QString &category) {
-        if (!text.startsWith(PREFIX, Qt::CaseInsensitive))
-            return;
-        currentSuggestions.append(Suggestion{text, description, category, QString(), {}});
+    auto append = [this](const QString &text, const QString &description, const QString &category) {
+        currentSuggestions.append(Suggestion{text, description, category, QString(), {}, {}});
     };
     if (VARIABLE_POSITION) {
         QMap<QString, QString> variables;
@@ -481,62 +812,61 @@ void CompletionController::updateSuggestions()
         const QProcessEnvironment ENVIRONMENT = QProcessEnvironment::systemEnvironment();
         for (const QString &name : ENVIRONMENT.keys())
             addVariable(name, QStringLiteral("Inherited environment variable."));
-
-        const QVector<Syntax::SyntaxToken> ALL_TOKENS = Syntax::SyntaxTokenizer::tokenize(SOURCE);
-        auto isInNonCodeText = [&ALL_TOKENS](qsizetype offset) {
-            for (const Syntax::SyntaxToken &token : ALL_TOKENS) {
-                if (offset >= token.startOffset && offset < token.startOffset + token.length)
-                    return token.kind == Syntax::TokenKind::Comment ||
-                           token.kind == Syntax::TokenKind::StringContent ||
-                           token.kind == Syntax::TokenKind::StringDelimiter ||
-                           token.kind == Syntax::TokenKind::HereDocContent;
+        for (const QString &name : profileEnvironmentVariables)
+            addVariable(name, QStringLiteral("Active execution profile override."));
+        for (const ScriptSymbol &symbol : knownScriptSymbols) {
+            if (symbol.kind != ScriptSymbol::Kind::Variable)
+                continue;
+            addVariable(symbol.name, QStringLiteral("Declared or assigned in this script at line %1.")
+                .arg(symbol.declarationLine));
+            if (symbol.readOnly) {
+                QString &description = variables[symbol.name];
+                if (!description.contains(QStringLiteral("Read-only variable."))) {
+                    const QString VALUE = symbol.value.isEmpty() ? QStringLiteral("(empty)") : symbol.value;
+                    description += QStringLiteral("\nRead-only variable. Value: %1").arg(VALUE);
+                }
             }
-            return false;
-        };
-        static const QRegularExpression ASSIGNMENT(
-            QStringLiteral(R"((?:^|[\s;({])([A-Za-z_][A-Za-z0-9_]*)\s*=)"));
-        auto assignmentMatches = ASSIGNMENT.globalMatch(SOURCE);
-        while (assignmentMatches.hasNext()) {
-            const auto MATCH = assignmentMatches.next();
-            if (!isInNonCodeText(MATCH.capturedStart(1)))
-                addVariable(MATCH.captured(1), QStringLiteral("Assigned in this script."));
-        }
-        static const QRegularExpression DECLARATION(
-            QStringLiteral(R"(\b(?:export|local|readonly|declare|typeset)\s+(?:-[A-Za-z]+\s+)*([A-Za-z_][A-Za-z0-9_]*)\b)"));
-        auto declarationMatches = DECLARATION.globalMatch(SOURCE);
-        while (declarationMatches.hasNext()) {
-            const auto MATCH = declarationMatches.next();
-            if (!isInNonCodeText(MATCH.capturedStart(1)))
-                addVariable(MATCH.captured(1), QStringLiteral("Declared in this script."));
         }
         for (auto it = variables.cbegin(); it != variables.cend(); ++it) {
             const QString COMPLETION = BRACED_VARIABLE
                 ? QStringLiteral("${%1}").arg(it.key()) : QStringLiteral("$%1").arg(it.key());
-            if (it.key().startsWith(PREFIX, Qt::CaseInsensitive)) {
-                const bool IS_ENVIRONMENT = it.value().contains(QStringLiteral("Inherited environment"));
-                const QString CATEGORY = IS_ENVIRONMENT && it.value().contains(QStringLiteral("script."), Qt::CaseInsensitive)
-                    ? QStringLiteral("Environment + Script")
-                    : (IS_ENVIRONMENT ? QStringLiteral("Environment") : QStringLiteral("Script variable"));
-                currentSuggestions.append(Suggestion{COMPLETION, it.value(), CATEGORY, QString(), {}});
-            }
+            const bool IS_ENVIRONMENT = it.value().contains(QStringLiteral("Inherited environment"));
+            const bool IS_PROFILE = it.value().contains(QStringLiteral("execution profile"), Qt::CaseInsensitive);
+            const bool IS_SCRIPT = it.value().contains(QStringLiteral("script."), Qt::CaseInsensitive);
+            QStringList SOURCES;
+            if (IS_ENVIRONMENT) SOURCES.append(QStringLiteral("Environment"));
+            if (IS_PROFILE) SOURCES.append(QStringLiteral("Profile"));
+            if (IS_SCRIPT) SOURCES.append(QStringLiteral("Script"));
+            const QString CATEGORY = SOURCES.isEmpty()
+                ? QStringLiteral("Script variable") : SOURCES.join(QStringLiteral(" + "));
+            currentSuggestions.append(Suggestion{COMPLETION, it.value(), CATEGORY, QString(), {}, {}});
         }
         for (const QString &special : {QStringLiteral("$?"), QStringLiteral("$#"), QStringLiteral("$@"),
                                        QStringLiteral("$*"), QStringLiteral("$!"), QStringLiteral("$$")}) {
-            if (PREFIX.isEmpty() || special.mid(1).startsWith(PREFIX, Qt::CaseInsensitive))
-                currentSuggestions.append(Suggestion{special, QStringLiteral("Special Bash parameter."),
-                                                     QStringLiteral("Special parameter"), QString(), {}});
+            currentSuggestions.append(Suggestion{special, QStringLiteral("Special Bash parameter."),
+                                                 QStringLiteral("Special parameter"), QString(), {}, {}});
         }
     } else if (commandPosition) {
         for (const Snippets::Snippet &snippet : snippets) {
-            if (snippet.name.startsWith(PREFIX, Qt::CaseInsensitive))
-                currentSuggestions.append(Suggestion{snippet.name, snippet.description,
-                                                     QStringLiteral("Snippet"), snippet.code, snippet.highlightPoints});
+            currentSuggestions.append(Suggestion{snippet.name, snippet.description,
+                                                 QStringLiteral("Snippet"), snippet.code, snippet.highlightPoints,
+                                                 snippet.autoChangeSections});
         }
         if (!AFTER_SUDO_PREFIX) {
             for (const QString &word : KEYWORDS)
                 append(word, QStringLiteral("Bash reserved word."), QStringLiteral("Keyword"));
-            for (const QString &word : BUILTINS)
-                append(word, builtinDescription(word), QStringLiteral("Builtin"));
+        }
+        for (const QString &word : BUILTINS)
+            append(word, builtinDescription(word), QStringLiteral("Builtin"));
+        for (const ScriptSymbol &symbol : knownScriptSymbols) {
+            if (symbol.kind != ScriptSymbol::Kind::Function)
+                continue;
+            const bool ALREADY_SUGGESTED = std::any_of(currentSuggestions.cbegin(), currentSuggestions.cend(),
+                [&symbol](const Suggestion &suggestion) { return suggestion.text == symbol.name; });
+            if (!ALREADY_SUGGESTED)
+                currentSuggestions.append(Suggestion{symbol.name,
+                    QStringLiteral("Function defined in this script at line %1.").arg(symbol.declarationLine),
+                    QStringLiteral("Script function"), QString(), {}, {}});
         }
         for (const QString &word : systemCommands)
             if (!BUILTINS.contains(word))
@@ -546,12 +876,50 @@ void CompletionController::updateSuggestions()
         const QStringList OPTIONS = argumentCatalog().value(NORMALIZED_COMMAND);
         for (const QString &option : OPTIONS)
             append(option, optionDescription(NORMALIZED_COMMAND, option), QStringLiteral("Argument"));
-        for (const Snippets::Snippet &snippet : snippets) {
-            if (snippet.name.startsWith(PREFIX, Qt::CaseInsensitive))
-                currentSuggestions.append(Suggestion{snippet.name, snippet.description,
-                                                     QStringLiteral("Snippet"), snippet.code, snippet.highlightPoints});
+        for (const Snippets::Snippet &snippet : snippets)
+            currentSuggestions.append(Suggestion{snippet.name, snippet.description,
+                                                 QStringLiteral("Snippet"), snippet.code, snippet.highlightPoints,
+                                                 snippet.autoChangeSections});
+    }
+
+    struct RankedSuggestion { Suggestion suggestion; int tier; int score; };
+    QVector<RankedSuggestion> rankedSuggestions;
+    rankedSuggestions.reserve(currentSuggestions.size());
+    for (const Suggestion &suggestion : currentSuggestions) {
+        QString candidate = suggestion.text;
+        if (suggestion.category == QLatin1String("Special parameter")) {
+            candidate.remove(0, 1);
+        } else if (VARIABLE_POSITION) {
+            if (candidate.startsWith(QStringLiteral("${")) && candidate.endsWith(QLatin1Char('}')))
+                candidate = candidate.mid(2, candidate.size() - 3);
+            else if (candidate.startsWith(QLatin1Char('$')))
+                candidate.remove(0, 1);
+        }
+        if (candidate.compare(PREFIX, Qt::CaseInsensitive) == 0) {
+            rankedSuggestions.append({suggestion, 0, 0});
+        } else if (candidate.startsWith(PREFIX, Qt::CaseInsensitive)) {
+            // Keep all prefix matches ahead of fuzzy results, while putting
+            // the closest completion first. This makes a short declared name
+            // such as $myvar easy to reach even when many environment names
+            // share the same prefix.
+            rankedSuggestions.append({suggestion, 1,
+                static_cast<int>(candidate.size() - PREFIX.size())});
+        } else {
+            const int SCORE = ShellScratchpad::Util::fuzzyMatchScore(PREFIX, candidate);
+            if (SCORE >= 0)
+                rankedSuggestions.append({suggestion, 2, SCORE});
         }
     }
+    std::stable_sort(rankedSuggestions.begin(), rankedSuggestions.end(),
+        [](const RankedSuggestion &left, const RankedSuggestion &right) {
+            if (left.tier != right.tier)
+                return left.tier < right.tier;
+            return left.score < right.score;
+        });
+    currentSuggestions.clear();
+    currentSuggestions.reserve(rankedSuggestions.size());
+    for (const RankedSuggestion &ranked : rankedSuggestions)
+        currentSuggestions.append(ranked.suggestion);
 
     popup->clear();
     const int DISPLAY_LIMIT = 80;
@@ -561,6 +929,7 @@ void CompletionController::updateSuggestions()
         item->setData(Qt::UserRole, index);
     }
     if ((PREFIX.isEmpty() && !VARIABLE_POSITION) || popup->count() == 0) {
+        selectedDescriptionTimer.stop();
         popup->hide();
         QToolTip::hideText();
         return;
@@ -570,7 +939,7 @@ void CompletionController::updateSuggestions()
     positionPopup();
     popup->show();
     popup->raise();
-    QTimer::singleShot(0, this, [this]() { showSelectedDescription(); });
+    selectedDescriptionTimer.start();
 }
 
 void CompletionController::positionPopup()
@@ -598,7 +967,7 @@ void CompletionController::acceptCurrentSuggestion()
             points.append(qMakePair(static_cast<int>(point.offset), static_cast<int>(point.length)));
         if (auto *codeEditor = qobject_cast<ShellScratchpad::CodeEditor *>(editor)) {
             editor->setTextCursor(cursor);
-            codeEditor->insertSnippet(SUGGESTION.insertText, points);
+            codeEditor->insertSnippet(SUGGESTION.insertText, points, SUGGESTION.autoChangeSections);
             popup->hide();
             QToolTip::hideText();
             editor->setFocus();
@@ -631,6 +1000,10 @@ void CompletionController::showSelectedDescription()
         return;
     }
     const QString DESCRIPTION = currentSuggestions.at(INDEX).description;
+    if (DESCRIPTION.isEmpty()) {
+        QToolTip::hideText();
+        return;
+    }
     const QRect ROW_RECT = popup->visualItemRect(popup->currentItem());
     if (ROW_RECT.isEmpty())
         return;

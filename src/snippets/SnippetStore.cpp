@@ -45,6 +45,17 @@ QJsonObject snippetObject(const Snippet &snippet)
         points.append(pointObject);
     }
     object.insert(QStringLiteral("highlightPoints"), points);
+    QJsonArray autoChanges;
+    for (const AutoChangeSection &section : snippet.autoChangeSections) {
+        if (section.offset < 0 || section.length < 0 || section.offset + section.length > snippet.code.size())
+            continue;
+        QJsonObject sectionObject;
+        sectionObject.insert(QStringLiteral("offset"), static_cast<int>(section.offset));
+        sectionObject.insert(QStringLiteral("length"), static_cast<int>(section.length));
+        sectionObject.insert(QStringLiteral("sourcePointOffset"), static_cast<int>(section.sourcePointOffset));
+        autoChanges.append(sectionObject);
+    }
+    object.insert(QStringLiteral("autoChangeSections"), autoChanges);
     return object;
 }
 
@@ -83,6 +94,16 @@ Snippet readSnippetFile(const QString &path)
         if (offset >= 0 && length >= 0 && offset + length <= snippet.code.size())
             snippet.highlightPoints.append(HighlightPoint{offset, length});
     }
+    for (const QJsonValue &sectionValue : object.value(QStringLiteral("autoChangeSections")).toArray()) {
+        const QJsonObject sectionObject = sectionValue.toObject();
+        const qsizetype offset = sectionObject.value(QStringLiteral("offset")).toInt(-1);
+        const qsizetype length = sectionObject.value(QStringLiteral("length")).toInt(-1);
+        const qsizetype sourceOffset = sectionObject.value(QStringLiteral("sourcePointOffset")).toInt(-1);
+        const bool HAS_SOURCE = std::any_of(snippet.highlightPoints.cbegin(), snippet.highlightPoints.cend(),
+            [sourceOffset](const HighlightPoint &point) { return point.offset == sourceOffset; });
+        if (offset >= 0 && length >= 0 && offset + length <= snippet.code.size() && HAS_SOURCE)
+            snippet.autoChangeSections.append(AutoChangeSection{offset, length, sourceOffset});
+    }
     return snippet;
 }
 
@@ -106,6 +127,96 @@ QString SnippetStore::directoryPath()
 {
     return QDir(QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation))
         .filePath(QStringLiteral("snippets"));
+}
+
+QVector<Snippet> SnippetStore::builtInSnippets()
+{
+    const auto makeSnippet = [](const QString &id, const QString &name, const QString &description,
+                                const QString &code, const QStringList &placeholders = QStringList()) {
+        Snippet snippet;
+        snippet.id = QStringLiteral("builtin-") + id;
+        snippet.name = name;
+        snippet.description = description;
+        snippet.code = code;
+        for (const QString &placeholder : placeholders) {
+            const qsizetype offset = snippet.code.indexOf(placeholder);
+            if (offset >= 0)
+                snippet.highlightPoints.append(HighlightPoint{offset, placeholder.size()});
+        }
+        return snippet;
+    };
+
+    QVector<Snippet> snippets = {
+        makeSnippet(QStringLiteral("function"), QStringLiteral("function"),
+            QStringLiteral("A reusable Bash function with a return status."),
+            QStringLiteral("function my_function() {\n    echo \"Hello World\"\n}\n"),
+            {QStringLiteral("my_function"), QStringLiteral("echo \"Hello World\"")}),
+        makeSnippet(QStringLiteral("for-list"), QStringLiteral("forlist"),
+            QStringLiteral("Run a block once for each item in a list."),
+            QStringLiteral("for item in \"${items[@]}\"; do\n    printf '%s\\n' \"$item\"\ndone\n"),
+            {QStringLiteral("items"), QStringLiteral("item")}),
+        makeSnippet(QStringLiteral("while-read"), QStringLiteral("readlines"),
+            QStringLiteral("Safely read a file line by line, preserving whitespace."),
+            QStringLiteral("while IFS= read -r line; do\n    printf '%s\\n' \"$line\"\ndone < \"${input_file}\"\n"),
+            {QStringLiteral("input_file"), QStringLiteral("line")}),
+        makeSnippet(QStringLiteral("if-file"), QStringLiteral("fileexists"),
+            QStringLiteral("Branch based on whether a file exists."),
+            QStringLiteral("if [[ -f \"${file_path}\" ]]; then\n    printf 'Found: %s\\n' \"$file_path\"\nelse\n    printf 'Missing: %s\\n' \"$file_path\" >&2\nfi\n"),
+            {QStringLiteral("file_path")}),
+        makeSnippet(QStringLiteral("variable"), QStringLiteral("localvariable"),
+            QStringLiteral("Declare a function-local variable with a default value."),
+            QStringLiteral("local variable_name=\"${1:-default_value}\"\n"),
+            {QStringLiteral("variable_name"), QStringLiteral("default_value")}),
+        makeSnippet(QStringLiteral("case"), QStringLiteral("casestatement"),
+            QStringLiteral("Handle a value with several matching patterns."),
+            QStringLiteral("case \"${choice}\" in\n    start)\n        printf 'Starting…\\n'\n        ;;\n    stop)\n        printf 'Stopping…\\n'\n        ;;\n    *)\n        printf 'Unknown choice: %s\\n' \"$choice\" >&2\n        return 2\n        ;;\nesac\n"),
+            {QStringLiteral("choice"), QStringLiteral("start"), QStringLiteral("stop")}),
+        makeSnippet(QStringLiteral("command-check"), QStringLiteral("checkcommand"),
+            QStringLiteral("Check that a required executable is available."),
+            QStringLiteral("if ! command -v \"${command_name}\" >/dev/null 2>&1; then\n    printf 'Required command not found: %s\\n' \"$command_name\" >&2\n    return 1\nfi\n"),
+            {QStringLiteral("command_name")}),
+        makeSnippet(QStringLiteral("temp-cleanup"), QStringLiteral("tempfile"),
+            QStringLiteral("Create a temporary file and remove it on exit."),
+            QStringLiteral("temp_file=$(mktemp)\ntrap 'rm -f -- \"$temp_file\"' EXIT\n\n"),
+            {QStringLiteral("temp_file")}),
+        makeSnippet(QStringLiteral("argument-default"), QStringLiteral("argumentwithdefault"),
+            QStringLiteral("Read a positional argument and provide a fallback."),
+            QStringLiteral("value=\"${1:-default_value}\"\n"),
+            {QStringLiteral("default_value")})
+    };
+
+    const auto linkRepeatedValue = [&snippets](const QString &id, const QString &value, int targetOccurrence = 1) {
+        auto snippet = std::find_if(snippets.begin(), snippets.end(), [&id](const Snippet &item) {
+            return item.id == QStringLiteral("builtin-") + id;
+        });
+        if (snippet == snippets.end())
+            return;
+        const qsizetype sourceOffset = snippet->code.indexOf(value);
+        if (sourceOffset < 0)
+            return;
+        const bool HAS_POINT = std::any_of(snippet->highlightPoints.cbegin(), snippet->highlightPoints.cend(),
+            [sourceOffset, &value](const HighlightPoint &point) {
+                return point.offset == sourceOffset && point.length == value.size();
+            });
+        if (!HAS_POINT)
+            snippet->highlightPoints.append(HighlightPoint{sourceOffset, value.size()});
+        qsizetype targetOffset = sourceOffset + value.size();
+        for (int occurrence = 1; occurrence <= targetOccurrence; ++occurrence) {
+            targetOffset = snippet->code.indexOf(value, targetOffset);
+            if (targetOffset < 0)
+                return;
+            targetOffset += value.size();
+        }
+        targetOffset -= value.size();
+        snippet->autoChangeSections.append(AutoChangeSection{targetOffset, value.size(), sourceOffset});
+    };
+    linkRepeatedValue(QStringLiteral("for-list"), QStringLiteral("item"));
+    linkRepeatedValue(QStringLiteral("while-read"), QStringLiteral("line"));
+    linkRepeatedValue(QStringLiteral("if-file"), QStringLiteral("file_path"), 2);
+    linkRepeatedValue(QStringLiteral("case"), QStringLiteral("choice"));
+    linkRepeatedValue(QStringLiteral("command-check"), QStringLiteral("command_name"));
+    linkRepeatedValue(QStringLiteral("temp-cleanup"), QStringLiteral("temp_file"));
+    return snippets;
 }
 
 QVector<Snippet> SnippetStore::loadAll()
@@ -155,6 +266,10 @@ bool SnippetStore::nameIsAvailable(const QString &name, const QString &exceptId)
     const QString NORMALIZED = name.trimmed();
     if (NORMALIZED.isEmpty())
         return false;
+    for (const Snippet &snippet : builtInSnippets()) {
+        if (snippet.name.compare(NORMALIZED, Qt::CaseInsensitive) == 0)
+            return false;
+    }
     for (const Snippet &snippet : loadAll()) {
         if (snippet.id != exceptId && snippet.name.compare(NORMALIZED, Qt::CaseInsensitive) == 0)
             return false;

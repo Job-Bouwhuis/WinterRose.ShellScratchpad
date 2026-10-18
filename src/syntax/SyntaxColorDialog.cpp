@@ -76,16 +76,5 @@ void SyntaxColorDialog::rebuild()
         });
         form->addRow(role.second, button);
     }
-    auto *hereDocButton = new QPushButton(settings->hereDocBackground().name(), rows);
-    hereDocButton->setMinimumWidth(110);
-    hereDocButton->setStyleSheet(QStringLiteral("background-color: %1; color: #202020;")
-                                     .arg(settings->hereDocBackground().name()));
-    connect(hereDocButton, &QPushButton::clicked, this, [this, hereDocButton]() {
-        const QColor SELECTED = QColorDialog::getColor(settings->hereDocBackground(), this,
-                                                        QStringLiteral("Choose here-document background"));
-        if (SELECTED.isValid())
-            settings->setHereDocBackground(SELECTED);
-    });
-    form->addRow(QStringLiteral("Here-document background"), hereDocButton);
 }
 }

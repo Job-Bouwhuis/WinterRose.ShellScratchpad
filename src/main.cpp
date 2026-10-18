@@ -57,6 +57,7 @@
 #include <QRegularExpression>
 #include <QSplitter>
 #include <QStatusBar>
+#include <QSet>
 #include <QSyntaxHighlighter>
 #include <QStringList>
 #include <QStringView>
@@ -65,6 +66,7 @@
 #include <QTextCharFormat>
 #include <QTextDocument>
 #include <QTimer>
+#include <QToolButton>
 #include <QThreadPool>
 #include <QRunnable>
 #include <QVBoxLayout>
@@ -72,9 +74,11 @@
 
 #include <functional>
 #include <atomic>
+#include <algorithm>
 #include <memory>
 
 #include "syntax/SyntaxHighlighter.h"
+#include "syntax/SyntaxTokenizer.h"
 #include "syntax/SyntaxDebugDialog.h"
 #include "syntax/SyntaxColorDialog.h"
 #include "editor/CodeEditor.h"
@@ -82,6 +86,7 @@
 #include "snippets/SnippetManagerDialog.h"
 #include "snippets/SnippetCreateDialog.h"
 #include "snippets/SnippetStore.h"
+#include "util/FuzzyMatcher.h"
 
 #include <cerrno>
 #include <csignal>
@@ -442,11 +447,13 @@ public:
         matchFormat.setForeground(QColor(QStringLiteral("#fff4c2")));
     }
 
-    void setQuery(const QString &newQuery)
+    void setQuery(const QString &newQuery, bool caseSensitive)
     {
-        if (query == newQuery)
+        if (query == newQuery && this->caseSensitive == caseSensitive)
             return;
         query = newQuery;
+        this->caseSensitive = caseSensitive;
+        rehighlight();
     }
 
 protected:
@@ -456,7 +463,8 @@ protected:
             return;
         qsizetype start = 0;
         while (start < text.size()) {
-            const qsizetype MATCH = text.indexOf(query, start, Qt::CaseInsensitive);
+            const qsizetype MATCH = text.indexOf(query, start,
+                caseSensitive ? Qt::CaseSensitive : Qt::CaseInsensitive);
             if (MATCH < 0)
                 break;
             setFormat(static_cast<int>(MATCH), query.size(), matchFormat);
@@ -466,6 +474,7 @@ protected:
 
 private:
     QString query;
+    bool caseSensitive = false;
     QTextCharFormat matchFormat;
 };
 }
@@ -520,6 +529,7 @@ public:
             if (index == 0) {
                 QSettings().setValue(QStringLiteral("runProfiles/active"), QString());
                 directoryEdit->setText(defaultWorkingDirectory);
+                refreshCompletionProfileVariables();
                 if (!applyingScriptRunProfile)
                     saveScriptRunProfile(QString());
                 return;
@@ -539,6 +549,7 @@ public:
                     break;
                 }
             }
+            refreshCompletionProfileVariables();
         });
 
         splitter = new QSplitter(Qt::Vertical, central);
@@ -563,7 +574,77 @@ public:
         scriptEdit->document()->setModified(false);
         new ShellScratchpad::Syntax::SyntaxHighlighter(scriptEdit);
         completionController = new ShellScratchpad::Completion::CompletionController(scriptEdit, scriptEdit);
+        connect(scriptEdit, &QPlainTextEdit::textChanged, this, [this]() { refreshNavigationSymbols(); });
+        connect(scriptEdit, &ShellScratchpad::CodeEditor::symbolNavigationRequested, this,
+                [this](const QString &name) {
+            const QJsonObject profile = selectedRunProfile();
+            if (profile.value(QStringLiteral("environment")).toObject().contains(name)) {
+                manageRunProfiles(profile.value(QStringLiteral("name")).toString(), name);
+                return;
+            }
+            const auto &symbols = completionController->scriptSymbols();
+            const auto symbol = std::find_if(symbols.cbegin(), symbols.cend(),
+                [&name](const auto &candidate) { return candidate.name == name; });
+            if (symbol == symbols.cend())
+                return;
+            scriptEdit->revealPosition(symbol->declarationOffset);
+            QTextCursor declaration(scriptEdit->document());
+            declaration.setPosition(static_cast<int>(symbol->declarationOffset));
+            declaration.setPosition(static_cast<int>(symbol->declarationOffset + name.size()), QTextCursor::KeepAnchor);
+            scriptEdit->setTextCursor(declaration);
+            scriptEdit->centerCursor();
+            scriptEdit->setFocus();
+        });
+        refreshCompletionProfileVariables();
         scriptLayout->addWidget(scriptHeading);
+        scriptSearchRow = new QWidget(scriptPanel);
+        auto *scriptSearchLayout = new QHBoxLayout(scriptSearchRow);
+        scriptSearchLayout->setContentsMargins(0, 0, 0, 0);
+        scriptSearchLayout->setSpacing(5);
+        scriptFindEdit = new QLineEdit(scriptSearchRow);
+        scriptFindEdit->setClearButtonEnabled(true);
+        scriptFindEdit->setPlaceholderText(QStringLiteral("Find in script"));
+        scriptFindEdit->setToolTip(QStringLiteral("Search the script. Enter finds the next match; Shift+Enter finds the previous match."));
+        auto *findPreviousButton = new QPushButton(QStringLiteral("↑"), scriptSearchRow);
+        findPreviousButton->setToolTip(QStringLiteral("Find previous (Shift+Enter)"));
+        auto *findNextButton = new QPushButton(QStringLiteral("↓"), scriptSearchRow);
+        findNextButton->setToolTip(QStringLiteral("Find next (Enter)"));
+        auto *findOptionsButton = new QToolButton(scriptSearchRow);
+        findOptionsButton->setText(QStringLiteral("Options"));
+        findOptionsButton->setPopupMode(QToolButton::InstantPopup);
+        auto *findOptionsMenu = new QMenu(findOptionsButton);
+        scriptFindCaseSensitiveAction = findOptionsMenu->addAction(QStringLiteral("Case sensitive"));
+        scriptFindCaseSensitiveAction->setCheckable(true);
+        findOptionsButton->setMenu(findOptionsMenu);
+        auto *closeFindButton = new QPushButton(QStringLiteral("×"), scriptSearchRow);
+        closeFindButton->setToolTip(QStringLiteral("Close search (Esc)"));
+        scriptSearchLayout->addWidget(scriptFindEdit, 1);
+        scriptSearchLayout->addWidget(findPreviousButton);
+        scriptSearchLayout->addWidget(findNextButton);
+        scriptSearchLayout->addWidget(findOptionsButton);
+        scriptSearchLayout->addWidget(closeFindButton);
+        scriptLayout->addWidget(scriptSearchRow);
+        scriptSearchRow->hide();
+        connect(findNextButton, &QPushButton::clicked, this, [this]() { findInScript(false); });
+        connect(findPreviousButton, &QPushButton::clicked, this, [this]() { findInScript(true); });
+        connect(scriptFindEdit, &QLineEdit::textChanged, this, [this]() {
+            if (!scriptFindEdit->text().isEmpty())
+                findInScript(false, true);
+            else {
+                QTextCursor cursor = scriptEdit->textCursor();
+                cursor.clearSelection();
+                scriptEdit->setTextCursor(cursor);
+            }
+        });
+        connect(scriptFindCaseSensitiveAction, &QAction::toggled, this, [this]() {
+            if (!scriptFindEdit->text().isEmpty())
+                findInScript(false, true);
+        });
+        connect(closeFindButton, &QPushButton::clicked, this, [this]() {
+            scriptSearchRow->hide();
+            scriptEdit->setFocus();
+        });
+        scriptFindEdit->installEventFilter(this);
         scriptLayout->addWidget(scriptEdit, 1);
 
         outputPanel = new QWidget(splitter);
@@ -572,40 +653,57 @@ public:
         outputLayout->setSpacing(6);
         auto *outputHeadingRow = new QHBoxLayout();
         auto *outputHeading = new QLabel(QStringLiteral("Output"), outputPanel);
-        clearOutputCheck = new QCheckBox(QStringLiteral("Clear before each run"), outputPanel);
-        clearOutputCheck->setChecked(true);
         auto *copyButton = new QPushButton(QStringLiteral("Copy output"), outputPanel);
         copyButton->setToolTip(QStringLiteral("Copy selected output, or all output when nothing is selected"));
-        connect(copyButton, &QPushButton::clicked, this, [this]() {
-            const QTextCursor CURSOR = outputEdit->textCursor();
-            QString text = CURSOR.hasSelection() ? CURSOR.selectedText() : outputEdit->toPlainText();
-            text.replace(QChar::ParagraphSeparator, QLatin1Char('\n'));
-            QApplication::clipboard()->setText(text);
-            statusBar()->showMessage(CURSOR.hasSelection()
-                ? QStringLiteral("Selected output copied to clipboard")
-                : QStringLiteral("Output copied to clipboard"), 2500);
-        });
+        connect(copyButton, &QPushButton::clicked, this, [this]() { copyOutput(); });
         auto *clearButton = new QPushButton(QStringLiteral("Clear output"), outputPanel);
         connect(clearButton, &QPushButton::clicked, this, [this]() {
             clearOutput();
         });
-        auto *bookmarkButton = new QPushButton(QStringLiteral("Bookmark line"), outputPanel);
-        bookmarkButton->setToolTip(QStringLiteral("Save the selected output line as a bookmark"));
+        auto *bookmarkButton = new QPushButton(QStringLiteral("Bookmark selection"), outputPanel);
+        bookmarkButton->setToolTip(QStringLiteral("Save selected output text as a bookmark, or bookmark the current line when there is no selection"));
         connect(bookmarkButton, &QPushButton::clicked, this, [this]() { addOutputBookmark(); });
         outputHeadingRow->addWidget(outputHeading);
         outputHeadingRow->addStretch(1);
-        outputHeadingRow->addWidget(clearOutputCheck);
         outputHeadingRow->addWidget(copyButton);
         outputHeadingRow->addWidget(clearButton);
         outputHeadingRow->addWidget(bookmarkButton);
 
-        auto *outputSearchRow = new QHBoxLayout();
-        outputSearchRow->addWidget(new QLabel(QStringLiteral("Find in output"), outputPanel));
+        outputSearchRow = new QWidget(outputPanel);
+        auto *outputSearchLayout = new QHBoxLayout(outputSearchRow);
+        outputSearchLayout->setContentsMargins(0, 0, 0, 0);
+        outputSearchLayout->setSpacing(5);
         outputFindEdit = new QLineEdit(outputPanel);
         outputFindEdit->setClearButtonEnabled(true);
         outputFindEdit->setPlaceholderText(QStringLiteral("Type to show matching lines…"));
         outputFindEdit->setToolTip(QStringLiteral("Filter output to lines containing this text; matching characters are highlighted."));
-        outputSearchRow->addWidget(outputFindEdit, 1);
+        auto *outputPreviousButton = new QPushButton(QStringLiteral("↑"), outputSearchRow);
+        outputPreviousButton->setToolTip(QStringLiteral("Previous matching line (Shift+Enter)"));
+        auto *outputNextButton = new QPushButton(QStringLiteral("↓"), outputSearchRow);
+        outputNextButton->setToolTip(QStringLiteral("Next matching line (Enter)"));
+        auto *outputOptionsButton = new QToolButton(outputSearchRow);
+        outputOptionsButton->setText(QStringLiteral("Options"));
+        outputOptionsButton->setPopupMode(QToolButton::InstantPopup);
+        auto *outputOptionsMenu = new QMenu(outputOptionsButton);
+        outputFindCaseSensitiveAction = outputOptionsMenu->addAction(QStringLiteral("Case sensitive"));
+        outputFindCaseSensitiveAction->setCheckable(true);
+        outputOptionsButton->setMenu(outputOptionsMenu);
+        auto *closeOutputFindButton = new QPushButton(QStringLiteral("×"), outputSearchRow);
+        closeOutputFindButton->setToolTip(QStringLiteral("Close search (Esc)"));
+        outputSearchLayout->addWidget(outputFindEdit, 1);
+        outputSearchLayout->addWidget(outputPreviousButton);
+        outputSearchLayout->addWidget(outputNextButton);
+        outputSearchLayout->addWidget(outputOptionsButton);
+        outputSearchLayout->addWidget(closeOutputFindButton);
+        outputSearchRow->hide();
+        connect(outputPreviousButton, &QPushButton::clicked, this, [this]() { navigateOutputMatches(true); });
+        connect(outputNextButton, &QPushButton::clicked, this, [this]() { navigateOutputMatches(false); });
+        connect(closeOutputFindButton, &QPushButton::clicked, this, [this]() {
+            outputFindEdit->clear();
+            outputSearchRow->hide();
+            outputEdit->setFocus();
+        });
+        outputFindEdit->installEventFilter(this);
 
         outputEdit = new QPlainTextEdit(outputPanel);
         outputEdit->setReadOnly(true);
@@ -615,7 +713,7 @@ public:
         outputEdit->setPlaceholderText(QStringLiteral("Script output and errors will appear here."));
         outputMatchHighlighter = new OutputMatchHighlighter(outputEdit->document());
         outputLayout->addLayout(outputHeadingRow);
-        outputLayout->addLayout(outputSearchRow);
+        outputLayout->addWidget(outputSearchRow);
         outputLayout->addWidget(outputEdit, 1);
 
         splitter->addWidget(scriptPanel);
@@ -647,20 +745,6 @@ public:
 
         setCentralWidget(central);
 
-        guiSudoCheck = new QCheckBox(QStringLiteral("GUI sudo prompts"), this);
-        guiSudoCheck->setChecked(true);
-        guiSudoCheck->setToolTip(QStringLiteral("Show a masked dialog when the script needs sudo authentication. Turn this off only when the script or environment handles sudo input itself."));
-        reuseSudoPasswordCheck = new QCheckBox(QStringLiteral("Reuse sudo password for this run"), this);
-        reuseSudoPasswordCheck->setChecked(true);
-        reuseSudoPasswordCheck->setToolTip(QStringLiteral("Keep the password only in the running script process so sudo is prompted once per run."));
-        auto *sudoOptions = new QWidget(this);
-        auto *sudoOptionsLayout = new QHBoxLayout(sudoOptions);
-        sudoOptionsLayout->setContentsMargins(0, 0, 0, 0);
-        sudoOptionsLayout->addWidget(guiSudoCheck);
-        sudoOptionsLayout->addWidget(reuseSudoPasswordCheck);
-        sudoOptionsLayout->addStretch(1);
-        pageLayout->insertWidget(2, sudoOptions);
-        connect(guiSudoCheck, &QCheckBox::toggled, reuseSudoPasswordCheck, &QWidget::setEnabled);
         outputFilterPool.setMaxThreadCount(1);
         outputFilterTimer.setSingleShot(true);
         outputFilterTimer.setInterval(90);
@@ -669,6 +753,7 @@ public:
                 [this](bool) { updateWindowTitle(); });
         connect(scriptEdit, &QPlainTextEdit::textChanged, this, [this]() {
             updateWindowTitle();
+            scriptEdit->setTextDecorations({});
             if (recoveryEnabled)
                 recoveryTimer.start();
             latestDraftTimer.start();
@@ -694,6 +779,22 @@ public:
         addDockWidget(Qt::BottomDockWidgetArea, diagnosticsDock);
         diagnosticsDock->hide();
         connect(diagnosticsList, &QListWidget::itemActivated, this, [this](QListWidgetItem *item) {
+            const int FIX_START = item->data(Qt::UserRole + 5).toInt();
+            const int FIX_LENGTH = item->data(Qt::UserRole + 6).toInt();
+            const QString FIX_REPLACEMENT = item->data(Qt::UserRole + 7).toString();
+            const QString EXPECTED_TEXT = item->data(Qt::UserRole + 8).toString();
+            if (FIX_LENGTH > 0 && !FIX_REPLACEMENT.isEmpty() && FIX_START >= 0 &&
+                scriptEdit->toPlainText().mid(FIX_START, FIX_LENGTH) == EXPECTED_TEXT) {
+                QTextCursor fix(scriptEdit->document());
+                fix.setPosition(FIX_START);
+                fix.setPosition(FIX_START + FIX_LENGTH, QTextCursor::KeepAnchor);
+                fix.insertText(FIX_REPLACEMENT);
+                fix.setPosition(FIX_START);
+                fix.setPosition(FIX_START + FIX_REPLACEMENT.size(), QTextCursor::KeepAnchor);
+                scriptEdit->setTextCursor(fix);
+                scriptEdit->setFocus();
+                return;
+            }
             const int LINE = item->data(Qt::UserRole).toInt();
             if (LINE > 0) {
                 QTextCursor cursor(scriptEdit->document()->findBlockByNumber(LINE - 1));
@@ -723,6 +824,135 @@ public:
         connect(scriptEdit, &QWidget::customContextMenuRequested, this, [this](const QPoint &position) {
             const bool HAS_SELECTION = scriptEdit->textCursor().hasSelection();
             QMenu contextMenu(scriptEdit);
+
+            // Resolve the clicked token independently of the current caret/selection.
+            const QString SOURCE = scriptEdit->toPlainText();
+            const QTextCursor CLICK_CURSOR = scriptEdit->cursorForPosition(position);
+            qsizetype CLICK_OFFSET = CLICK_CURSOR.position();
+            if (CLICK_OFFSET == SOURCE.size() && CLICK_OFFSET > 0)
+                --CLICK_OFFSET;
+            const QVector<ShellScratchpad::Syntax::SyntaxToken> TOKENS =
+                ShellScratchpad::Syntax::SyntaxTokenizer::tokenize(SOURCE);
+            const ShellScratchpad::Syntax::SyntaxToken *clickedToken = nullptr;
+            for (const auto &token : TOKENS) {
+                if (CLICK_OFFSET >= token.startOffset &&
+                    CLICK_OFFSET < token.startOffset + token.length) {
+                    clickedToken = &token;
+                    break;
+                }
+            }
+            QString commandContext;
+            bool commandContextBuiltin = false;
+            if (clickedToken) {
+                for (const auto &token : TOKENS) {
+                    if (token.startOffset > clickedToken->startOffset)
+                        break;
+                    if (token.kind == ShellScratchpad::Syntax::TokenKind::Operator) {
+                        const QString OPERATOR = SOURCE.mid(token.startOffset, token.length);
+                        if (OPERATOR == QStringLiteral(";") || OPERATOR == QStringLiteral("&&") ||
+                            OPERATOR == QStringLiteral("||") || OPERATOR == QStringLiteral("|") ||
+                            OPERATOR == QStringLiteral("|&")) {
+                            commandContext.clear();
+                            commandContextBuiltin = false;
+                        }
+                    } else if (token.kind == ShellScratchpad::Syntax::TokenKind::Command ||
+                               token.kind == ShellScratchpad::Syntax::TokenKind::Builtin) {
+                        commandContext = SOURCE.mid(token.startOffset, token.length);
+                        commandContextBuiltin = token.kind == ShellScratchpad::Syntax::TokenKind::Builtin;
+                    }
+                }
+                const QString tokenText = SOURCE.mid(clickedToken->startOffset, clickedToken->length);
+                QString symbolName = tokenText;
+                if (clickedToken->kind == ShellScratchpad::Syntax::TokenKind::Variable) {
+                    static const QRegularExpression VARIABLE_NAME(QStringLiteral(R"(^\$\{?([A-Za-z_][A-Za-z0-9_]*))"));
+                    const auto MATCH = VARIABLE_NAME.match(tokenText);
+                    symbolName = MATCH.hasMatch() ? MATCH.captured(1) : QString();
+                }
+                bool hasContextAction = false;
+                const bool SYMBOL_TOKEN = clickedToken->kind == ShellScratchpad::Syntax::TokenKind::Variable ||
+                    clickedToken->kind == ShellScratchpad::Syntax::TokenKind::AssignmentName ||
+                    clickedToken->kind == ShellScratchpad::Syntax::TokenKind::Command ||
+                    clickedToken->kind == ShellScratchpad::Syntax::TokenKind::Builtin ||
+                    clickedToken->kind == ShellScratchpad::Syntax::TokenKind::Argument ||
+                    clickedToken->kind == ShellScratchpad::Syntax::TokenKind::Word;
+                const QJsonObject PROFILE = selectedRunProfile();
+                const QJsonObject PROFILE_OVERRIDES = PROFILE.value(QStringLiteral("environment")).toObject();
+                if (SYMBOL_TOKEN && !symbolName.isEmpty() && PROFILE_OVERRIDES.contains(symbolName)) {
+                    QAction *profileDeclaration = contextMenu.addAction(
+                        QStringLiteral("Go to execution profile declaration of %1").arg(symbolName));
+                    const QString PROFILE_NAME = PROFILE.value(QStringLiteral("name")).toString();
+                    connect(profileDeclaration, &QAction::triggered, this,
+                            [this, PROFILE_NAME, symbolName]() { manageRunProfiles(PROFILE_NAME, symbolName); });
+                    hasContextAction = true;
+                } else if (SYMBOL_TOKEN && completionController && !symbolName.isEmpty()) {
+                    const auto &SYMBOLS = completionController->scriptSymbols();
+                    const auto SYMBOL = std::find_if(SYMBOLS.cbegin(), SYMBOLS.cend(),
+                        [&symbolName](const auto &entry) { return entry.name == symbolName; });
+                    if (SYMBOL != SYMBOLS.cend()) {
+                        QAction *declarationAction = contextMenu.addAction(
+                            QStringLiteral("Go to declaration of %1").arg(symbolName));
+                        const qsizetype DECLARATION_OFFSET = SYMBOL->declarationOffset;
+                        const qsizetype DECLARATION_LENGTH = symbolName.size();
+                        connect(declarationAction, &QAction::triggered, this,
+                                [this, DECLARATION_OFFSET, DECLARATION_LENGTH]() {
+                            scriptEdit->revealPosition(DECLARATION_OFFSET);
+                            QTextCursor declaration(scriptEdit->document());
+                            declaration.setPosition(static_cast<int>(DECLARATION_OFFSET));
+                            declaration.setPosition(static_cast<int>(DECLARATION_OFFSET + DECLARATION_LENGTH),
+                                                    QTextCursor::KeepAnchor);
+                            scriptEdit->setTextCursor(declaration);
+                            scriptEdit->centerCursor();
+                            scriptEdit->setFocus();
+                        });
+                        hasContextAction = true;
+                    }
+                }
+                if (!commandContext.isEmpty()) {
+                    const bool DOCS_ELIGIBLE = clickedToken->kind == ShellScratchpad::Syntax::TokenKind::Command ||
+                        clickedToken->kind == ShellScratchpad::Syntax::TokenKind::Builtin ||
+                        clickedToken->kind == ShellScratchpad::Syntax::TokenKind::Option ||
+                        clickedToken->kind == ShellScratchpad::Syntax::TokenKind::Argument ||
+                        clickedToken->kind == ShellScratchpad::Syntax::TokenKind::Path ||
+                        clickedToken->kind == ShellScratchpad::Syntax::TokenKind::Number;
+                    if (DOCS_ELIGIBLE) {
+                        const QString ACTION_LABEL = commandContextBuiltin
+                            ? QStringLiteral("Open Bash manual for %1").arg(commandContext)
+                            : QStringLiteral("Open man page for %1").arg(commandContext);
+                        QAction *manPage = contextMenu.addAction(ACTION_LABEL);
+                        const QString SEARCH_TERM = commandContextBuiltin ? commandContext : tokenText;
+                        connect(manPage, &QAction::triggered, this,
+                                [this, commandContext, commandContextBuiltin, SEARCH_TERM]() {
+                            openManPage(commandContext, commandContextBuiltin, SEARCH_TERM);
+                        });
+                        hasContextAction = true;
+                    }
+                }
+                if (hasContextAction)
+                    contextMenu.addSeparator();
+            }
+
+            const QTextBlock RIGHT_CLICKED_BLOCK = scriptEdit->cursorForPosition(position).block();
+            const int RIGHT_CLICKED_LINE = RIGHT_CLICKED_BLOCK.blockNumber() + 1;
+            QStringList lineErrors;
+            for (int row = 0; row < diagnosticsList->count(); ++row) {
+                const QListWidgetItem *diagnostic = diagnosticsList->item(row);
+                if (diagnostic->data(Qt::UserRole).toInt() != RIGHT_CLICKED_LINE)
+                    continue;
+                lineErrors.append(QStringLiteral("%1 SC%2 at column %3: %4")
+                    .arg(diagnostic->data(Qt::UserRole + 3).toString().toUpper())
+                    .arg(diagnostic->data(Qt::UserRole + 1).toInt(), 4, 10, QLatin1Char('0'))
+                    .arg(diagnostic->data(Qt::UserRole + 2).toInt())
+                    .arg(diagnostic->data(Qt::UserRole + 4).toString()));
+            }
+            if (!lineErrors.isEmpty()) {
+                QAction *copyLineAndErrors = contextMenu.addAction(QStringLiteral("Copy Line and Diagnostics"));
+                const QString LINE_TEXT = RIGHT_CLICKED_BLOCK.text();
+                connect(copyLineAndErrors, &QAction::triggered, this, [RIGHT_CLICKED_LINE, LINE_TEXT, lineErrors]() {
+                    QApplication::clipboard()->setText(QStringLiteral("Line %1: %2\nDiagnostics:\n%3")
+                        .arg(RIGHT_CLICKED_LINE).arg(LINE_TEXT, lineErrors.join(QLatin1Char('\n'))));
+                });
+                contextMenu.addSeparator();
+            }
 
             QAction *paste = contextMenu.addAction(QStringLiteral("Paste"));
             paste->setEnabled(QApplication::clipboard()->mimeData()->hasText());
@@ -764,6 +994,7 @@ public:
         });
         connect(stopButton, &QPushButton::clicked, this, [this]() { stopScript(); });
         connect(outputFindEdit, &QLineEdit::textChanged, this, [this]() { refreshOutputView(); });
+        connect(outputFindCaseSensitiveAction, &QAction::toggled, this, [this]() { refreshOutputView(); });
         scriptEdit->installEventFilter(this);
 
         connect(&process, &QProcess::readyReadStandardOutput, this, [this]() {
@@ -853,6 +1084,31 @@ public:
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override
     {
+        if (watched == outputFindEdit && event->type() == QEvent::KeyPress) {
+            auto *keyEvent = static_cast<QKeyEvent *>(event);
+            if (keyEvent->key() == Qt::Key_Escape) {
+                outputFindEdit->clear();
+                outputSearchRow->hide();
+                outputEdit->setFocus();
+                return true;
+            }
+            if (keyEvent->key() == Qt::Key_Return || keyEvent->key() == Qt::Key_Enter) {
+                navigateOutputMatches(keyEvent->modifiers().testFlag(Qt::ShiftModifier));
+                return true;
+            }
+        }
+        if (watched == scriptFindEdit && event->type() == QEvent::KeyPress) {
+            auto *keyEvent = static_cast<QKeyEvent *>(event);
+            if (keyEvent->key() == Qt::Key_Escape) {
+                scriptSearchRow->hide();
+                scriptEdit->setFocus();
+                return true;
+            }
+            if (keyEvent->key() == Qt::Key_Return || keyEvent->key() == Qt::Key_Enter) {
+                findInScript(keyEvent->modifiers().testFlag(Qt::ShiftModifier));
+                return true;
+            }
+        }
         if (watched == scriptEdit && event->type() == QEvent::KeyPress) {
             auto *keyEvent = static_cast<QKeyEvent *>(event);
             const Qt::KeyboardModifiers MODIFIERS = keyEvent->modifiers();
@@ -913,16 +1169,21 @@ protected:
 
 private:
     ShellScratchpad::CodeEditor *scriptEdit = nullptr;
+    QWidget *scriptSearchRow = nullptr;
+    QLineEdit *scriptFindEdit = nullptr;
+    QAction *scriptFindCaseSensitiveAction = nullptr;
     QPlainTextEdit *outputEdit = nullptr;
     QLineEdit *outputFindEdit = nullptr;
+    QWidget *outputSearchRow = nullptr;
+    QAction *outputFindCaseSensitiveAction = nullptr;
     QWidget *outputPanel = nullptr;
     QSplitter *splitter = nullptr;
     QLineEdit *directoryEdit = nullptr;
     QString defaultWorkingDirectory;
     QComboBox *runProfileCombo = nullptr;
-    QCheckBox *clearOutputCheck = nullptr;
-    QCheckBox *guiSudoCheck = nullptr;
-    QCheckBox *reuseSudoPasswordCheck = nullptr;
+    QAction *clearOutputEachRunAction = nullptr;
+    QAction *guiSudoPromptsAction = nullptr;
+    QAction *reuseSudoPasswordAction = nullptr;
     QPushButton *runButton = nullptr;
     QPushButton *stopButton = nullptr;
     QLabel *runStatusLabel = nullptr;
@@ -938,6 +1199,7 @@ private:
     QString outputContent;
     QElapsedTimer runElapsed;
     OutputMatchHighlighter *outputMatchHighlighter = nullptr;
+    qsizetype outputFindNavigationPosition = 0;
     QThreadPool outputFilterPool;
     QTimer outputFilterTimer;
     std::shared_ptr<std::atomic<quint64>> outputFilterGeneration =
@@ -974,6 +1236,72 @@ private:
     bool recoveryEnabled = false;
     bool recoveryDraftOwned = false;
     int zoomLevel = 0;
+
+    void openManPage(const QString &command, bool isShellBuiltin, const QString &searchTerm)
+    {
+        const QString MAN_PROGRAM = QStandardPaths::findExecutable(QStringLiteral("man"));
+        if (MAN_PROGRAM.isEmpty()) {
+            QMessageBox::information(this, QStringLiteral("Manual pages unavailable"),
+                QStringLiteral("The 'man' program is not installed or could not be found."));
+            return;
+        }
+        const QString TOPIC = isShellBuiltin ? QStringLiteral("bash") : QFileInfo(command).fileName();
+        if (TOPIC.isEmpty())
+            return;
+        auto *manProcess = new QProcess(this);
+        QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+        environment.insert(QStringLiteral("MANPAGER"), QStringLiteral("cat"));
+        environment.insert(QStringLiteral("PAGER"), QStringLiteral("cat"));
+        environment.insert(QStringLiteral("GROFF_NO_SGR"), QStringLiteral("1"));
+        environment.insert(QStringLiteral("MANWIDTH"), QStringLiteral("100"));
+        manProcess->setProcessEnvironment(environment);
+        connect(manProcess, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+                [this, manProcess, command, isShellBuiltin, searchTerm, TOPIC](int exitCode, QProcess::ExitStatus) {
+            const QString OUTPUT = QString::fromLocal8Bit(manProcess->readAllStandardOutput()).replace(QLatin1Char('\r'), QLatin1Char('\n'));
+            const QString ERROR = QString::fromLocal8Bit(manProcess->readAllStandardError()).trimmed();
+            manProcess->deleteLater();
+            if (exitCode != 0 || OUTPUT.trimmed().isEmpty()) {
+                const QString MESSAGE = ERROR.isEmpty()
+                    ? QStringLiteral("No manual page was found for %1.").arg(command)
+                    : ERROR;
+                QMessageBox::information(this, QStringLiteral("Manual page unavailable"), MESSAGE);
+                return;
+            }
+            QDialog dialog(this);
+            dialog.setWindowTitle(isShellBuiltin
+                ? QStringLiteral("Bash manual — %1").arg(command)
+                : QStringLiteral("Man page — %1").arg(TOPIC));
+            dialog.resize(860, 640);
+            auto *layout = new QVBoxLayout(&dialog);
+            auto *viewer = new QPlainTextEdit(&dialog);
+            viewer->setReadOnly(true);
+            viewer->setLineWrapMode(QPlainTextEdit::NoWrap);
+            viewer->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+            viewer->setPlainText(OUTPUT);
+            if (!searchTerm.isEmpty()) {
+                QTextCursor cursor = viewer->document()->find(searchTerm, 0, QTextDocument::FindWholeWords);
+                if (!cursor.isNull()) {
+                    viewer->setTextCursor(cursor);
+                    viewer->centerCursor();
+                }
+            }
+            layout->addWidget(viewer, 1);
+            auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+            connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+            layout->addWidget(buttons);
+            dialog.exec();
+        });
+        connect(manProcess, &QProcess::errorOccurred, this,
+                [this, manProcess](QProcess::ProcessError error) {
+            if (error != QProcess::FailedToStart)
+                return;
+            const QString REASON = manProcess->errorString();
+            manProcess->deleteLater();
+            QMessageBox::warning(this, QStringLiteral("Could not open manual page"), REASON);
+        });
+        manProcess->start(MAN_PROGRAM, {QStringLiteral("-P"), QStringLiteral("cat"),
+                                        QStringLiteral("--"), TOPIC});
+    }
 
     void createMenus()
     {
@@ -1025,7 +1353,7 @@ private:
                 return;
             }
             if (outputEdit->hasFocus()) {
-                outputEdit->copy();
+                copyOutput();
                 return;
             }
             scriptEdit->copy();
@@ -1041,10 +1369,11 @@ private:
         findAction->setShortcut(QKeySequence::Find);
         connect(findAction, &QAction::triggered, this, [this]() {
             if (outputEdit->hasFocus() || outputFindEdit->hasFocus()) {
+                outputSearchRow->show();
                 outputFindEdit->setFocus();
                 outputFindEdit->selectAll();
             } else {
-                findInScript();
+                showScriptFind();
             }
         });
 
@@ -1060,6 +1389,19 @@ private:
         stopAction->setShortcut(QKeySequence(QStringLiteral("Shift+Alt+Return")));
         connect(stopAction, &QAction::triggered, this, [this]() { stopScript(); });
         scriptMenu->addSeparator();
+        guiSudoPromptsAction = scriptMenu->addAction(QStringLiteral("GUI Sudo Prompts"));
+        guiSudoPromptsAction->setCheckable(true);
+        guiSudoPromptsAction->setChecked(true);
+        guiSudoPromptsAction->setToolTip(QStringLiteral("Show a masked dialog when the script needs sudo authentication."));
+        reuseSudoPasswordAction = scriptMenu->addAction(QStringLiteral("Reuse sudo password for this run"));
+        reuseSudoPasswordAction->setCheckable(true);
+        reuseSudoPasswordAction->setChecked(true);
+        reuseSudoPasswordAction->setToolTip(QStringLiteral("Keep the password only in the running script process so sudo is prompted once per run."));
+        connect(guiSudoPromptsAction, &QAction::toggled, reuseSudoPasswordAction, &QAction::setEnabled);
+        scriptMenu->addSeparator();
+        clearOutputEachRunAction = scriptMenu->addAction(QStringLiteral("Clear output each run"));
+        clearOutputEachRunAction->setCheckable(true);
+        clearOutputEachRunAction->setChecked(true);
         QAction *clearOutputAction = scriptMenu->addAction(QStringLiteral("Clear Output"));
         connect(clearOutputAction, &QAction::triggered, this, [this]() {
             clearOutput();
@@ -1075,6 +1417,7 @@ private:
         });
         scriptMenu->addSeparator();
         QAction *quickSavedScriptsAction = scriptMenu->addAction(QStringLiteral("Quick Saved Scripts…"));
+        quickSavedScriptsAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+Q")));
         connect(quickSavedScriptsAction, &QAction::triggered, this, [this]() { showQuickSavedScripts(); });
         QAction *saveQuickScriptAction = scriptMenu->addAction(QStringLiteral("Save Quick Script…"));
         connect(saveQuickScriptAction, &QAction::triggered, this, [this]() { saveQuickScript(); });
@@ -1373,16 +1716,34 @@ df -ih
         writeLatestDraft();
         QDialog dialog(this);
         dialog.setWindowTitle(QStringLiteral("Quick Saved Scripts"));
-        dialog.setMinimumSize(540, 560);
+        dialog.setMinimumSize(900, 560);
         auto *layout = new QVBoxLayout(&dialog);
+        auto *splitter = new QSplitter(Qt::Horizontal, &dialog);
+        auto *listsPanel = new QWidget(splitter);
+        auto *listsLayout = new QVBoxLayout(listsPanel);
         auto *quickSavesHeading = new QLabel(QStringLiteral("Your Quick Saves"), &dialog);
-        auto *quickSavesList = new QListWidget(&dialog);
+        auto *quickSavesList = new QListWidget(listsPanel);
         auto *diagnosticsHeading = new QLabel(QStringLiteral("Built-in Diagnostics"), &dialog);
-        auto *diagnosticsScriptsList = new QListWidget(&dialog);
-        layout->addWidget(quickSavesHeading);
-        layout->addWidget(quickSavesList, 1);
-        layout->addWidget(diagnosticsHeading);
-        layout->addWidget(diagnosticsScriptsList, 1);
+        auto *diagnosticsScriptsList = new QListWidget(listsPanel);
+        listsLayout->addWidget(quickSavesHeading);
+        listsLayout->addWidget(quickSavesList, 1);
+        listsLayout->addWidget(diagnosticsHeading);
+        listsLayout->addWidget(diagnosticsScriptsList, 1);
+        auto *previewPanel = new QWidget(splitter);
+        auto *previewLayout = new QVBoxLayout(previewPanel);
+        previewLayout->addWidget(new QLabel(QStringLiteral("Script Preview"), previewPanel));
+        auto *previewEditor = new ShellScratchpad::CodeEditor(previewPanel);
+        previewEditor->setReadOnly(true);
+        previewEditor->setLineWrapMode(QPlainTextEdit::NoWrap);
+        previewEditor->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+        previewEditor->setStyleSheet(QStringLiteral("QPlainTextEdit { background: #25282d; color: #e5e7eb; }"));
+        new ShellScratchpad::Syntax::SyntaxHighlighter(previewEditor);
+        previewLayout->addWidget(previewEditor, 1);
+        splitter->addWidget(listsPanel);
+        splitter->addWidget(previewPanel);
+        splitter->setStretchFactor(0, 1);
+        splitter->setStretchFactor(1, 2);
+        layout->addWidget(splitter, 1);
 
         const QString DRAFT_PATH = latestDraftPath();
         if (QFileInfo::exists(DRAFT_PATH)) {
@@ -1482,6 +1843,30 @@ df -ih
                 quickSavesList->setCurrentItem(nullptr);
             updateDeleteButton();
         });
+        const auto updatePreview = [&]() {
+            QListWidgetItem *item = quickSavesList->currentItem();
+            if (!item)
+                item = diagnosticsScriptsList->currentItem();
+            if (!item) {
+                previewEditor->clear();
+                return;
+            }
+            const QString TYPE = item->data(Qt::UserRole + 2).toString();
+            if (TYPE == QLatin1String("builtin")) {
+                previewEditor->setPlainText(item->data(Qt::UserRole + 1).toString());
+                return;
+            }
+            QFile file(item->data(Qt::UserRole).toString());
+            if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                previewEditor->setPlainText(QStringLiteral("Could not read this script."));
+                return;
+            }
+            previewEditor->setPlainText(QString::fromUtf8(file.readAll()));
+        };
+        connect(quickSavesList, &QListWidget::currentItemChanged, &dialog,
+                [updatePreview](QListWidgetItem *, QListWidgetItem *) { updatePreview(); });
+        connect(diagnosticsScriptsList, &QListWidget::currentItemChanged, &dialog,
+                [updatePreview](QListWidgetItem *, QListWidgetItem *) { updatePreview(); });
         connect(quickSavesList, &QListWidget::itemDoubleClicked, &dialog,
                 [&](QListWidgetItem *) { openSelected(); });
         connect(diagnosticsScriptsList, &QListWidget::itemDoubleClicked, &dialog,
@@ -1547,6 +1932,9 @@ df -ih
             auto *item = new QListWidgetItem(
                 QStringLiteral("ShellCheck is not installed; script checks are unavailable."), diagnosticsList);
             item->setForeground(QColor(QStringLiteral("#d6a84f")));
+            QVector<ShellScratchpad::CodeEditor::TextDecoration> decorations;
+            appendFuzzyVariableDiagnostics(decorations);
+            scriptEdit->setTextDecorations(decorations);
             diagnosticsDock->show();
             shellCheckCurrent = true;
             if (runAfterShellCheck) {
@@ -1575,6 +1963,7 @@ df -ih
         shellCheckCurrent = true;
         const QJsonDocument DOCUMENT = QJsonDocument::fromJson(shellCheckProcess.readAllStandardOutput());
         diagnosticsList->clear();
+        QVector<ShellScratchpad::CodeEditor::TextDecoration> decorations;
         if (DOCUMENT.isArray()) {
             for (const QJsonValue &value : DOCUMENT.array()) {
                 const QJsonObject finding = value.toObject();
@@ -1583,16 +1972,52 @@ df -ih
                 const int CODE = finding.value(QStringLiteral("code")).toInt();
                 const QString LEVEL = finding.value(QStringLiteral("level")).toString();
                 const QString MESSAGE = finding.value(QStringLiteral("message")).toString();
+                const QTextBlock START_BLOCK = scriptEdit->document()->findBlockByNumber(LINE - 1);
+                if (START_BLOCK.isValid()) {
+                    const int START_COLUMN = qMax(1, COLUMN);
+                    qsizetype startOffset = START_BLOCK.position() + START_COLUMN - 1;
+                    qsizetype endOffset = startOffset;
+                    const int END_LINE = finding.value(QStringLiteral("endLine")).toInt(LINE);
+                    const int END_COLUMN = finding.value(QStringLiteral("endColumn")).toInt(0);
+                    const QTextBlock END_BLOCK = scriptEdit->document()->findBlockByNumber(END_LINE - 1);
+                    if (END_COLUMN > 0 && END_BLOCK.isValid()) {
+                        endOffset = END_BLOCK.position() + END_COLUMN - 1;
+                    } else {
+                        endOffset = START_BLOCK.position() + START_BLOCK.text().size();
+                    }
+                    if (endOffset <= startOffset)
+                        endOffset = START_BLOCK.position() + START_BLOCK.text().size();
+                    if (endOffset > startOffset) {
+                        QTextCharFormat format;
+                        if (LEVEL == QLatin1String("error")) {
+                            format.setUnderlineStyle(QTextCharFormat::WaveUnderline);
+                            format.setUnderlineColor(QColor(QStringLiteral("#ef5350")));
+                        } else if (LEVEL == QLatin1String("warning")) {
+                            format.setUnderlineStyle(QTextCharFormat::WaveUnderline);
+                            format.setUnderlineColor(QColor(QStringLiteral("#e6a23c")));
+                        } else {
+                            format.setUnderlineStyle(QTextCharFormat::DotLine);
+                            format.setUnderlineColor(QColor(QStringLiteral("#69b7e3")));
+                        }
+                        decorations.append({startOffset, endOffset - startOffset, format});
+                    }
+                }
                 auto *item = new QListWidgetItem(QStringLiteral("%1  SC%2  Line %3:%4 — %5")
                     .arg(LEVEL.toUpper()).arg(CODE, 4, 10, QLatin1Char('0'))
                     .arg(LINE).arg(COLUMN).arg(MESSAGE), diagnosticsList);
                 item->setData(Qt::UserRole, LINE);
+                item->setData(Qt::UserRole + 1, CODE);
+                item->setData(Qt::UserRole + 2, COLUMN);
+                item->setData(Qt::UserRole + 3, LEVEL);
+                item->setData(Qt::UserRole + 4, MESSAGE);
                 if (LEVEL == QLatin1String("error"))
                     item->setForeground(QColor(QStringLiteral("#e06c75")));
                 else if (LEVEL == QLatin1String("warning"))
                     item->setForeground(QColor(QStringLiteral("#d6a84f")));
             }
         }
+        appendFuzzyVariableDiagnostics(decorations);
+        scriptEdit->setTextDecorations(decorations);
         if (diagnosticsList->count() == 0) {
             diagnosticsDock->hide();
             statusBar()->showMessage(QStringLiteral("ShellCheck: no issues found"), 3000);
@@ -1605,6 +2030,83 @@ df -ih
             const bool SELECTION_ONLY = runSelectionAfterShellCheck;
             runSelectionAfterShellCheck = false;
             runScript(SELECTION_ONLY);
+        }
+    }
+
+    void appendFuzzyVariableDiagnostics(QVector<ShellScratchpad::CodeEditor::TextDecoration> &decorations)
+    {
+        const QString SOURCE = scriptEdit->toPlainText();
+        QSet<QString> knownVariables;
+        QStringList candidates;
+        const auto addCandidate = [&knownVariables, &candidates](const QString &name) {
+            if (!name.isEmpty() && !knownVariables.contains(name)) {
+                knownVariables.insert(name);
+                candidates.append(name);
+            }
+        };
+        for (const QString &name : QProcessEnvironment::systemEnvironment().keys())
+            addCandidate(name);
+        const QJsonObject PROFILE_VARIABLES = selectedRunProfile().value(QStringLiteral("environment")).toObject();
+        for (auto it = PROFILE_VARIABLES.begin(); it != PROFILE_VARIABLES.end(); ++it)
+            addCandidate(it.key());
+        if (completionController) {
+            for (const auto &symbol : completionController->scriptSymbols()) {
+                if (symbol.kind == ShellScratchpad::Completion::CompletionController::ScriptSymbol::Kind::Variable)
+                    addCandidate(symbol.name);
+            }
+        }
+        for (const QString &name : {QStringLiteral("BASH"), QStringLiteral("BASHOPTS"),
+                 QStringLiteral("BASHPID"), QStringLiteral("BASH_SOURCE"), QStringLiteral("BASH_LINENO"),
+                 QStringLiteral("BASH_VERSION"), QStringLiteral("EUID"), QStringLiteral("FUNCNAME"),
+                 QStringLiteral("GROUPS"), QStringLiteral("HOME"), QStringLiteral("HOSTNAME"),
+                 QStringLiteral("IFS"), QStringLiteral("LINENO"), QStringLiteral("OLDPWD"),
+                 QStringLiteral("OPTARG"), QStringLiteral("OPTIND"), QStringLiteral("OSTYPE"),
+                 QStringLiteral("PPID"), QStringLiteral("PWD"), QStringLiteral("RANDOM"),
+                 QStringLiteral("SECONDS"), QStringLiteral("SHELLOPTS"), QStringLiteral("SHLVL"),
+                 QStringLiteral("UID")})
+            addCandidate(name);
+
+        const QVector<ShellScratchpad::Syntax::SyntaxToken> tokens =
+            ShellScratchpad::Syntax::SyntaxTokenizer::tokenize(SOURCE);
+        static const QRegularExpression VARIABLE_NAME(QStringLiteral(R"(^\$\{?([A-Za-z_][A-Za-z0-9_]*))"));
+        for (const auto &token : tokens) {
+            if (token.kind != ShellScratchpad::Syntax::TokenKind::Variable)
+                continue;
+            const QString tokenText = SOURCE.mid(token.startOffset, token.length);
+            const auto match = VARIABLE_NAME.match(tokenText);
+            if (!match.hasMatch())
+                continue;
+            const QString name = match.captured(1);
+            if (knownVariables.contains(name))
+                continue;
+            const int maximumDistance = qMin(3, qMax(1, name.size() / 4));
+            const auto matches = ShellScratchpad::Util::fuzzyMatches(name, candidates, maximumDistance, 3);
+            if (matches.isEmpty() || (matches.size() > 1 && matches.at(0).distance == matches.at(1).distance))
+                continue;
+            const QString suggestion = matches.first().candidate;
+            const int identifierOffset = static_cast<int>(token.startOffset + match.capturedStart(1));
+            const int identifierLength = name.size();
+            const int column = token.column + match.capturedStart(1);
+            const QString renderedSuggestion = tokenText.left(match.capturedStart(1)) + suggestion +
+                tokenText.mid(match.capturedEnd(1));
+            auto *item = new QListWidgetItem(QStringLiteral("INFO  Line %1:%2 — %3 may be a typo; did you mean %4? Double-click to apply.")
+                .arg(token.line).arg(column).arg(tokenText, renderedSuggestion), diagnosticsList);
+            item->setData(Qt::UserRole, token.line);
+            item->setData(Qt::UserRole + 1, 0);
+            item->setData(Qt::UserRole + 2, column);
+            item->setData(Qt::UserRole + 3, QStringLiteral("info"));
+            item->setData(Qt::UserRole + 4, QStringLiteral("%1 may be a typo; did you mean %2?")
+                .arg(tokenText, renderedSuggestion));
+            item->setData(Qt::UserRole + 5, identifierOffset);
+            item->setData(Qt::UserRole + 6, identifierLength);
+            item->setData(Qt::UserRole + 7, suggestion);
+            item->setData(Qt::UserRole + 8, name);
+            item->setForeground(QColor(QStringLiteral("#69b7e3")));
+
+            QTextCharFormat format;
+            format.setUnderlineStyle(QTextCharFormat::DotLine);
+            format.setUnderlineColor(QColor(QStringLiteral("#69b7e3")));
+            decorations.append({identifierOffset, identifierLength, format});
         }
     }
 
@@ -1701,21 +2203,49 @@ df -ih
         statusBar()->showMessage(QStringLiteral("Recovered draft"), 5000);
     }
 
-    void findInScript()
+    void showScriptFind()
     {
-        bool accepted = false;
-        const QString query = QInputDialog::getText(
-            this, QStringLiteral("Find in Script"), QStringLiteral("Text to find:"),
-            QLineEdit::Normal, QString(), &accepted);
-        if (!accepted || query.isEmpty())
+        scriptSearchRow->show();
+        scriptFindEdit->setFocus();
+        if (!scriptEdit->textCursor().selectedText().isEmpty())
+            scriptFindEdit->setText(scriptEdit->textCursor().selectedText());
+        scriptFindEdit->selectAll();
+    }
+
+    void findInScript(bool backward = false, bool fromTyping = false)
+    {
+        const QString query = scriptFindEdit->text();
+        if (query.isEmpty())
             return;
-        if (scriptEdit->find(query))
-            return;
-        QTextCursor cursor = scriptEdit->textCursor();
-        cursor.movePosition(QTextCursor::Start);
-        scriptEdit->setTextCursor(cursor);
-        if (!scriptEdit->find(query))
+        QTextDocument::FindFlags flags;
+        if (backward)
+            flags |= QTextDocument::FindBackward;
+        if (scriptFindCaseSensitiveAction->isChecked())
+            flags |= QTextDocument::FindCaseSensitively;
+        QTextCursor start = scriptEdit->textCursor();
+        if (fromTyping) {
+            start = QTextCursor(scriptEdit->document());
+            start.movePosition(QTextCursor::Start);
+        } else if (start.hasSelection()) {
+            // Begin beyond the current result so repeated searches visit each
+            // occurrence rather than rediscovering the same one.
+            start.setPosition(backward ? start.selectionStart() : start.selectionEnd());
+        }
+        QTextCursor match = scriptEdit->document()->find(query, start, flags);
+        if (match.isNull()) {
+            QTextCursor wrapped(scriptEdit->document());
+            wrapped.movePosition(backward ? QTextCursor::End : QTextCursor::Start);
+            match = scriptEdit->document()->find(query, wrapped, flags);
+        }
+        if (!match.isNull()) {
+            scriptEdit->setTextCursor(match);
+            scriptEdit->centerCursor();
+        } else {
+            QTextCursor cursor = scriptEdit->textCursor();
+            cursor.clearSelection();
+            scriptEdit->setTextCursor(cursor);
             statusBar()->showMessage(QStringLiteral("Text not found: %1").arg(query), 3000);
+        }
     }
 
     void changeZoom(int delta)
@@ -2042,6 +2572,38 @@ df -ih
         return {};
     }
 
+    void refreshCompletionProfileVariables()
+    {
+        if (!completionController)
+            return;
+        QStringList names;
+        const QJsonObject OVERRIDES = selectedRunProfile().value(QStringLiteral("environment")).toObject();
+        for (auto it = OVERRIDES.begin(); it != OVERRIDES.end(); ++it)
+            names.append(it.key());
+        completionController->setProfileEnvironmentVariables(names);
+        refreshNavigationSymbols();
+    }
+
+    void refreshNavigationSymbols()
+    {
+        if (!scriptEdit || !completionController)
+            return;
+        QVector<ShellScratchpad::CodeEditor::NavigationSymbol> symbols;
+        const QJsonObject PROFILE = selectedRunProfile();
+        const QJsonObject OVERRIDES = PROFILE.value(QStringLiteral("environment")).toObject();
+        for (auto it = OVERRIDES.begin(); it != OVERRIDES.end(); ++it)
+            symbols.append({it.key(), -1, true});
+        for (const auto &symbol : completionController->scriptSymbols()) {
+            const bool PROFILE_SHADOWS_SYMBOL = OVERRIDES.contains(symbol.name);
+            const bool ALREADY_ADDED = std::any_of(symbols.cbegin(), symbols.cend(), [&symbol](const auto &entry) {
+                return entry.name == symbol.name;
+            });
+            if (!PROFILE_SHADOWS_SYMBOL && !ALREADY_ADDED)
+                symbols.append({symbol.name, symbol.declarationOffset, false});
+        }
+        scriptEdit->setNavigationSymbols(symbols);
+    }
+
     void loadRunProfiles()
     {
         if (!runProfileCombo)
@@ -2063,9 +2625,11 @@ df -ih
             if (!PATH.isEmpty())
                 directoryEdit->setText(PATH);
         }
+        refreshCompletionProfileVariables();
     }
 
-    void manageRunProfiles()
+    void manageRunProfiles(const QString &focusProfileName = QString(),
+                           const QString &focusVariableName = QString())
     {
         QDialog dialog(this);
         dialog.setWindowTitle(QStringLiteral("Run Profiles"));
@@ -2121,6 +2685,27 @@ df -ih
         };
         refillList();
         connect(list, &QListWidget::currentRowChanged, &dialog, [&](int) { loadSelected(); });
+        if (!focusProfileName.isEmpty()) {
+            for (int row = 0; row < list->count(); ++row) {
+                if (list->item(row)->text() != focusProfileName)
+                    continue;
+                list->setCurrentRow(row);
+                if (!focusVariableName.isEmpty()) {
+                    const QStringList lines = environment->toPlainText().split(QLatin1Char('\n'));
+                    for (int lineNumber = 0; lineNumber < lines.size(); ++lineNumber) {
+                        if (!lines.at(lineNumber).startsWith(focusVariableName + QLatin1Char('=')))
+                            continue;
+                        const QTextBlock block = environment->document()->findBlockByNumber(lineNumber);
+                        QTextCursor cursor(block);
+                        cursor.setPosition(block.position() + focusVariableName.size(), QTextCursor::KeepAnchor);
+                        environment->setTextCursor(cursor);
+                        environment->setFocus();
+                        break;
+                    }
+                }
+                break;
+            }
+        }
         connect(newButton, &QPushButton::clicked, &dialog, [&]() {
             list->clearSelection(); list->setCurrentRow(-1); name->clear(); directory->setText(expandedWorkingDirectory()); environment->clear(); name->setFocus();
         });
@@ -2425,8 +3010,8 @@ df -ih
         }
         const bool CAPTURE_HISTORY = prepareRunHistoryPipe();
         const QByteArray RUNTIME_SCRIPT = buildRuntimeScript(
-            sourceText.toUtf8(), guiSudoCheck->isChecked(),
-            reuseSudoPasswordCheck->isChecked(), CAPTURE_HISTORY);
+            sourceText.toUtf8(), guiSudoPromptsAction->isChecked(),
+            reuseSudoPasswordAction->isChecked(), CAPTURE_HISTORY);
         currentHistoryLineOffset = selectionOnly ? selectedStartLine - 1 : 0;
         scriptFileDescriptor = createAnonymousScriptFile(RUNTIME_SCRIPT);
         if (scriptFileDescriptor < 0) {
@@ -2437,7 +3022,7 @@ df -ih
             return;
         }
 
-        if (clearOutputCheck->isChecked()) {
+        if (clearOutputEachRunAction->isChecked()) {
             clearOutput();
         }
         pendingOutput.clear();
@@ -2544,10 +3129,11 @@ df -ih
     void refreshOutputView()
     {
         const QString QUERY = outputFindEdit->text();
+        outputFindNavigationPosition = 0;
         outputFilterTimer.stop();
         outputFilterGeneration->fetch_add(1, std::memory_order_relaxed);
         if (QUERY.isEmpty()) {
-            outputMatchHighlighter->setQuery(QString());
+            outputMatchHighlighter->setQuery(QString(), outputFindCaseSensitiveAction->isChecked());
             outputEdit->setPlainText(outputContent);
             outputEdit->moveCursor(QTextCursor::End);
             outputEdit->ensureCursorVisible();
@@ -2556,9 +3142,45 @@ df -ih
         outputFilterTimer.start();
     }
 
+    void navigateOutputMatches(bool backward)
+    {
+        const QString QUERY = outputFindEdit->text();
+        if (QUERY.isEmpty())
+            return;
+        QTextDocument::FindFlags flags;
+        if (backward)
+            flags |= QTextDocument::FindBackward;
+        if (outputFindCaseSensitiveAction->isChecked())
+            flags |= QTextDocument::FindCaseSensitively;
+
+        QTextCursor start(outputEdit->document());
+        const qsizetype boundedPosition = qBound<qsizetype>(qsizetype(0), outputFindNavigationPosition,
+            static_cast<qsizetype>(outputEdit->document()->characterCount() - 1));
+        start.setPosition(static_cast<int>(boundedPosition));
+        QTextCursor match = outputEdit->document()->find(QUERY, start, flags);
+        if (match.isNull()) {
+            QTextCursor wrapped(outputEdit->document());
+            wrapped.movePosition(backward ? QTextCursor::End : QTextCursor::Start);
+            match = outputEdit->document()->find(QUERY, wrapped, flags);
+        }
+        if (match.isNull())
+            return;
+
+        // Output remains read-only and unselected: navigation only scrolls the
+        // matching line into view.
+        const qsizetype matchStart = match.selectionStart();
+        const qsizetype matchEnd = match.selectionEnd();
+        QTextCursor visible(outputEdit->document());
+        visible.setPosition(static_cast<int>(matchStart));
+        outputEdit->setTextCursor(visible);
+        outputEdit->ensureCursorVisible();
+        outputFindNavigationPosition = backward ? matchStart : matchEnd;
+    }
+
     void filterOutputInBackground()
     {
         const QString QUERY = outputFindEdit->text();
+        const bool CASE_SENSITIVE = outputFindCaseSensitiveAction->isChecked();
         if (QUERY.isEmpty())
             return;
         const QString SOURCE = outputContent;
@@ -2566,7 +3188,7 @@ df -ih
         const auto GENERATION_STATE = outputFilterGeneration;
         const QPointer<ShellScratchpadWindow> SELF(this);
         QThreadPool *pool = &outputFilterPool;
-        pool->start(QRunnable::create([SOURCE, QUERY, GENERATION, GENERATION_STATE, SELF]() {
+        pool->start(QRunnable::create([SOURCE, QUERY, CASE_SENSITIVE, GENERATION, GENERATION_STATE, SELF]() {
             QString filtered;
             bool hasMatchingLine = false;
             qsizetype lineStart = 0;
@@ -2576,7 +3198,7 @@ df -ih
                 const qsizetype newline = SOURCE.indexOf(QLatin1Char('\n'), lineStart);
                 const qsizetype lineEnd = newline < 0 ? SOURCE.size() : newline;
                 const QStringView line(SOURCE.constData() + lineStart, lineEnd - lineStart);
-                if (line.contains(QUERY, Qt::CaseInsensitive)) {
+                if (line.contains(QUERY, CASE_SENSITIVE ? Qt::CaseSensitive : Qt::CaseInsensitive)) {
                     if (hasMatchingLine)
                         filtered.append(QLatin1Char('\n'));
                     filtered.append(line);
@@ -2590,13 +3212,15 @@ df -ih
             QCoreApplication *app = QCoreApplication::instance();
             if (!app)
                 return;
-            QMetaObject::invokeMethod(app, [SELF, GENERATION_STATE, GENERATION, QUERY,
+            QMetaObject::invokeMethod(app, [SELF, GENERATION_STATE, GENERATION, QUERY, CASE_SENSITIVE,
                                             FILTERED = std::move(filtered)]() mutable {
                 if (!SELF || GENERATION_STATE->load(std::memory_order_relaxed) != GENERATION ||
-                    SELF->outputFindEdit->text() != QUERY)
+                    SELF->outputFindEdit->text() != QUERY ||
+                    SELF->outputFindCaseSensitiveAction->isChecked() != CASE_SENSITIVE)
                     return;
-                SELF->outputMatchHighlighter->setQuery(QUERY);
+                SELF->outputMatchHighlighter->setQuery(QUERY, CASE_SENSITIVE);
                 SELF->outputEdit->setPlainText(FILTERED);
+                SELF->outputFindNavigationPosition = 0;
                 SELF->outputEdit->moveCursor(QTextCursor::End);
                 SELF->outputEdit->ensureCursorVisible();
             }, Qt::QueuedConnection);
@@ -2611,6 +3235,17 @@ df -ih
         outputFilterGeneration->fetch_add(1, std::memory_order_relaxed);
         outputContent.clear();
         outputEdit->clear();
+    }
+
+    void copyOutput()
+    {
+        const QTextCursor cursor = outputEdit->textCursor();
+        QString text = cursor.hasSelection() ? cursor.selectedText() : outputEdit->toPlainText();
+        text.replace(QChar::ParagraphSeparator, QLatin1Char('\n'));
+        QApplication::clipboard()->setText(text);
+        statusBar()->showMessage(cursor.hasSelection()
+            ? QStringLiteral("Selected output copied to clipboard")
+            : QStringLiteral("Output copied to clipboard"), 2500);
     }
 
     void processOutputAvailable()

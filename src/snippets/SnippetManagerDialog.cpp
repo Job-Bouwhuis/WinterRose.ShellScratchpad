@@ -17,6 +17,8 @@
 #include <QDesktopServices>
 #include <QDir>
 #include <QTimer>
+#include <QTabWidget>
+#include <QComboBox>
 #include <QTextCursor>
 #include <QUrl>
 #include <QVBoxLayout>
@@ -32,7 +34,11 @@ SnippetManagerDialog::SnippetManagerDialog(QWidget *parent)
     resize(900, 600);
     auto *rootLayout = new QVBoxLayout(this);
     auto *splitter = new QSplitter(this);
-    snippetList = new QListWidget(splitter);
+    snippetTabs = new QTabWidget(splitter);
+    snippetList = new QListWidget(snippetTabs);
+    builtInList = new QListWidget(snippetTabs);
+    snippetTabs->addTab(snippetList, QStringLiteral("My Snippets"));
+    snippetTabs->addTab(builtInList, QStringLiteral("Built-in"));
     auto *details = new QWidget(splitter);
     auto *detailsLayout = new QVBoxLayout(details);
     auto *form = new QFormLayout();
@@ -53,6 +59,7 @@ SnippetManagerDialog::SnippetManagerDialog(QWidget *parent)
     pointsList = new QListWidget(details);
     pointsList->setMaximumHeight(100);
     detailsLayout->addWidget(pointsList);
+    auto *autoChangeButtons = new QHBoxLayout();
     auto *pointButtons = new QHBoxLayout();
     addPointButton = new QPushButton(QStringLiteral("Mark Selected Text"), details);
     removePointButton = new QPushButton(QStringLiteral("Remove Point"), details);
@@ -60,7 +67,19 @@ SnippetManagerDialog::SnippetManagerDialog(QWidget *parent)
     pointButtons->addWidget(removePointButton);
     pointButtons->addStretch(1);
     detailsLayout->addLayout(pointButtons);
-    splitter->addWidget(snippetList);
+    detailsLayout->addWidget(new QLabel(QStringLiteral("Auto-change sections"), details));
+    autoChangeSource = new QComboBox(details);
+    detailsLayout->addWidget(autoChangeSource);
+    autoChangesList = new QListWidget(details);
+    autoChangesList->setMaximumHeight(80);
+    detailsLayout->addWidget(autoChangesList);
+    addAutoChangeButton = new QPushButton(QStringLiteral("Mark Selection as Auto-change"), details);
+    removeAutoChangeButton = new QPushButton(QStringLiteral("Remove Auto-change"), details);
+    autoChangeButtons->addWidget(addAutoChangeButton);
+    autoChangeButtons->addWidget(removeAutoChangeButton);
+    autoChangeButtons->addStretch(1);
+    detailsLayout->addLayout(autoChangeButtons);
+    splitter->addWidget(snippetTabs);
     splitter->addWidget(details);
     splitter->setStretchFactor(1, 1);
     rootLayout->addWidget(splitter, 1);
@@ -86,6 +105,8 @@ SnippetManagerDialog::SnippetManagerDialog(QWidget *parent)
     saveTimer->setInterval(350);
     connect(saveTimer, &QTimer::timeout, this, [this]() { saveCurrentMetadata(); });
     connect(snippetList, &QListWidget::currentRowChanged, this, [this]() { showCurrentSnippet(); });
+    connect(builtInList, &QListWidget::currentRowChanged, this, [this]() { showCurrentSnippet(); });
+    connect(snippetTabs, &QTabWidget::currentChanged, this, [this]() { showCurrentSnippet(); });
     connect(nameEdit, &QLineEdit::textEdited, this, [this]() { saveTimer->start(); });
     connect(descriptionEdit, &QLineEdit::textEdited, this, [this]() { saveTimer->start(); });
     connect(reloadButton, &QPushButton::clicked, this, [this]() { reloadFromDisk(); });
@@ -97,6 +118,8 @@ SnippetManagerDialog::SnippetManagerDialog(QWidget *parent)
     });
     connect(addPointButton, &QPushButton::clicked, this, [this]() { addHighlightPoint(); });
     connect(removePointButton, &QPushButton::clicked, this, [this]() { removeHighlightPoint(); });
+    connect(addAutoChangeButton, &QPushButton::clicked, this, [this]() { addAutoChangeSection(); });
+    connect(removeAutoChangeButton, &QPushButton::clicked, this, [this]() { removeAutoChangeSection(); });
     connect(closeButton, &QPushButton::clicked, this, &QDialog::accept);
     reloadFromDisk();
 }
@@ -107,11 +130,19 @@ void SnippetManagerDialog::reloadFromDisk()
     loading = true;
     selectedId.clear();
     snippetList->clear();
+    builtInList->clear();
     const QVector<Snippet> snippets = SnippetStore::loadAll();
     for (const Snippet &snippet : snippets) {
         auto *item = new QListWidgetItem(snippet.name, snippetList);
         item->setData(Qt::UserRole, snippet.id);
     }
+    for (const Snippet &snippet : SnippetStore::builtInSnippets()) {
+        auto *item = new QListWidgetItem(snippet.name, builtInList);
+        item->setData(Qt::UserRole, snippet.id);
+    }
+    if (builtInList->count() > 0)
+        builtInList->setCurrentRow(0);
+    snippetTabs->setCurrentIndex(0);
     if (snippetList->count() > 0)
         snippetList->setCurrentRow(0);
     else {
@@ -119,16 +150,26 @@ void SnippetManagerDialog::reloadFromDisk()
         descriptionEdit->clear();
         codePreview->clear();
         pointsList->clear();
+        autoChangesList->clear();
+        autoChangeSource->clear();
         nameEdit->setEnabled(false);
         descriptionEdit->setEnabled(false);
         addPointButton->setEnabled(false);
         removePointButton->setEnabled(false);
+        autoChangeSource->setEnabled(false);
+        addAutoChangeButton->setEnabled(false);
+        removeAutoChangeButton->setEnabled(false);
         deleteButton->setEnabled(false);
         statusLabel->setText(QStringLiteral("No snippets saved yet."));
     }
     loading = false;
-    if (snippetList->count() > 0)
+    if (currentSnippetList()->count() > 0)
         showCurrentSnippet();
+}
+
+QListWidget *SnippetManagerDialog::currentSnippetList() const
+{
+    return snippetTabs->currentIndex() == 1 ? builtInList : snippetList;
 }
 
 void SnippetManagerDialog::showCurrentSnippet()
@@ -139,33 +180,41 @@ void SnippetManagerDialog::showCurrentSnippet()
     const QString PREVIOUS_ID = selectedId;
     if (!PREVIOUS_ID.isEmpty())
         saveCurrentMetadata();
-    const QListWidgetItem *item = snippetList->currentItem();
+    const QListWidgetItem *item = currentSnippetList()->currentItem();
     if (!item)
         return;
     selectedId = item->data(Qt::UserRole).toString();
-    const QVector<Snippet> snippets = SnippetStore::loadAll();
+    QVector<Snippet> snippets = SnippetStore::loadAll();
+    const bool BUILT_IN = snippetTabs->currentIndex() == 1;
+    if (BUILT_IN)
+        snippets = SnippetStore::builtInSnippets();
     for (const Snippet &snippet : snippets) {
         if (snippet.id != selectedId)
             continue;
         loading = true;
-        nameEdit->setEnabled(true);
-        descriptionEdit->setEnabled(true);
+        nameEdit->setEnabled(!BUILT_IN);
+        descriptionEdit->setEnabled(!BUILT_IN);
         nameEdit->setText(snippet.name);
         descriptionEdit->setText(snippet.description);
         codePreview->setPlainText(snippet.code);
         refreshPointsList(snippet);
-        addPointButton->setEnabled(true);
-        removePointButton->setEnabled(true);
-        deleteButton->setEnabled(true);
+        refreshAutoChangesList(snippet);
+        refreshAutoChangesList(snippet);
+        addPointButton->setEnabled(!BUILT_IN);
+        removePointButton->setEnabled(!BUILT_IN);
+        autoChangeSource->setEnabled(!BUILT_IN && !snippet.highlightPoints.isEmpty());
+        addAutoChangeButton->setEnabled(!BUILT_IN && !snippet.highlightPoints.isEmpty());
+        removeAutoChangeButton->setEnabled(!BUILT_IN && !snippet.autoChangeSections.isEmpty());
+        deleteButton->setEnabled(!BUILT_IN);
         loading = false;
-        statusLabel->setText(snippet.filePath);
+        statusLabel->setText(BUILT_IN ? QStringLiteral("Built-in snippet · read-only") : snippet.filePath);
         return;
     }
 }
 
 void SnippetManagerDialog::saveCurrentMetadata()
 {
-    if (loading || selectedId.isEmpty())
+    if (loading || selectedId.isEmpty() || snippetTabs->currentIndex() == 1)
         return;
     QVector<Snippet> snippets = SnippetStore::loadAll();
     for (Snippet &snippet : snippets) {
@@ -195,6 +244,8 @@ void SnippetManagerDialog::saveCurrentMetadata()
 void SnippetManagerDialog::refreshPointsList(const Snippet &snippet)
 {
     pointsList->clear();
+    const QVariant PREVIOUS_SOURCE = autoChangeSource->currentData();
+    autoChangeSource->clear();
     for (int index = 0; index < snippet.highlightPoints.size(); ++index) {
         const HighlightPoint &point = snippet.highlightPoints.at(index);
         const int LINE = snippet.code.left(point.offset).count(QLatin1Char('\n')) + 1;
@@ -203,6 +254,101 @@ void SnippetManagerDialog::refreshPointsList(const Snippet &snippet)
             .arg(index + 1).arg(LINE).arg(TEXT.isEmpty() ? QStringLiteral("(caret point)") : TEXT), pointsList);
         item->setData(Qt::UserRole, static_cast<int>(point.offset));
         item->setData(Qt::UserRole + 1, static_cast<int>(point.length));
+        autoChangeSource->addItem(QStringLiteral("After highlight point %1: %2")
+            .arg(index + 1).arg(TEXT.isEmpty() ? QStringLiteral("(caret point)") : TEXT),
+            static_cast<int>(point.offset));
+    }
+    const int SOURCE_INDEX = autoChangeSource->findData(PREVIOUS_SOURCE);
+    if (SOURCE_INDEX >= 0)
+        autoChangeSource->setCurrentIndex(SOURCE_INDEX);
+}
+
+void SnippetManagerDialog::refreshAutoChangesList(const Snippet &snippet)
+{
+    autoChangesList->clear();
+    for (const AutoChangeSection &section : snippet.autoChangeSections) {
+        const QString TEXT = snippet.code.mid(section.offset, section.length).simplified();
+        const auto source = std::find_if(snippet.highlightPoints.cbegin(), snippet.highlightPoints.cend(),
+            [&section](const HighlightPoint &point) { return point.offset == section.sourcePointOffset; });
+        const QString SOURCE_NUMBER = source == snippet.highlightPoints.cend()
+            ? QStringLiteral("?") : QString::number(static_cast<int>(source - snippet.highlightPoints.cbegin()) + 1);
+        auto *item = new QListWidgetItem(QStringLiteral("%1 ← highlight point %2")
+            .arg(TEXT, SOURCE_NUMBER), autoChangesList);
+        item->setData(Qt::UserRole, static_cast<int>(section.offset));
+        item->setData(Qt::UserRole + 1, static_cast<int>(section.length));
+    }
+}
+
+void SnippetManagerDialog::addAutoChangeSection()
+{
+    if (selectedId.isEmpty() || autoChangeSource->currentIndex() < 0)
+        return;
+    const QTextCursor selection = codePreview->textCursor();
+    if (!selection.hasSelection()) {
+        statusLabel->setText(QStringLiteral("Select text in the preview first."));
+        return;
+    }
+    const qsizetype offset = selection.selectionStart();
+    const qsizetype length = selection.selectionEnd() - selection.selectionStart();
+    const qsizetype sourceOffset = autoChangeSource->currentData().toInt();
+    for (const Snippet &snippet : SnippetStore::loadAll()) {
+        if (snippet.id != selectedId)
+            continue;
+        const auto overlaps = [offset, length](qsizetype otherOffset, qsizetype otherLength) {
+            return offset < otherOffset + otherLength && otherOffset < offset + length;
+        };
+        for (const HighlightPoint &point : snippet.highlightPoints) {
+            if (overlaps(point.offset, point.length)) {
+                statusLabel->setText(QStringLiteral("Auto-change sections must be separate from highlight points."));
+                return;
+            }
+        }
+        for (const AutoChangeSection &existing : snippet.autoChangeSections) {
+            if (overlaps(existing.offset, existing.length)) {
+                statusLabel->setText(QStringLiteral("Auto-change sections cannot overlap."));
+                return;
+            }
+        }
+        Snippet updated = snippet;
+        updated.autoChangeSections.append(AutoChangeSection{offset, length, sourceOffset});
+        std::stable_sort(updated.autoChangeSections.begin(), updated.autoChangeSections.end(),
+            [](const AutoChangeSection &left, const AutoChangeSection &right) { return left.offset < right.offset; });
+        QString error;
+        if (!SnippetStore::save(&updated, &error)) {
+            statusLabel->setText(error);
+            return;
+        }
+        refreshAutoChangesList(updated);
+        removeAutoChangeButton->setEnabled(true);
+        statusLabel->setText(QStringLiteral("Auto-change section saved."));
+        return;
+    }
+}
+
+void SnippetManagerDialog::removeAutoChangeSection()
+{
+    if (selectedId.isEmpty() || !autoChangesList->currentItem())
+        return;
+    const qsizetype offset = autoChangesList->currentItem()->data(Qt::UserRole).toInt();
+    const qsizetype length = autoChangesList->currentItem()->data(Qt::UserRole + 1).toInt();
+    for (const Snippet &snippet : SnippetStore::loadAll()) {
+        if (snippet.id != selectedId)
+            continue;
+        Snippet updated = snippet;
+        const auto section = std::find_if(updated.autoChangeSections.begin(), updated.autoChangeSections.end(),
+            [offset, length](const AutoChangeSection &item) { return item.offset == offset && item.length == length; });
+        if (section == updated.autoChangeSections.end())
+            return;
+        updated.autoChangeSections.erase(section);
+        QString error;
+        if (!SnippetStore::save(&updated, &error)) {
+            statusLabel->setText(error);
+            return;
+        }
+        refreshAutoChangesList(updated);
+        removeAutoChangeButton->setEnabled(!updated.autoChangeSections.isEmpty());
+        statusLabel->setText(QStringLiteral("Auto-change section removed."));
+        return;
     }
 }
 
@@ -237,6 +383,9 @@ void SnippetManagerDialog::addHighlightPoint()
             return;
         }
         refreshPointsList(snippet);
+        refreshAutoChangesList(snippet);
+        autoChangeSource->setEnabled(!snippet.highlightPoints.isEmpty());
+        addAutoChangeButton->setEnabled(!snippet.highlightPoints.isEmpty());
         statusLabel->setText(QStringLiteral("Highlight point saved."));
         return;
     }
@@ -261,12 +410,19 @@ void SnippetManagerDialog::removeHighlightPoint()
                 break;
             }
         }
+        snippet.autoChangeSections.erase(std::remove_if(snippet.autoChangeSections.begin(), snippet.autoChangeSections.end(),
+            [OFFSET](const AutoChangeSection &section) { return section.sourcePointOffset == OFFSET; }),
+            snippet.autoChangeSections.end());
         QString error;
         if (!SnippetStore::save(&snippet, &error)) {
             statusLabel->setText(error);
             return;
         }
         refreshPointsList(snippet);
+        refreshAutoChangesList(snippet);
+        autoChangeSource->setEnabled(!snippet.highlightPoints.isEmpty());
+        addAutoChangeButton->setEnabled(!snippet.highlightPoints.isEmpty());
+        removeAutoChangeButton->setEnabled(!snippet.autoChangeSections.isEmpty());
         statusLabel->setText(QStringLiteral("Highlight point removed."));
         return;
     }

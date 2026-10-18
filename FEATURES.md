@@ -1,61 +1,65 @@
 # Shell Scratchpad Features
 
-Shell Scratchpad is a KDE/Linux desktop app for writing, checking, and running Bash scripts from a focused editor.
+Shell Scratchpad is a Linux desktop app for writing, checking, and running Bash scripts. The editor and the rest of the app follow the KDE theme; the code editor keeps its own dark background and syntax color settings.
 
-## Script editing
+## Write and navigate scripts
 
-- Edit multiline Bash scripts with line numbers, current-line highlighting, undo/redo, find, a dark code background, and customizable syntax colors.
-- Highlight common Bash syntax as you type, including comments, strings, variables, keywords, commands, assignments, options, paths, operators, and redirections. The tokenizer is lightweight and best-effort rather than a complete Bash parser.
-- Fold common control-flow blocks and here-documents. Collapsed sections show an inline artifact for selecting the hidden text or placing the caret before or after it.
-- Insert a blank line above the current line with **Ctrl+Enter**, or below it with **Shift+Enter**. Zoom the editor with the View menu; use **Ctrl+Y** to redo.
-- Customize syntax colors, including the here-document background, with **Tools → Code Style…**. The separate Syntax Debugger remains available for inspecting tokenizer results.
+- Start with a new scratch script, open a `.sh` file, or pass a script path when launching the app. Save file-backed scripts with **Ctrl+S** or **File → Save Script**. Ctrl+S does nothing for an untitled scratch script.
+- Create more than one independent window with **File → New Window**. The Window menu switches between open windows.
+- Edit Bash in a monospace editor with line numbers, current-line highlighting, undo and redo, and four-space tab width. With multiple lines selected, **Tab** indents every line and **Shift+Tab** removes one indentation level.
+- Insert a blank line above the current line with **Ctrl+Enter**, or below it with **Shift+Enter**.
+- Find text with **Edit → Find** or **Ctrl+F**. The search bar appears above the editor. Enter and the next button find forward; Shift+Enter and the previous button find backward. Search wraps around, and **Options → Case sensitive** changes matching.
+- Fold supported Bash blocks and here-documents from the editor. A collapsed section is represented by an inline artifact: select it to select the hidden text, or place the caret immediately before or after it to edit around the folded section. **Ctrl+M**, then **Ctrl+O** folds all sections; **Ctrl+M**, then **Ctrl+P** unfolds them. The status bar shows when the app is waiting for the second key.
+- Right-click the editor for actions relevant to the clicked token or selection. Depending on context, you can paste, run code, run selected code, copy, create a snippet, open a command's man page, navigate to a declaration, or copy a line together with its diagnostics. Hold **Ctrl** over a navigable in-script symbol to highlight it, then click to jump to its declaration.
+- A delayed hover tooltip shows available token descriptions. Typing dismisses it until typing pauses; editor focus loss hides suggestions and tooltips.
 
-## Suggestions and snippets
+## Syntax, suggestions, and diagnostics
 
-- Get context-aware suggestions for Bash keywords, builtins, executable commands, environment and script variables, special parameters, and common command options. Command suggestions include descriptions when available.
-- Create Bash snippets from selected editor text. Each snippet has a unique name and description and is saved as a single JSON file named after the snippet in the snippets folder.
-- Manage snippets with **Tools → Snippets…**: edit names and descriptions, mark or remove highlight points, reload from disk, open the snippets folder, or delete a snippet with confirmation.
-- Preview snippet code with syntax highlighting. ShellCheck syntax errors prevent a snippet from being saved.
-- When an inserted snippet has highlight points, the editor selects them in order. Press **Tab** or **Enter** to advance, or **Escape** to stop.
+- Bash syntax is highlighted as you type, including comments, quoted strings, variables, keywords, commands, arguments, paths, operators, redirections, and here-documents. Here-documents use the string style and do not receive ordinary code suggestions.
+- Change syntax colors and code style with **Tools → Code Style**. The highlighter recognizes common Bash syntax and shell context without trying to parse every Bash construct.
+- Suggestions appear while typing and include Bash keywords and builtins, executable commands, command options, snippets, environment variables, script variables, functions, and special Bash parameters. Suggestions respect context, including variable expansion and the command position after `sudo`.
+- Suggestion matching accepts exact and prefix matches first, then ranks reasonable fuzzy matches. Select an entry to insert it; command suggestions and other entries retain their descriptions where available.
+- Environment variables from the selected run profile are included in variable suggestions. The editor also tracks declarations in the current script so suggestions and navigation can point back to their source.
+- ShellCheck runs after edits pause and before a script runs. Its errors and warnings appear in the diagnostics list and can be opened at their source line. Errors and warnings receive distinct squiggly underlines; right-click a diagnostic line to copy the line and its diagnostics.
+- When an unknown variable resembles a known script or environment variable, the app can report a suggested correction and offer a direct fix.
+- Use **Tools → Refresh Command Cache** after changing the system's available commands. **Tools → Syntax Debugger** opens the tokenizer inspection window.
 
-## Running scripts
+## Snippets
 
-- Run the full script with **Alt+Enter** or **Script → Run Script**; run selected text with **Script → Run Selection**. Stop a running script with **Shift+Alt+Enter**.
-- Choose a working directory directly, browse for one, or select a saved run profile with its own working directory and environment overrides. Opened script files use the default profile unless a profile has been saved for that file; changing back to Default removes its saved override.
-- Run scripts through Bash without creating a temporary script file. Output streams live in the app, while run state, elapsed time, and exit status appear in the status area.
-- Choose whether output clears at the start of each run. Stop a running process from the Script menu or the Stop control.
-- Handle common Bash `read` prompts in dialogs, including masked input for `read -s`, and detect some prompts from external commands. Optional GUI sudo prompts keep passwords out of output and support reuse for the current run.
-- Inspect top-level commands from the latest run in the separate **Tools → Run History…** window.
+- Select code and choose **Create Snippet** from the editor context menu. Give the snippet a unique name and description; snippets are stored as individual JSON files in the snippets folder.
+- Open **Tools → Snippets** to browse and manage your own snippets. The manager previews selected code with syntax highlighting and lets you edit its name and description, edit highlight points, reload the file from disk, open the snippets folder, or delete the snippet after confirmation.
+- The manager also has a separate read-only view of built-in snippets. Built-ins and user snippets are both offered by the completion menu.
+- ShellCheck syntax errors prevent invalid snippets from being saved.
+- Highlight points mark editable fields. When a snippet is inserted, the editor selects those fields in order; press **Tab** or **Enter** to advance, or **Escape** to leave snippet navigation.
+- Auto-change sections copy the confirmed text of a related highlight point to other places in the snippet. This is useful for repeating names, such as a function name in its body.
+
+## Run scripts and profiles
+
+- Run a full script with **Alt+Enter** or **Script → Run Script**. Run selected text with **Script → Run Selection**. Stop a running script with **Shift+Alt+Enter** or **Script → Stop Script**.
+- Set the working directory in the field above the editor, use **Browse**, or select a saved run profile. Profiles hold a working directory and environment overrides. A `.sh` file uses the Default profile unless a profile has been saved for that file; selecting Default removes that file's saved profile choice.
+- Choose **Script → Clear output each run** to control whether the previous output is removed before running. Output can also be cleared with **Script → Clear Output**.
+- Run progress, elapsed time, and the final exit status appear in the app's status area. Output contains the program's output rather than extra run-status messages.
+- The Script menu can show GUI password prompts for `sudo` and reuse a password for the duration of that run, so repeated sudo commands do not ask again. Passwords are not saved as part of a run profile.
+- Shell Scratchpad can respond to common Bash `read` prompts with input dialogs, including masked input for `read -s`.
+- Open **Tools → Run History** when needed to inspect top-level commands from the latest run, including commands executed through `sudo` and their source lines.
 
 ## Output
 
-- View combined standard output and standard error as a script runs.
-- Filter large output by matching lines as you type, with matching characters highlighted.
-- Copy selected output with **Ctrl+C** or the Copy Output control; with no selection, the control copies all output.
-- Save selected output lines as bookmarks. Bookmarks persist across runs and can be opened, removed, or searched in the current output.
-- Clear output independently from the script. Output text remains free of synthetic run-status messages.
+- Standard output and standard error are shown together in the output pane as the script runs.
+- Focus the output pane and press **Ctrl+F** to open its filter bar. Typing filters the pane to lines containing the query and highlights matching characters. Enter and the arrow buttons move through matching lines without selecting their text; Shift+Enter moves backward. Use **Options → Case sensitive** to change matching, or close the bar to show all output again.
+- Press **Ctrl+C** in the output pane to copy the selection, or all output if nothing is selected. The **Copy output** button follows the same rule.
+- Select output and choose **Bookmark selection** to save it; with no selection, the current line is bookmarked. Bookmarks persist across runs and can be opened, removed, or searched in the current output from **Tools → Output Bookmarks**.
 
-## Script files and saved scripts
+## Quick saved scripts and recovery
 
-- Create scratch scripts, open `.sh` files, save file-backed scripts, or pass a script path on the command line. **Ctrl+S** saves an opened file and does nothing for an untitled scratch script.
-- Modified file-backed scripts prompt before replacement or close. Untitled scratch scripts do not prompt to save. Recovery drafts are saved automatically and can be restored on startup.
-- Save reusable scripts in the Quick Saved Scripts window. User scripts appear separately from built-in system diagnostic scripts, and user entries can be deleted.
-- Keep a single Latest Draft entry for the most recent unsaved draft. Opening a new script clears the output and its filter.
-- Use the built-in Bash diagnostics for boot logs, graphics and kernel details, NVMe/SMART health, network and DNS, and memory and disk usage. They are ordinary editable scripts.
+- Open **Script → Quick Saved Scripts** or press **Ctrl+Q** to browse reusable scripts. The window previews the selected script on the right.
+- Save your own scripts to the list and remove them later. User scripts appear above a separate read-only list of built-in diagnostics for boot logs, graphics and kernel details, NVMe and SMART health, network and DNS, memory, and disk usage. Selecting an entry loads an ordinary Bash script into the editor so it can be inspected, changed, and run.
+- The list includes one **Latest Draft** entry for the most recent unsaved draft.
+- Opening a new script clears output. Modified saved files ask before being replaced or closed; untitled scratch scripts do not prompt to save. The app keeps recovery drafts and offers to restore an interrupted session on startup.
 
-## Checks and run profiles
+## Menus, appearance, and installation
 
-- Run ShellCheck after a short pause while editing and before execution. Findings appear in the dockable diagnostics list and can navigate to their source lines. ShellCheck is also used to reject invalid snippet syntax.
-- Save and select run profiles containing a working directory and environment overrides.
-
-## Menus, windows, and KDE integration
-
-- Use File, Edit, Script, View, Tools, Window, and Help menus for script actions, editor commands, layout, zoom, tools, window navigation, shortcuts, and About information.
-- Open multiple independent app windows and switch between them. Use **Ctrl+M**, then **Ctrl+O** to collapse all sections or **Ctrl+P** to expand them; the status bar indicates when a follow-up key is expected.
-- The About dialog identifies WinterRose as the company and MPL-2.0 as the license.
-- Install a KDE application launcher and Dolphin context-menu actions for opening a directory in Shell Scratchpad or opening a `.sh` file directly.
-
-## Setup
-
-- Build and install with `setup.sh` or build manually with CMake and Qt 6.6 or newer.
-- The setup script supports Fedora, Debian/Ubuntu-based distributions, openSUSE, and Arch-based distributions. It installs the app, icon, desktop entry, and Dolphin service menus into the user's local environment.
+- **File** creates, opens, saves, and closes scripts and windows. **Edit** contains standard editing commands and Find. **Script** runs scripts, controls output and sudo behavior, sets the working directory, and opens quick saved scripts. **View** controls output visibility, layout, folding, and zoom.
+- **Tools** opens snippets, code style, syntax debugging, command-cache refresh, run history, and output bookmarks. **Window** switches among app windows. **Help** contains keyboard shortcuts and About information.
+- The About window credits WinterRose and lists the MPL-2.0 license.
+- `setup.sh` builds and installs the app, launcher icon, desktop entry, and Dolphin context-menu actions for opening a directory or a `.sh` file. The setup script supports Fedora, Debian/Ubuntu-based distributions, openSUSE, and Arch-based distributions.

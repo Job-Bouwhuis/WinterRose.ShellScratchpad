@@ -14,6 +14,7 @@
 #include <QTextCursor>
 #include <QEvent>
 #include <QTextDocument>
+#include <QCursor>
 #include <algorithm>
 
 namespace ShellScratchpad
@@ -65,6 +66,7 @@ CodeEditor::CodeEditor(QWidget *parent)
     normalCursorWidth = cursorWidth();
     rebuildFoldRegions();
     updateLineNumberAreaWidth();
+    updateTabStopDistance();
     highlightCurrentLine();
 }
 
@@ -104,14 +106,24 @@ void CodeEditor::resizeEvent(QResizeEvent *event)
 void CodeEditor::changeEvent(QEvent *event)
 {
     QPlainTextEdit::changeEvent(event);
-    if (event->type() == QEvent::FontChange)
+    if (event->type() == QEvent::FontChange) {
         updateLineNumberAreaWidth();
+        updateTabStopDistance();
+    }
 }
 
 void CodeEditor::mousePressEvent(QMouseEvent *event)
 {
+    if (event->button() == Qt::LeftButton && event->modifiers().testFlag(Qt::ControlModifier)) {
+        if (const NavigationSymbol *symbol = navigationSymbolAt(event->position().toPoint())) {
+            emit symbolNavigationRequested(symbol->name);
+            event->accept();
+            return;
+        }
+    }
     if (!snippetPointCursors.isEmpty()) {
         snippetPointCursors.clear();
+        snippetAutoChanges.clear();
         activeSnippetPoint = -1;
     }
     if (event->button() == Qt::LeftButton) {
@@ -179,6 +191,18 @@ void CodeEditor::mousePressEvent(QMouseEvent *event)
     QPlainTextEdit::mousePressEvent(event);
 }
 
+void CodeEditor::mouseMoveEvent(QMouseEvent *event)
+{
+    QPlainTextEdit::mouseMoveEvent(event);
+    updateNavigationHover(event->position().toPoint(), event->modifiers().testFlag(Qt::ControlModifier));
+}
+
+void CodeEditor::leaveEvent(QEvent *event)
+{
+    updateNavigationHover(QPoint(-1, -1), false);
+    QPlainTextEdit::leaveEvent(event);
+}
+
 void CodeEditor::paintEvent(QPaintEvent *event)
 {
     QPlainTextEdit::paintEvent(event);
@@ -215,20 +239,48 @@ void CodeEditor::paintEvent(QPaintEvent *event)
 
 void CodeEditor::keyPressEvent(QKeyEvent *event)
 {
+    if (event->key() == Qt::Key_Control)
+        updateNavigationHover(viewport()->mapFromGlobal(QCursor::pos()), true);
+    if ((event->key() == Qt::Key_Tab || event->key() == Qt::Key_Backtab) && textCursor().hasSelection()) {
+        const bool UNINDENT = event->key() == Qt::Key_Backtab || event->modifiers().testFlag(Qt::ShiftModifier);
+        if (indentSelectedLines(UNINDENT)) {
+            event->accept();
+            return;
+        }
+    }
     if (activeSnippetPoint >= 0 && !snippetPointCursors.isEmpty()) {
         if (event->key() == Qt::Key_Escape) {
             snippetPointCursors.clear();
+            snippetAutoChanges.clear();
             activeSnippetPoint = -1;
             event->accept();
             return;
         }
         if ((event->key() == Qt::Key_Tab || event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) &&
             event->modifiers() == Qt::NoModifier) {
+            const int CONFIRMED_POINT = activeSnippetPoint;
+            const int VALUE_START = activePointStartCursor.position();
+            const int VALUE_END = activePointEndCursor.position();
+            const QString CONFIRMED_VALUE = document()->toPlainText().mid(VALUE_START, qMax(0, VALUE_END - VALUE_START));
+            for (ActiveAutoChange &section : snippetAutoChanges) {
+                if (section.sourcePointIndex != CONFIRMED_POINT || section.applied)
+                    continue;
+                QTextCursor target = section.range;
+                target.insertText(CONFIRMED_VALUE);
+                section.range = target;
+                section.applied = true;
+            }
             ++activeSnippetPoint;
             if (activeSnippetPoint < snippetPointCursors.size()) {
                 setTextCursor(snippetPointCursors.at(activeSnippetPoint));
+                activePointStartCursor = QTextCursor(document());
+                activePointStartCursor.setPosition(snippetPointCursors.at(activeSnippetPoint).selectionStart());
+                activePointStartCursor.setKeepPositionOnInsert(true);
+                activePointEndCursor = QTextCursor(document());
+                activePointEndCursor.setPosition(snippetPointCursors.at(activeSnippetPoint).selectionEnd());
             } else {
                 snippetPointCursors.clear();
+                snippetAutoChanges.clear();
                 activeSnippetPoint = -1;
                 setTextCursor(snippetEndCursor);
             }
@@ -276,9 +328,94 @@ void CodeEditor::keyPressEvent(QKeyEvent *event)
     event->accept();
 }
 
-void CodeEditor::insertSnippet(const QString &source, const QVector<QPair<int, int>> &highlightPoints)
+bool CodeEditor::indentSelectedLines(bool unindent)
+{
+    const QTextCursor originalCursor = textCursor();
+    const int selectionStart = static_cast<int>(originalCursor.selectionStart());
+    const int selectionEnd = static_cast<int>(originalCursor.selectionEnd());
+    const QTextBlock firstBlock = document()->findBlock(selectionStart);
+    int adjustedEnd = selectionEnd;
+    if (adjustedEnd > selectionStart) {
+        const QTextBlock blockAtEnd = document()->findBlock(adjustedEnd);
+        if (blockAtEnd.isValid() && blockAtEnd.position() == adjustedEnd)
+            --adjustedEnd;
+    }
+    const QTextBlock lastBlock = document()->findBlock(adjustedEnd);
+    if (!firstBlock.isValid() || !lastBlock.isValid() || firstBlock == lastBlock)
+        return false;
+
+    struct Edit { int position; int removed; int inserted; };
+    QVector<Edit> edits;
+    for (QTextBlock block = firstBlock; block.isValid() && block.blockNumber() <= lastBlock.blockNumber();
+         block = block.next()) {
+        const QString line = block.text();
+        if (!unindent) {
+            edits.append(Edit{block.position(), 0, 4});
+            continue;
+        }
+        int removeCount = 0;
+        if (line.startsWith(QLatin1Char('\t'))) {
+            removeCount = 1;
+        } else {
+            while (removeCount < 4 && removeCount < line.size() && line.at(removeCount) == QLatin1Char(' '))
+                ++removeCount;
+        }
+        if (removeCount > 0)
+            edits.append(Edit{block.position(), removeCount, 0});
+    }
+    if (edits.isEmpty())
+        return true;
+
+    QTextCursor editCursor(document());
+    editCursor.beginEditBlock();
+    for (auto it = edits.crbegin(); it != edits.crend(); ++it) {
+        editCursor.setPosition(it->position);
+        if (it->removed > 0) {
+            editCursor.setPosition(it->position + it->removed, QTextCursor::KeepAnchor);
+            editCursor.removeSelectedText();
+        }
+        if (it->inserted > 0)
+            editCursor.insertText(QString(it->inserted, QLatin1Char(' ')));
+    }
+    editCursor.endEditBlock();
+
+    const auto adjustedPosition = [&edits](int position) {
+        int result = position;
+        for (const Edit &edit : edits) {
+            if (edit.inserted > 0 && edit.position <= position)
+                result += edit.inserted;
+            else if (edit.removed > 0 && edit.position + edit.removed <= position)
+                result -= edit.removed;
+            else if (edit.removed > 0 && edit.position < position)
+                result = edit.position;
+        }
+        return result;
+    };
+    QTextCursor restored(document());
+    restored.setPosition(qBound(0, adjustedPosition(selectionStart), document()->characterCount() - 1));
+    restored.setPosition(qBound(0, adjustedPosition(selectionEnd), document()->characterCount() - 1),
+                         QTextCursor::KeepAnchor);
+    setTextCursor(restored);
+    return true;
+}
+
+void CodeEditor::updateTabStopDistance()
+{
+    setTabStopDistance(4.0 * fontMetrics().horizontalAdvance(QLatin1Char(' ')));
+}
+
+void CodeEditor::keyReleaseEvent(QKeyEvent *event)
+{
+    QPlainTextEdit::keyReleaseEvent(event);
+    if (event->key() == Qt::Key_Control)
+        updateNavigationHover(viewport()->mapFromGlobal(QCursor::pos()), false);
+}
+
+void CodeEditor::insertSnippet(const QString &source, const QVector<QPair<int, int>> &highlightPoints,
+                               const QVector<ShellScratchpad::Snippets::AutoChangeSection> &autoChangeSections)
 {
     snippetPointCursors.clear();
+    snippetAutoChanges.clear();
     activeSnippetPoint = -1;
     virtualAfterFoldBlock = -1;
     setCursorWidth(normalCursorWidth);
@@ -302,12 +439,34 @@ void CodeEditor::insertSnippet(const QString &source, const QVector<QPair<int, i
         selection.setPosition(START + point.first + point.second, QTextCursor::KeepAnchor);
         snippetPointCursors.append(selection);
     }
+    for (const ShellScratchpad::Snippets::AutoChangeSection &section : autoChangeSections) {
+        if (section.offset < 0 || section.length < 0 || section.offset + section.length > source.size())
+            continue;
+        int sourcePointIndex = -1;
+        for (int index = 0; index < orderedPoints.size(); ++index) {
+            if (orderedPoints.at(index).first == section.sourcePointOffset) {
+                sourcePointIndex = index;
+                break;
+            }
+        }
+        if (sourcePointIndex < 0)
+            continue;
+        QTextCursor target(document());
+        target.setPosition(START + section.offset);
+        target.setPosition(START + section.offset + section.length, QTextCursor::KeepAnchor);
+        snippetAutoChanges.append(ActiveAutoChange{target, sourcePointIndex, false});
+    }
     if (snippetPointCursors.isEmpty()) {
         setTextCursor(snippetEndCursor);
         return;
     }
     activeSnippetPoint = 0;
     setTextCursor(snippetPointCursors.first());
+    activePointStartCursor = QTextCursor(document());
+    activePointStartCursor.setPosition(snippetPointCursors.first().selectionStart());
+    activePointStartCursor.setKeepPositionOnInsert(true);
+    activePointEndCursor = QTextCursor(document());
+    activePointEndCursor.setPosition(snippetPointCursors.first().selectionEnd());
     setFocus();
 }
 
@@ -435,6 +594,28 @@ void CodeEditor::expandAllSections()
     applyFoldVisibility();
 }
 
+void CodeEditor::revealPosition(qsizetype position)
+{
+    const QTextBlock target = document()->findBlock(position);
+    if (!target.isValid())
+        return;
+    const int TARGET_BLOCK = target.blockNumber();
+    bool changed = false;
+    for (auto it = collapsedBlocks.begin(); it != collapsedBlocks.end();) {
+        if (TARGET_BLOCK > *it && TARGET_BLOCK <= foldRegions.value(*it, *it)) {
+            it = collapsedBlocks.erase(it);
+            changed = true;
+        } else {
+            ++it;
+        }
+    }
+    if (changed)
+        applyFoldVisibility();
+    virtualAfterFoldBlock = -1;
+    selectedFoldBlock = -1;
+    setCursorWidth(normalCursorWidth);
+}
+
 void CodeEditor::handleGutterClick(int y)
 {
     QTextBlock block = firstVisibleBlock();
@@ -497,8 +678,119 @@ void CodeEditor::highlightCurrentLine()
         selection.cursor.clearSelection();
         selections.append(selection);
     }
+    for (const TextDecoration &decoration : textDecorations) {
+        if (decoration.length <= 0 || decoration.startOffset < 0 ||
+            decoration.startOffset >= document()->characterCount() - 1)
+            continue;
+        QTextEdit::ExtraSelection selection;
+        selection.cursor = QTextCursor(document());
+        selection.cursor.setPosition(static_cast<int>(decoration.startOffset));
+        const qsizetype end = qMin<qsizetype>(decoration.startOffset + decoration.length,
+                                              document()->characterCount() - 1);
+        selection.cursor.setPosition(static_cast<int>(end), QTextCursor::KeepAnchor);
+        selection.format = decoration.format;
+        selections.append(selection);
+    }
+    if (navigationHoverStart >= 0 && navigationHoverLength > 0 &&
+        navigationHoverStart < document()->characterCount() - 1) {
+        QTextEdit::ExtraSelection selection;
+        selection.cursor = QTextCursor(document());
+        selection.cursor.setPosition(static_cast<int>(navigationHoverStart));
+        selection.cursor.setPosition(static_cast<int>(qMin<qsizetype>(navigationHoverStart + navigationHoverLength,
+            document()->characterCount() - 1)), QTextCursor::KeepAnchor);
+        selection.format.setForeground(Qt::white);
+        selection.format.setUnderlineColor(Qt::white);
+        selection.format.setUnderlineStyle(QTextCharFormat::SingleUnderline);
+        selections.append(selection);
+    }
     setExtraSelections(selections);
     lineNumberArea->update();
+}
+
+void CodeEditor::setTextDecorations(const QVector<TextDecoration> &decorations)
+{
+    textDecorations = decorations;
+    highlightCurrentLine();
+}
+
+void CodeEditor::setNavigationSymbols(const QVector<NavigationSymbol> &symbols)
+{
+    navigationSymbols = symbols;
+    if (navigationHoverStart >= 0) {
+        bool stillNavigable = false;
+        const QString NAME = document()->toPlainText().mid(navigationHoverStart, navigationHoverLength);
+        for (const NavigationSymbol &symbol : navigationSymbols) {
+            if (symbol.name == NAME) {
+                stillNavigable = true;
+                break;
+            }
+        }
+        if (!stillNavigable)
+            updateNavigationHover(QPoint(-1, -1), false);
+    }
+}
+
+const CodeEditor::NavigationSymbol *CodeEditor::navigationSymbolAt(const QPoint &viewportPosition,
+                                                                    qsizetype *start, qsizetype *length) const
+{
+    if (viewportPosition.x() < 0 || viewportPosition.y() < 0)
+        return nullptr;
+    const QTextCursor cursor = cursorForPosition(viewportPosition);
+    const QString LINE = cursor.block().text();
+    int column = cursor.positionInBlock();
+    if (column >= LINE.size())
+        column = LINE.size() - 1;
+    if (column < 0)
+        return nullptr;
+    const auto isIdentifierCharacter = [](QChar character) {
+        return character.isLetterOrNumber() || character == QLatin1Char('_');
+    };
+    if (!isIdentifierCharacter(LINE.at(column))) {
+        if (LINE.at(column) == QLatin1Char('$')) {
+            ++column;
+            if (column < LINE.size() && LINE.at(column) == QLatin1Char('{'))
+                ++column;
+        } else if (column + 1 < LINE.size() && isIdentifierCharacter(LINE.at(column + 1))) {
+            ++column;
+        } else if (column > 0 && isIdentifierCharacter(LINE.at(column - 1))) {
+            --column;
+        }
+    }
+    if (column < 0 || column >= LINE.size() || !isIdentifierCharacter(LINE.at(column)))
+        return nullptr;
+    int left = column;
+    int right = column + 1;
+    while (left > 0 && isIdentifierCharacter(LINE.at(left - 1)))
+        --left;
+    while (right < LINE.size() && isIdentifierCharacter(LINE.at(right)))
+        ++right;
+    const QString NAME = LINE.mid(left, right - left);
+    for (const NavigationSymbol &symbol : navigationSymbols) {
+        if (symbol.name != NAME)
+            continue;
+        if (start)
+            *start = cursor.block().position() + left;
+        if (length)
+            *length = right - left;
+        return &symbol;
+    }
+    return nullptr;
+}
+
+void CodeEditor::updateNavigationHover(const QPoint &viewportPosition, bool controlHeld)
+{
+    qsizetype start = -1;
+    qsizetype length = 0;
+    const NavigationSymbol *symbol = controlHeld
+        ? navigationSymbolAt(viewportPosition, &start, &length) : nullptr;
+    const qsizetype newStart = symbol ? start : -1;
+    const qsizetype newLength = symbol ? length : 0;
+    if (navigationHoverStart == newStart && navigationHoverLength == newLength)
+        return;
+    navigationHoverStart = newStart;
+    navigationHoverLength = newLength;
+    viewport()->setCursor(symbol ? Qt::PointingHandCursor : Qt::IBeamCursor);
+    highlightCurrentLine();
 }
 
 void CodeEditor::lineNumberAreaPaintEvent(QPaintEvent *event)

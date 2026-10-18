@@ -11,6 +11,13 @@ struct HighlightPoint
     qsizetype length = 0;
 };
 
+struct AutoChangeSection
+{
+    qsizetype offset = 0;
+    qsizetype length = 0;
+    qsizetype sourcePointOffset = 0;
+};
+
 struct Snippet
 {
     QString id;
@@ -19,6 +26,7 @@ struct Snippet
     QString code;
     QString filePath;
     QVector<HighlightPoint> highlightPoints;
+    QVector<AutoChangeSection> autoChangeSections;
 };
 
 class SnippetStore final
@@ -26,6 +34,7 @@ class SnippetStore final
 public:
     static QString directoryPath();
     static QVector<Snippet> loadAll();
+    static QVector<Snippet> builtInSnippets();
     static bool save(Snippet *snippet, QString *error = nullptr);
     static bool remove(const QString &id, QString *error = nullptr);
     static bool create(const QString &name, const QString &description,

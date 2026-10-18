@@ -92,19 +92,24 @@ bool startsOperator(const QString &source, qsizetype offset, QString *matched = 
     return false;
 }
 
-bool parseHereDocDelimiter(const QString &source, qsizetype start, QString *delimiter)
+bool parseHereDocDelimiter(const QString &source, qsizetype start, QString *delimiter,
+                          qsizetype *rangeStart = nullptr, qsizetype *rangeEnd = nullptr)
 {
     while (start < source.size() && (source.at(start) == QLatin1Char(' ') ||
                                      source.at(start) == QLatin1Char('\t')))
         ++start;
     if (start >= source.size() || source.at(start) == QLatin1Char('\n'))
         return false;
+    const qsizetype TOKEN_START = start;
 
     if (source.at(start) == QLatin1Char('\'') || source.at(start) == QLatin1Char('"')) {
         const QChar QUOTE = source.at(start++);
         while (start < source.size() && source.at(start) != QLatin1Char('\n')) {
-            if (source.at(start) == QUOTE)
+            if (source.at(start) == QUOTE) {
+                if (rangeStart) *rangeStart = TOKEN_START;
+                if (rangeEnd) *rangeEnd = start + 1;
                 return !delimiter->isEmpty();
+            }
             if (source.at(start) == QLatin1Char('\\') && start + 1 < source.size() &&
                 source.at(start + 1) != QLatin1Char('\n'))
                 ++start;
@@ -123,7 +128,12 @@ bool parseHereDocDelimiter(const QString &source, qsizetype start, QString *deli
             ++start;
         delimiter->append(source.at(start++));
     }
-    return !delimiter->isEmpty();
+    if (!delimiter->isEmpty()) {
+        if (rangeStart) *rangeStart = TOKEN_START;
+        if (rangeEnd) *rangeEnd = start;
+        return true;
+    }
+    return false;
 }
 
 QVector<SyntaxToken> findHereDocSpans(const QString &source,
@@ -144,8 +154,24 @@ QVector<SyntaxToken> findHereDocSpans(const QString &source,
 
         QString delimiter;
         bool stripTabs = OPERATOR_TEXT == QStringLiteral("<<-");
-        if (!parseHereDocDelimiter(source, token.startOffset + token.length, &delimiter))
+        qsizetype delimiterStart = 0;
+        qsizetype delimiterEnd = 0;
+        if (!parseHereDocDelimiter(source, token.startOffset + token.length, &delimiter,
+                                   &delimiterStart, &delimiterEnd))
             continue;
+
+        int delimiterLine = 1;
+        int delimiterColumn = 1;
+        for (qsizetype index = 0; index < delimiterStart; ++index) {
+            if (source.at(index) == QLatin1Char('\n')) {
+                ++delimiterLine;
+                delimiterColumn = 1;
+            } else {
+                ++delimiterColumn;
+            }
+        }
+        spans.append(SyntaxToken{delimiterStart, delimiterEnd - delimiterStart, delimiterLine,
+                                 delimiterColumn, TokenKind::StringContent});
 
         const qsizetype lineEnd = source.indexOf(QLatin1Char('\n'), token.startOffset);
         qsizetype bodyStart = lineEnd < 0 ? source.size() : lineEnd + 1;
@@ -519,6 +545,8 @@ QVector<SyntaxToken> SyntaxTokenizer::tokenize(const QString &source)
         QStringLiteral("unalias"), QStringLiteral("unset"), QStringLiteral("wait")
     };
     bool expectingCommand = true;
+    bool expectingSudoCommand = false;
+    bool expectingSudoOptionValue = false;
     bool expectingRedirectionTarget = false;
     int previousLine = 1;
     for (const SyntaxToken &TOKEN : LEXICAL_TOKENS) {
@@ -530,8 +558,11 @@ QVector<SyntaxToken> SyntaxTokenizer::tokenize(const QString &source)
             result.append(TOKEN);
             if (TEXT == QStringLiteral(";") || TEXT == QStringLiteral("&&") || TEXT == QStringLiteral("||") ||
                 TEXT == QStringLiteral("|") || TEXT == QStringLiteral("|&") || TEXT == QStringLiteral("{") ||
-                TEXT == QStringLiteral("("))
+                TEXT == QStringLiteral("(")) {
                 expectingCommand = true;
+                expectingSudoCommand = false;
+                expectingSudoOptionValue = false;
+            }
             continue;
         }
         if (TOKEN.kind == TokenKind::Redirection) {
@@ -599,9 +630,19 @@ QVector<SyntaxToken> SyntaxTokenizer::tokenize(const QString &source)
             else if (TEXT == QStringLiteral("for") || TEXT == QStringLiteral("select") ||
                      TEXT == QStringLiteral("function") || TEXT == QStringLiteral("case"))
                 expectingCommand = false;
+        } else if (expectingSudoOptionValue) {
+            classified.kind = TokenKind::Argument;
+            expectingSudoOptionValue = false;
+        } else if (expectingSudoCommand && TEXT.startsWith(QLatin1Char('-'))) {
+            classified.kind = TokenKind::Option;
+            expectingSudoOptionValue = TEXT == QStringLiteral("-u") || TEXT == QStringLiteral("-g") ||
+                TEXT == QStringLiteral("-h") || TEXT == QStringLiteral("-p") || TEXT == QStringLiteral("-C") ||
+                TEXT == QStringLiteral("--user") || TEXT == QStringLiteral("--group") ||
+                TEXT == QStringLiteral("--host") || TEXT == QStringLiteral("--prompt");
         } else if (expectingCommand) {
             classified.kind = BUILTINS.contains(TEXT) ? TokenKind::Builtin : TokenKind::Command;
-            expectingCommand = false;
+            expectingCommand = TEXT == QStringLiteral("sudo");
+            expectingSudoCommand = TEXT == QStringLiteral("sudo");
         } else if (TEXT.startsWith(QLatin1Char('-')) && TEXT.size() > 1) {
             classified.kind = TokenKind::Option;
         } else if (TEXT.startsWith(QLatin1Char('/')) || TEXT.startsWith(QStringLiteral("./")) ||

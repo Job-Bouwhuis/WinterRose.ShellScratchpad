@@ -114,8 +114,13 @@ int main()
     expectToken(CONTEXT_CASE, TokenKind::Option, QStringLiteral("-S"), QStringLiteral("command option"));
     expectToken(CONTEXT_CASE, TokenKind::Path, QStringLiteral("./setup.sh"), QStringLiteral("path argument"));
     expectToken(CONTEXT_CASE, TokenKind::Command, QStringLiteral("sudo"), QStringLiteral("first command in chain"));
-    expectToken(CONTEXT_CASE, TokenKind::Argument, QStringLiteral("dnf"), QStringLiteral("sudo subcommand argument"));
+    expectToken(CONTEXT_CASE, TokenKind::Command, QStringLiteral("dnf"), QStringLiteral("command invoked through sudo"));
     expectToken(CONTEXT_CASE, TokenKind::Builtin, QStringLiteral("echo"), QStringLiteral("command after logical operator"));
+
+    const QString SUDO_OPTION_CASE = QStringLiteral("sudo -u root apt install package");
+    expectToken(SUDO_OPTION_CASE, TokenKind::Option, QStringLiteral("-u"), QStringLiteral("sudo option"));
+    expectToken(SUDO_OPTION_CASE, TokenKind::Argument, QStringLiteral("root"), QStringLiteral("sudo option value"));
+    expectToken(SUDO_OPTION_CASE, TokenKind::Command, QStringLiteral("apt"), QStringLiteral("command after sudo option value"));
 
     const QString CONTROL_FLOW_CASE = QStringLiteral(
         "if [ -d \"$HOME/.cache\" ]; then\n"
