@@ -14,6 +14,7 @@
 #include <QTextCursor>
 #include <QEvent>
 #include <QTextDocument>
+#include <QTextBlockUserData>
 #include <QCursor>
 #include <algorithm>
 
@@ -21,6 +22,12 @@ namespace ShellScratchpad
 {
 namespace
 {
+class BreakpointBlockData final : public QTextBlockUserData
+{
+public:
+    bool breakpoint = true;
+};
+
 class LineNumberArea final : public QWidget
 {
 public:
@@ -43,8 +50,11 @@ protected:
 
     void mousePressEvent(QMouseEvent *event) override
     {
-        if (event->button() == Qt::LeftButton && event->position().x() < 15) {
-            codeEditor->handleGutterClick(qRound(event->position().y()));
+        if (event->button() == Qt::LeftButton) {
+            if (event->position().x() < 15)
+                codeEditor->handleGutterClick(qRound(event->position().y()));
+            else
+                codeEditor->toggleBreakpointAtY(qRound(event->position().y()));
             event->accept();
             return;
         }
@@ -54,6 +64,22 @@ protected:
 private:
     CodeEditor *codeEditor;
 };
+}
+
+void CodeEditor::toggleBreakpointAtY(int y)
+{
+    QTextBlock block = firstVisibleBlock();
+    int top = qRound(blockBoundingGeometry(block).translated(contentOffset()).top());
+    int bottom = top + qRound(blockBoundingRect(block).height());
+    while (block.isValid()) {
+        if (block.isVisible() && y >= top && y <= bottom) {
+            toggleBreakpoint(block.blockNumber() + 1);
+            return;
+        }
+        block = block.next();
+        top = bottom;
+        bottom = top + qRound(blockBoundingRect(block).height());
+    }
 }
 
 CodeEditor::CodeEditor(QWidget *parent)
@@ -678,6 +704,17 @@ void CodeEditor::highlightCurrentLine()
         selection.cursor.clearSelection();
         selections.append(selection);
     }
+    if (debugLine > 0) {
+        const QTextBlock block = document()->findBlockByNumber(debugLine - 1);
+        if (block.isValid()) {
+            QTextEdit::ExtraSelection selection;
+            selection.cursor = QTextCursor(block);
+            selection.cursor.clearSelection();
+            selection.format.setBackground(QColor(QStringLiteral("#51492a")));
+            selection.format.setProperty(QTextFormat::FullWidthSelection, true);
+            selections.append(selection);
+        }
+    }
     for (const TextDecoration &decoration : textDecorations) {
         if (decoration.length <= 0 || decoration.startOffset < 0 ||
             decoration.startOffset >= document()->characterCount() - 1)
@@ -710,6 +747,37 @@ void CodeEditor::highlightCurrentLine()
 void CodeEditor::setTextDecorations(const QVector<TextDecoration> &decorations)
 {
     textDecorations = decorations;
+    highlightCurrentLine();
+}
+
+void CodeEditor::toggleBreakpoint(int lineNumber)
+{
+    QTextBlock block = document()->findBlockByNumber(lineNumber - 1);
+    if (!block.isValid())
+        return;
+    auto *data = static_cast<BreakpointBlockData *>(block.userData());
+    if (data)
+        block.setUserData(nullptr);
+    else
+        block.setUserData(new BreakpointBlockData());
+    lineNumberArea->update();
+    emit breakpointsChanged();
+}
+
+QSet<int> CodeEditor::breakpoints() const
+{
+    QSet<int> result;
+    for (QTextBlock block = document()->begin(); block.isValid(); block = block.next()) {
+        const auto *data = dynamic_cast<const BreakpointBlockData *>(block.userData());
+        if (data && data->breakpoint)
+            result.insert(block.blockNumber() + 1);
+    }
+    return result;
+}
+
+void CodeEditor::setDebugLine(int lineNumber)
+{
+    debugLine = lineNumber;
     highlightCurrentLine();
 }
 
@@ -820,9 +888,15 @@ void CodeEditor::lineNumberAreaPaintEvent(QPaintEvent *event)
                 painter.setPen(Qt::NoPen);
                 painter.drawPath(marker);
             }
-            painter.setPen(blockNumber + 1 == textCursor().blockNumber() + 1
-                               ? QColor(QStringLiteral("#e5e7eb"))
-                               : QColor(QStringLiteral("#858585")));
+            const auto *data = dynamic_cast<const BreakpointBlockData *>(block.userData());
+            if (data && data->breakpoint)
+                painter.setPen(QColor(QStringLiteral("#ff6666")));
+            else if (blockNumber + 1 == debugLine)
+                painter.setPen(QColor(QStringLiteral("#ffe082")));
+            else
+                painter.setPen(blockNumber == textCursor().blockNumber()
+                                   ? QColor(QStringLiteral("#e5e7eb"))
+                                   : QColor(QStringLiteral("#858585")));
             painter.drawText(16, top, lineNumberArea->width() - 20, fontMetrics().height(),
                              Qt::AlignRight, QString::number(blockNumber + 1));
         }

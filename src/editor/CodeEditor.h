@@ -44,9 +44,14 @@ public:
                        const QVector<ShellScratchpad::Snippets::AutoChangeSection> &autoChangeSections = {});
     void setTextDecorations(const QVector<TextDecoration> &decorations);
     void setNavigationSymbols(const QVector<NavigationSymbol> &symbols);
+    void toggleBreakpoint(int lineNumber);
+    void toggleBreakpointAtY(int y);
+    QSet<int> breakpoints() const;
+    void setDebugLine(int lineNumber);
 
 signals:
     void symbolNavigationRequested(const QString &name);
+    void breakpointsChanged();
 
 protected:
     void resizeEvent(QResizeEvent *event) override;
@@ -69,6 +74,7 @@ private:
     QWidget *lineNumberArea = nullptr;
     QMap<int, int> foldRegions;
     QSet<int> collapsedBlocks;
+    int debugLine = 0;
     int selectedFoldBlock = -1;
     int virtualAfterFoldBlock = -1;
     int normalCursorWidth = 1;

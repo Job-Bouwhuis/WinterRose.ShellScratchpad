@@ -33,6 +33,7 @@ public:
     void refreshCommandCache();
     void refreshSnippets();
     void setProfileEnvironmentVariables(const QStringList &names);
+    void setRuntimeVariables(const QHash<QString, QString> &variables);
     const QVector<ScriptSymbol> &scriptSymbols() const { return knownScriptSymbols; }
 
 protected:
@@ -54,6 +55,7 @@ private:
     QProcess *descriptionLookupProcess = nullptr;
     QStringList systemCommands;
     QStringList profileEnvironmentVariables;
+    QHash<QString, QString> runtimeVariables;
     QVector<Snippets::Snippet> snippets;
     QStringList descriptionLookupNames;
     QHash<QString, QString> commandDescriptions;

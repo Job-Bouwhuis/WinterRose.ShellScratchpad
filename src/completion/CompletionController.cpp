@@ -365,6 +365,15 @@ QString CompletionController::descriptionForTokenAt(const QPoint &position, qsiz
 
     const QString TEXT = SOURCE.mid(hovered->startOffset, hovered->length);
     switch (hovered->kind) {
+    case Syntax::TokenKind::Variable: {
+        QString name = TEXT;
+        if (name.startsWith(QStringLiteral("${")) && name.endsWith(QLatin1Char('}')))
+            name = name.mid(2, name.size() - 3);
+        else if (name.startsWith(QLatin1Char('$')))
+            name.remove(0, 1);
+        const QString declaration = runtimeVariables.value(name);
+        return declaration.isEmpty() ? QString() : QStringLiteral("Runtime value: %1").arg(declaration);
+    }
     case Syntax::TokenKind::Command:
         return commandDescription(TEXT);
     case Syntax::TokenKind::Builtin:
@@ -439,6 +448,11 @@ void CompletionController::updateHoverTarget(const QPoint &position)
         hoverDescription = DESCRIPTION;
         if (QToolTip::isVisible() && !DESCRIPTION.isEmpty())
             QToolTip::showText(editor->viewport()->mapToGlobal(position), DESCRIPTION, editor->viewport());
+        else if (DESCRIPTION.isEmpty()) {
+            hoverDescriptionTimer.stop();
+            QToolTip::hideText();
+        } else if (!hoverDescriptionTimer.isActive())
+            hoverDescriptionTimer.start();
     }
 }
 
@@ -500,6 +514,13 @@ void CompletionController::setProfileEnvironmentVariables(const QStringList &nam
 {
     profileEnvironmentVariables = names;
     updateSuggestions();
+}
+
+void CompletionController::setRuntimeVariables(const QHash<QString, QString> &variables)
+{
+    runtimeVariables = variables;
+    if (hoverTokenStart >= 0)
+        updateHoverTarget(hoverPosition);
 }
 
 void CompletionController::startNextDescriptionLookupBatch()

@@ -67,6 +67,7 @@
 #include <QTextDocument>
 #include <QTimer>
 #include <QToolButton>
+#include <QToolTip>
 #include <QThreadPool>
 #include <QRunnable>
 #include <QVBoxLayout>
@@ -93,6 +94,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -100,11 +102,14 @@ namespace
 {
 constexpr int SCRIPT_DESCRIPTOR = 198;
 constexpr int HISTORY_DESCRIPTOR = 197;
+constexpr int DEBUG_DESCRIPTOR = 196;
 const QByteArray INPUT_MARKER_PREFIX = QByteArray(1, '\x1e') + "SSPAD_INPUT:";
 constexpr char INPUT_MARKER_END = '\x1f';
 
 QByteArray buildRuntimeScript(const QByteArray &userScript, bool handleSudoWithDialog,
-                              bool reuseSudoPassword, bool captureHistory)
+                              bool reuseSudoPassword, bool captureHistory,
+                              bool debuggingEnabled, const QSet<int> &breakpoints,
+                              int sourceLineOffset, bool debugStartPaused)
 {
     static const QByteArray RUNTIME_PRELUDE = R"SSPAD(
 # Keep a separate duplicate of the app's input stream for prompts and sudo.
@@ -282,7 +287,7 @@ sudo() {
     runtimeScript.replace("__SSPAD_GUI_SUDO__", handleSudoWithDialog ? "1" : "0");
     runtimeScript.replace("__SSPAD_REUSE_SUDO_PASSWORD__", reuseSudoPassword ? "1" : "0");
     runtimeScript.append('\n');
-    if (captureHistory) {
+    if (captureHistory && !debuggingEnabled) {
         runtimeScript.append(R"SSPAD(
 shell_scratchpad_record_sudo() {
     builtin printf 'S%s\0' "$1" >&197
@@ -301,7 +306,104 @@ __sspad_trace_command() {
 trap '__sspad_trace_command "$BASH_COMMAND"' DEBUG
 )SSPAD");
     }
-    runtimeScript.append("SSPAD_USER_SCRIPT_START_LINE=$((LINENO + 1))\n");
+    if (debuggingEnabled) {
+        QString breakpointSet = QStringLiteral("|");
+        QList<int> sortedBreakpoints = breakpoints.values();
+        std::sort(sortedBreakpoints.begin(), sortedBreakpoints.end());
+        for (int line : sortedBreakpoints)
+            breakpointSet += QString::number(line) + QLatin1Char('|');
+        runtimeScript += QStringLiteral("__SSPAD_DEBUG_BREAKPOINTS='%1'\n")
+            .arg(breakpointSet).toUtf8();
+        runtimeScript += QStringLiteral("__SSPAD_DEBUG_LINE_OFFSET=%1\n").arg(sourceLineOffset).toUtf8();
+        runtimeScript.append(R"SSPAD(
+__SSPAD_DEBUG_MODE=__SSPAD_DEBUG_MODE_VALUE__
+__SSPAD_DEBUG_TARGET_DEPTH=0
+__SSPAD_DEBUG_SKIP_LINE=0
+set -T
+__sspad_debug() {
+    local __sspad_previous_status=$?
+    if [[ -z ${SSPAD_USER_SCRIPT_START_LINE+x} ]]; then
+        return "$__sspad_previous_status"
+    fi
+    local __sspad_source_line=${BASH_LINENO[0]:-${LINENO}}
+    if ((__sspad_source_line < SSPAD_USER_SCRIPT_START_LINE)); then
+        return "$__sspad_previous_status"
+    fi
+    local __sspad_user_line=$((__sspad_source_line - SSPAD_USER_SCRIPT_START_LINE + 1 + __SSPAD_DEBUG_LINE_OFFSET))
+    local __sspad_depth=${#FUNCNAME[@]}
+    local __sspad_command="${1-}"
+    local __sspad_pause=0
+    if [[ "${SSPAD_CAPTURE_HISTORY-0}" == "1" ]]; then
+        builtin printf 'C%s\t%s\0' "$((__sspad_user_line - __SSPAD_DEBUG_LINE_OFFSET))" "$__sspad_command" >&197
+    fi
+    case "$__SSPAD_DEBUG_MODE" in
+        run)
+            if ((__SSPAD_DEBUG_SKIP_LINE == __sspad_user_line)); then
+                :
+            else
+                __SSPAD_DEBUG_SKIP_LINE=0
+                [[ "$__SSPAD_DEBUG_BREAKPOINTS" == *"|${__sspad_user_line}|"* ]] && __sspad_pause=1
+            fi
+            ;;
+        step)
+            ((__sspad_depth <= __SSPAD_DEBUG_TARGET_DEPTH)) && __sspad_pause=1
+            ;;
+        stepin)
+            __sspad_pause=1
+            ;;
+        stepout)
+            ((__sspad_depth < __SSPAD_DEBUG_TARGET_DEPTH)) && __sspad_pause=1
+            ;;
+    esac
+    ((__sspad_pause)) || return "$__sspad_previous_status"
+
+    local __sspad_encoded_command
+    __sspad_encoded_command="$(builtin printf '%s' "$__sspad_command" | command base64 -w0 2>/dev/null)"
+    builtin printf 'P\t%s\t%s\t%s\n' "$__sspad_user_line" "$__sspad_depth" "$__sspad_encoded_command" >&196
+
+    local __sspad_encoded_variables
+    __sspad_encoded_variables="$(builtin declare -p 2>/dev/null | command base64 -w0 2>/dev/null)"
+    builtin printf 'V\t%s\n' "$__sspad_encoded_variables" >&196
+    builtin printf 'R\n' >&196
+
+    local __sspad_action
+    while IFS= read -r -u 196 __sspad_action; do
+        case "$__sspad_action" in
+            c)
+                __SSPAD_DEBUG_MODE=run
+                __SSPAD_DEBUG_SKIP_LINE=$__sspad_user_line
+                break
+                ;;
+            s)
+                __SSPAD_DEBUG_MODE=step
+                __SSPAD_DEBUG_TARGET_DEPTH=$__sspad_depth
+                break
+                ;;
+            i)
+                __SSPAD_DEBUG_MODE=stepin
+                __SSPAD_DEBUG_TARGET_DEPTH=$__sspad_depth
+                break
+                ;;
+            o)
+                if ((__sspad_depth > 1)); then
+                    __SSPAD_DEBUG_MODE=stepout
+                    __SSPAD_DEBUG_TARGET_DEPTH=$__sspad_depth
+                    break
+                fi
+                ;;
+        esac
+    done
+    return "$__sspad_previous_status"
+}
+trap '__sspad_debug "$BASH_COMMAND"' DEBUG
+)SSPAD");
+        runtimeScript.replace("__SSPAD_DEBUG_MODE_VALUE__", debugStartPaused ? "start" : "run");
+        runtimeScript += captureHistory
+            ? QByteArray("SSPAD_CAPTURE_HISTORY=1\n") : QByteArray("SSPAD_CAPTURE_HISTORY=0\n");
+        runtimeScript.append("SSPAD_USER_SCRIPT_START_LINE=$((LINENO + 1))\n");
+    } else {
+        runtimeScript.append("SSPAD_USER_SCRIPT_START_LINE=$((LINENO + 1))\n");
+    }
     runtimeScript.append(userScript);
     if (!runtimeScript.endsWith('\n'))
         runtimeScript.append('\n');
@@ -1000,11 +1102,14 @@ public:
         connect(&process, &QProcess::readyReadStandardOutput, this, [this]() {
             processOutputAvailable();
         });
+        connect(&process, &QProcess::started, this, [this]() { closeDebuggerChildSocket(); });
         connect(&process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
                 [this](int exitCode, QProcess::ExitStatus exitStatus) {
             processOutputAvailable();
+            readDebuggerSocket();
             readRunHistoryPipe();
             closeRunHistoryPipe();
+            closeDebuggerSocket();
             if (!pendingOutput.isEmpty()) {
                 appendOutput(QString::fromLocal8Bit(pendingOutput));
                 pendingOutput.clear();
@@ -1015,6 +1120,16 @@ public:
             runButton->setEnabled(true);
             stopButton->setEnabled(false);
             directoryEdit->setEnabled(true);
+            scriptEdit->setReadOnly(false);
+            scriptEdit->setDebugLine(0);
+            debuggerEnabled = false;
+            debuggerPaused = false;
+            debuggerVariables.clear();
+            if (completionController)
+                completionController->setRuntimeVariables({});
+            updateDebuggerActions();
+            if (toggleBreakpointAction)
+                toggleBreakpointAction->setEnabled(true);
             closeScriptFileDescriptor();
 
             const QString DURATION = QStringLiteral("%1 s").arg(runElapsed.elapsed() / 1000.0, 0, 'f', 1);
@@ -1042,6 +1157,14 @@ public:
                 directoryEdit->setEnabled(true);
                 closeScriptFileDescriptor();
                 closeRunHistoryPipe();
+                closeDebuggerSocket();
+                debuggerEnabled = false;
+                debuggerPaused = false;
+                scriptEdit->setReadOnly(false);
+                scriptEdit->setDebugLine(0);
+                updateDebuggerActions();
+                if (toggleBreakpointAction)
+                    toggleBreakpointAction->setEnabled(true);
                 runStatusLabel->setText(QStringLiteral("Could not start"));
                 statusBar()->showMessage(QStringLiteral("Could not start script"));
             }
@@ -1078,6 +1201,7 @@ public:
         latestDraftTimer.stop();
         shellCheckProcess.kill();
         closeRunHistoryPipe();
+        closeDebuggerSocket();
         openScratchpadWindows().removeAll(this);
     }
 
@@ -1112,6 +1236,24 @@ protected:
         if (watched == scriptEdit && event->type() == QEvent::KeyPress) {
             auto *keyEvent = static_cast<QKeyEvent *>(event);
             const Qt::KeyboardModifiers MODIFIERS = keyEvent->modifiers();
+            if (keyEvent->key() == Qt::Key_F9 && MODIFIERS == Qt::NoModifier) {
+                if (process.state() == QProcess::NotRunning)
+                    scriptEdit->toggleBreakpoint(scriptEdit->textCursor().blockNumber() + 1);
+                return true;
+            }
+            if (debuggerPaused && keyEvent->key() == Qt::Key_F10 && MODIFIERS == Qt::NoModifier) {
+                sendDebuggerCommand('s');
+                return true;
+            }
+            if (debuggerPaused && keyEvent->key() == Qt::Key_F11) {
+                if (MODIFIERS == Qt::NoModifier)
+                    sendDebuggerCommand('i');
+                else if (MODIFIERS == Qt::ShiftModifier)
+                    sendDebuggerCommand('o');
+                else
+                    return QMainWindow::eventFilter(watched, event);
+                return true;
+            }
             const bool IS_ENTER = keyEvent->key() == Qt::Key_Return || keyEvent->key() == Qt::Key_Enter;
             if (IS_ENTER && (MODIFIERS == Qt::ControlModifier || MODIFIERS == Qt::ShiftModifier)) {
                 QTextCursor cursor = scriptEdit->textCursor();
@@ -1184,6 +1326,11 @@ private:
     QAction *clearOutputEachRunAction = nullptr;
     QAction *guiSudoPromptsAction = nullptr;
     QAction *reuseSudoPasswordAction = nullptr;
+    QAction *debugContinueAction = nullptr;
+    QAction *debugStepOverAction = nullptr;
+    QAction *debugStepInAction = nullptr;
+    QAction *debugStepOutAction = nullptr;
+    QAction *toggleBreakpointAction = nullptr;
     QPushButton *runButton = nullptr;
     QPushButton *stopButton = nullptr;
     QLabel *runStatusLabel = nullptr;
@@ -1215,6 +1362,14 @@ private:
     QPointer<QDialog> runHistoryDialog;
     QListWidget *runHistoryList = nullptr;
     QSocketNotifier *runHistoryNotifier = nullptr;
+    QSocketNotifier *debuggerNotifier = nullptr;
+    int debuggerSocketDescriptor = -1;
+    int debuggerChildSocketDescriptor = -1;
+    QByteArray debuggerSocketBuffer;
+    bool debuggerEnabled = false;
+    bool debuggerPaused = false;
+    int debuggerCurrentDepth = 0;
+    QHash<QString, QString> debuggerVariables;
     QStringList runHistoryEntries;
     QList<int> runHistorySourceLines;
     QByteArray runHistoryBuffer;
@@ -1230,6 +1385,7 @@ private:
     bool shellCheckCurrent = false;
     bool runAfterShellCheck = false;
     bool runSelectionAfterShellCheck = false;
+    bool runForceDebugAfterShellCheck = false;
     bool applyingScriptRunProfile = false;
     int currentHistoryLineOffset = 0;
     QString latestDraftSnapshot;
@@ -1385,6 +1541,29 @@ private:
         runSelectionAction->setEnabled(scriptEdit->textCursor().hasSelection());
         connect(scriptEdit, &QPlainTextEdit::copyAvailable, runSelectionAction, &QAction::setEnabled);
         connect(runSelectionAction, &QAction::triggered, this, [this]() { runScript(true); });
+        scriptMenu->addSeparator();
+        QAction *debugStartAction = scriptMenu->addAction(QStringLiteral("Start Debugging"));
+        connect(debugStartAction, &QAction::triggered, this, [this]() { runScript(false, true); });
+        toggleBreakpointAction = scriptMenu->addAction(QStringLiteral("Toggle Breakpoint"));
+        toggleBreakpointAction->setShortcut(QKeySequence(Qt::Key_F9));
+        connect(toggleBreakpointAction, &QAction::triggered, this, [this]() {
+            if (process.state() != QProcess::NotRunning)
+                return;
+            scriptEdit->toggleBreakpoint(scriptEdit->textCursor().blockNumber() + 1);
+        });
+        debugContinueAction = scriptMenu->addAction(QStringLiteral("Continue Debugging"));
+        debugContinueAction->setShortcut(QKeySequence(Qt::Key_F5));
+        connect(debugContinueAction, &QAction::triggered, this, [this]() { sendDebuggerCommand('c'); });
+        debugStepOverAction = scriptMenu->addAction(QStringLiteral("Step Over"));
+        debugStepOverAction->setShortcut(QKeySequence(Qt::Key_F10));
+        connect(debugStepOverAction, &QAction::triggered, this, [this]() { sendDebuggerCommand('s'); });
+        debugStepInAction = scriptMenu->addAction(QStringLiteral("Step Into"));
+        debugStepInAction->setShortcut(QKeySequence(Qt::Key_F11));
+        connect(debugStepInAction, &QAction::triggered, this, [this]() { sendDebuggerCommand('i'); });
+        debugStepOutAction = scriptMenu->addAction(QStringLiteral("Step Out"));
+        debugStepOutAction->setShortcut(QKeySequence(QStringLiteral("Shift+F11")));
+        connect(debugStepOutAction, &QAction::triggered, this, [this]() { sendDebuggerCommand('o'); });
+        updateDebuggerActions();
         QAction *stopAction = scriptMenu->addAction(QStringLiteral("Stop Script"));
         stopAction->setShortcut(QKeySequence(QStringLiteral("Shift+Alt+Return")));
         connect(stopAction, &QAction::triggered, this, [this]() { stopScript(); });
@@ -1939,7 +2118,7 @@ df -ih
             shellCheckCurrent = true;
             if (runAfterShellCheck) {
                 runAfterShellCheck = false;
-                runScript();
+                runPendingScriptAfterShellCheck();
             }
             return;
         }
@@ -2026,10 +2205,7 @@ df -ih
             statusBar()->showMessage(QStringLiteral("ShellCheck found %1 issue(s)").arg(diagnosticsList->count()), 4000);
         }
         if (runAfterShellCheck) {
-            runAfterShellCheck = false;
-            const bool SELECTION_ONLY = runSelectionAfterShellCheck;
-            runSelectionAfterShellCheck = false;
-            runScript(SELECTION_ONLY);
+            runPendingScriptAfterShellCheck();
         }
     }
 
@@ -2144,7 +2320,7 @@ df -ih
             shellCheckCurrent = true;
             if (runAfterShellCheck) {
                 runAfterShellCheck = false;
-                runScript();
+                runPendingScriptAfterShellCheck();
             }
         });
     }
@@ -2843,6 +3019,140 @@ df -ih
         return true;
     }
 
+    bool prepareDebuggerSocket()
+    {
+        closeDebuggerSocket();
+        int descriptors[2] = {-1, -1};
+        if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, descriptors) != 0)
+            return false;
+        const int FLAGS = ::fcntl(descriptors[0], F_GETFL);
+        if (FLAGS < 0 || ::fcntl(descriptors[0], F_SETFL, FLAGS | O_NONBLOCK) < 0) {
+            ::close(descriptors[0]);
+            ::close(descriptors[1]);
+            return false;
+        }
+        debuggerSocketDescriptor = descriptors[0];
+        debuggerChildSocketDescriptor = descriptors[1];
+        debuggerSocketBuffer.clear();
+        debuggerNotifier = new QSocketNotifier(debuggerSocketDescriptor, QSocketNotifier::Read, this);
+        connect(debuggerNotifier, &QSocketNotifier::activated, this,
+                [this](QSocketDescriptor, QSocketNotifier::Type) { readDebuggerSocket(); });
+        return true;
+    }
+
+    void closeDebuggerChildSocket()
+    {
+        if (debuggerChildSocketDescriptor >= 0) {
+            ::close(debuggerChildSocketDescriptor);
+            debuggerChildSocketDescriptor = -1;
+        }
+    }
+
+    void closeDebuggerSocket()
+    {
+        if (debuggerNotifier) {
+            debuggerNotifier->setEnabled(false);
+            debuggerNotifier->deleteLater();
+            debuggerNotifier = nullptr;
+        }
+        if (debuggerSocketDescriptor >= 0) {
+            ::close(debuggerSocketDescriptor);
+            debuggerSocketDescriptor = -1;
+        }
+        closeDebuggerChildSocket();
+        debuggerSocketBuffer.clear();
+    }
+
+    void sendDebuggerCommand(char command)
+    {
+        if (!debuggerEnabled || !debuggerPaused || debuggerSocketDescriptor < 0)
+            return;
+        const char MESSAGE[2] = {command, '\n'};
+        const ssize_t WRITTEN = ::send(debuggerSocketDescriptor, MESSAGE, sizeof(MESSAGE), MSG_NOSIGNAL);
+        if (WRITTEN != sizeof(MESSAGE)) {
+            statusBar()->showMessage(QStringLiteral("Could not send debugger command"), 3000);
+            return;
+        }
+        debuggerPaused = false;
+        scriptEdit->setDebugLine(0);
+        runStatusLabel->setText(QStringLiteral("Running"));
+        statusBar()->showMessage(QStringLiteral("Running under debugger…"));
+        updateDebuggerActions();
+    }
+
+    void updateDebuggerActions()
+    {
+        const bool PAUSED = debuggerEnabled && debuggerPaused;
+        if (debugContinueAction) debugContinueAction->setEnabled(PAUSED);
+        if (debugStepOverAction) debugStepOverAction->setEnabled(PAUSED);
+        if (debugStepInAction) debugStepInAction->setEnabled(PAUSED);
+        if (debugStepOutAction) debugStepOutAction->setEnabled(PAUSED && debuggerCurrentDepth > 1);
+    }
+
+    void readDebuggerSocket()
+    {
+        if (debuggerSocketDescriptor < 0)
+            return;
+        char buffer[16384];
+        while (true) {
+            const ssize_t READ_SIZE = ::read(debuggerSocketDescriptor, buffer, sizeof(buffer));
+            if (READ_SIZE > 0) {
+                debuggerSocketBuffer.append(buffer, static_cast<qsizetype>(READ_SIZE));
+                continue;
+            }
+            if (READ_SIZE == 0 && debuggerNotifier)
+                debuggerNotifier->setEnabled(false);
+            if (READ_SIZE < 0 && errno == EINTR)
+                continue;
+            break;
+        }
+        while (true) {
+            const qsizetype NEWLINE = debuggerSocketBuffer.indexOf('\n');
+            if (NEWLINE < 0)
+                break;
+            const QByteArray RECORD = debuggerSocketBuffer.left(NEWLINE);
+            debuggerSocketBuffer.remove(0, NEWLINE + 1);
+            const QList<QByteArray> FIELDS = RECORD.split('\t');
+            if (FIELDS.isEmpty())
+                continue;
+            if (FIELDS[0] == "P" && FIELDS.size() >= 4) {
+                debuggerPaused = true;
+                debuggerCurrentDepth = FIELDS[2].toInt();
+                const int LINE = FIELDS[1].toInt();
+                const QString COMMAND = QString::fromUtf8(QByteArray::fromBase64(FIELDS[3]));
+                debuggerVariables.clear();
+                if (completionController)
+                    completionController->setRuntimeVariables({});
+                const QTextBlock currentBlock = scriptEdit->document()->findBlockByNumber(LINE - 1);
+                if (currentBlock.isValid()) {
+                    scriptEdit->revealPosition(currentBlock.position());
+                    scriptEdit->setDebugLine(LINE);
+                    scriptEdit->setTextCursor(QTextCursor(currentBlock));
+                    scriptEdit->centerCursor();
+                }
+                runStatusLabel->setText(QStringLiteral("Paused at line %1").arg(LINE));
+                statusBar()->showMessage(QStringLiteral("Paused at line %1: %2").arg(LINE).arg(COMMAND));
+                updateDebuggerActions();
+            } else if (FIELDS[0] == "V" && FIELDS.size() >= 2) {
+                const QString DECLARATIONS = QString::fromUtf8(QByteArray::fromBase64(FIELDS[1]));
+                static const QRegularExpression DECLARATION_NAME(
+                    QStringLiteral(R"(^declare\s+\S+\s+([^=\s]+))"));
+                for (const QString &declaration : DECLARATIONS.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
+                    const auto MATCH = DECLARATION_NAME.match(declaration);
+                    if (!MATCH.hasMatch())
+                        continue;
+                    const QString NAME = MATCH.captured(1);
+                    if (NAME.startsWith(QStringLiteral("SSPAD_")) || NAME.startsWith(QStringLiteral("__sspad_")))
+                        continue;
+                    debuggerVariables.insert(NAME, declaration);
+                }
+            } else if (FIELDS[0] == "R") {
+                if (completionController)
+                    completionController->setRuntimeVariables(debuggerVariables);
+            }
+        }
+    }
+
     void closeRunHistoryWriteEnd()
     {
         if (runHistoryWriteDescriptor >= 0) {
@@ -2968,7 +3278,17 @@ df -ih
     }
 
 
-    void runScript(bool selectionOnly = false)
+    void runPendingScriptAfterShellCheck()
+    {
+        const bool SELECTION_ONLY = runSelectionAfterShellCheck;
+        const bool FORCE_DEBUG = runForceDebugAfterShellCheck;
+        runAfterShellCheck = false;
+        runSelectionAfterShellCheck = false;
+        runForceDebugAfterShellCheck = false;
+        runScript(SELECTION_ONLY, FORCE_DEBUG);
+    }
+
+    void runScript(bool selectionOnly = false, bool forceDebug = false)
     {
 
         if (process.state() != QProcess::NotRunning)
@@ -2986,6 +3306,7 @@ df -ih
         if (!shellCheckCurrent) {
             runAfterShellCheck = true;
             runSelectionAfterShellCheck = selectionOnly;
+            runForceDebugAfterShellCheck = forceDebug;
             statusBar()->showMessage(QStringLiteral("Checking script with ShellCheck…"));
             if (shellCheckProcess.state() == QProcess::NotRunning)
                 shellCheckTimer.start(0);
@@ -3009,13 +3330,38 @@ df -ih
             sourceText.replace(QChar::ParagraphSeparator, QLatin1Char('\n'));
         }
         const bool CAPTURE_HISTORY = prepareRunHistoryPipe();
+        const QSet<int> BREAKPOINTS = scriptEdit->breakpoints();
+        const bool DEBUGGING_ENABLED = forceDebug || !BREAKPOINTS.isEmpty();
+        if (DEBUGGING_ENABLED && !prepareDebuggerSocket()) {
+            closeRunHistoryPipe();
+            QMessageBox::critical(this, QStringLiteral("Could not start debugger"),
+                                  QStringLiteral("Could not create the local debugger control channel."));
+            return;
+        }
+        debuggerEnabled = DEBUGGING_ENABLED;
+        debuggerPaused = false;
+        debuggerCurrentDepth = 0;
+        debuggerVariables.clear();
+        if (completionController)
+            completionController->setRuntimeVariables({});
+        updateDebuggerActions();
+        scriptEdit->setReadOnly(DEBUGGING_ENABLED);
+        if (toggleBreakpointAction)
+            toggleBreakpointAction->setEnabled(false);
         const QByteArray RUNTIME_SCRIPT = buildRuntimeScript(
             sourceText.toUtf8(), guiSudoPromptsAction->isChecked(),
-            reuseSudoPasswordAction->isChecked(), CAPTURE_HISTORY);
+            reuseSudoPasswordAction->isChecked(), CAPTURE_HISTORY, DEBUGGING_ENABLED,
+            BREAKPOINTS, selectedStartLine - 1, forceDebug);
         currentHistoryLineOffset = selectionOnly ? selectedStartLine - 1 : 0;
         scriptFileDescriptor = createAnonymousScriptFile(RUNTIME_SCRIPT);
         if (scriptFileDescriptor < 0) {
             closeRunHistoryPipe();
+            closeDebuggerSocket();
+            debuggerEnabled = false;
+            scriptEdit->setReadOnly(false);
+            updateDebuggerActions();
+            if (toggleBreakpointAction)
+                toggleBreakpointAction->setEnabled(true);
             QMessageBox::critical(this, QStringLiteral("Could not prepare script"),
                                   QStringLiteral("Could not prepare an in-memory script file:\n%1")
                                       .arg(QString::fromLocal8Bit(std::strerror(errno))));
@@ -3040,8 +3386,11 @@ df -ih
         const int CHILD_SCRIPT_DESCRIPTOR = scriptFileDescriptor;
         const int CHILD_HISTORY_READ_DESCRIPTOR = runHistoryReadDescriptor;
         const int CHILD_HISTORY_WRITE_DESCRIPTOR = runHistoryWriteDescriptor;
+        const int CHILD_DEBUG_DESCRIPTOR = debuggerChildSocketDescriptor;
+        const int PARENT_DEBUG_DESCRIPTOR = debuggerSocketDescriptor;
         process.setChildProcessModifier([CHILD_SCRIPT_DESCRIPTOR, CHILD_HISTORY_READ_DESCRIPTOR,
-                                         CHILD_HISTORY_WRITE_DESCRIPTOR]() {
+                                         CHILD_HISTORY_WRITE_DESCRIPTOR, CHILD_DEBUG_DESCRIPTOR,
+                                         PARENT_DEBUG_DESCRIPTOR]() {
             if (::setsid() < 0)
                 ::_exit(126);
             if (::dup2(CHILD_SCRIPT_DESCRIPTOR, SCRIPT_DESCRIPTOR) < 0)
@@ -3061,6 +3410,18 @@ df -ih
                     ::close(CHILD_HISTORY_READ_DESCRIPTOR);
                 if (CHILD_HISTORY_WRITE_DESCRIPTOR != HISTORY_DESCRIPTOR)
                     ::close(CHILD_HISTORY_WRITE_DESCRIPTOR);
+            }
+            if (CHILD_DEBUG_DESCRIPTOR >= 0) {
+                if (::dup2(CHILD_DEBUG_DESCRIPTOR, DEBUG_DESCRIPTOR) < 0)
+                    ::_exit(126);
+                const int DEBUG_FLAGS = ::fcntl(DEBUG_DESCRIPTOR, F_GETFD);
+                if (DEBUG_FLAGS < 0 ||
+                    ::fcntl(DEBUG_DESCRIPTOR, F_SETFD, DEBUG_FLAGS & ~FD_CLOEXEC) < 0)
+                    ::_exit(126);
+                if (PARENT_DEBUG_DESCRIPTOR >= 0 && PARENT_DEBUG_DESCRIPTOR != DEBUG_DESCRIPTOR)
+                    ::close(PARENT_DEBUG_DESCRIPTOR);
+                if (CHILD_DEBUG_DESCRIPTOR != DEBUG_DESCRIPTOR)
+                    ::close(CHILD_DEBUG_DESCRIPTOR);
             }
         });
 
