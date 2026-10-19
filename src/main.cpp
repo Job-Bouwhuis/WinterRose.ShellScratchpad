@@ -129,6 +129,9 @@ exec 199<&0
 SSPAD_GUI_SUDO="__SSPAD_GUI_SUDO__"
 SSPAD_REUSE_SUDO_PASSWORD="__SSPAD_REUSE_SUDO_PASSWORD__"
 SSPAD_ORIGINAL_STDIN="$(readlink "/proc/${BASHPID}/fd/0" 2>/dev/null || true)"
+if [[ "${SSPAD_BASH_ENV_CHILD-0}" == "1" ]]; then
+    SSPAD_CHILD_SCRIPT_PATH="$(command readlink -f -- "$0" 2>/dev/null || builtin printf '%s' "$0")"
+fi
 
 shell_scratchpad_record_sudo() { :; }
 
@@ -306,12 +309,18 @@ shell_scratchpad_record_sudo() {
 }
 __sspad_trace_command() {
     local previous_status=$?
-    if [[ -z ${SSPAD_USER_SCRIPT_START_LINE+x} ]]; then
+    if [[ -z ${SSPAD_USER_SCRIPT_START_LINE+x} && "${SSPAD_BASH_ENV_CHILD-0}" != "1" ]]; then
+        return 0
+    fi
+    if [[ "${SSPAD_BASH_ENV_CHILD-0}" == "1" && "${BASH_SOURCE[1]-}" == "${SSPAD_RUNTIME_FILE-}" ]]; then
         return 0
     fi
     local traced_command="${1-}"
     local source_line=${BASH_LINENO[0]:-0}
-    local user_line=$((source_line - SSPAD_USER_SCRIPT_START_LINE + 1))
+    local user_line=$source_line
+    if [[ "${SSPAD_BASH_ENV_CHILD-0}" != "1" ]]; then
+        user_line=$((source_line - SSPAD_USER_SCRIPT_START_LINE + 1))
+    fi
     builtin printf 'C%s\t%s\0' "$user_line" "$traced_command" >&197
     return 0
 }
@@ -334,19 +343,31 @@ __SSPAD_DEBUG_SKIP_LINE=0
 set -T
 __sspad_debug() {
     local __sspad_previous_status=$?
-    if [[ -z ${SSPAD_USER_SCRIPT_START_LINE+x} ]]; then
+    if [[ -z ${SSPAD_USER_SCRIPT_START_LINE+x} && "${SSPAD_BASH_ENV_CHILD-0}" != "1" ]]; then
+        return 0
+    fi
+    if [[ "${SSPAD_BASH_ENV_CHILD-0}" == "1" && "${BASH_SOURCE[1]-}" == "${SSPAD_RUNTIME_FILE-}" ]]; then
         return 0
     fi
     local __sspad_source_line=${BASH_LINENO[0]:-${LINENO}}
-    if ((__sspad_source_line < SSPAD_USER_SCRIPT_START_LINE)); then
+    if [[ "${SSPAD_BASH_ENV_CHILD-0}" != "1" ]] && ((__sspad_source_line < SSPAD_USER_SCRIPT_START_LINE)); then
         return 0
     fi
-    local __sspad_user_line=$((__sspad_source_line - SSPAD_USER_SCRIPT_START_LINE + 1 + __SSPAD_DEBUG_LINE_OFFSET))
+    local __sspad_source_file="${SSPAD_CHILD_SCRIPT_PATH-}"
+    local __sspad_user_line
+    if [[ "${SSPAD_BASH_ENV_CHILD-0}" == "1" ]]; then
+        __sspad_user_line=$__sspad_source_line
+    else
+        __sspad_user_line=$((__sspad_source_line - SSPAD_USER_SCRIPT_START_LINE + 1 + __SSPAD_DEBUG_LINE_OFFSET))
+        __sspad_source_file=""
+    fi
     local __sspad_depth=${#FUNCNAME[@]}
     local __sspad_command="${1-}"
     local __sspad_pause=0
     if [[ "${SSPAD_CAPTURE_HISTORY-0}" == "1" ]]; then
-        builtin printf 'C%s\t%s\0' "$((__sspad_user_line - __SSPAD_DEBUG_LINE_OFFSET))" "$__sspad_command" >&197
+        local __sspad_history_line=$__sspad_user_line
+        [[ "${SSPAD_BASH_ENV_CHILD-0}" == "1" ]] || __sspad_history_line=$((__sspad_user_line - __SSPAD_DEBUG_LINE_OFFSET))
+        builtin printf 'C%s\t%s\0' "$__sspad_history_line" "$__sspad_command" >&197
     fi
     case "$__SSPAD_DEBUG_MODE" in
         run)
@@ -379,7 +400,12 @@ __sspad_debug() {
 
     local __sspad_encoded_command
     __sspad_encoded_command="$(builtin printf '%s' "$__sspad_command" | command base64 -w0 2>/dev/null)"
-    builtin printf 'P\t%s\t%s\t%s\n' "$__sspad_user_line" "$__sspad_depth" "$__sspad_encoded_command" >&196
+    local __sspad_encoded_source_file=""
+    if [[ -n "$__sspad_source_file" ]]; then
+        __sspad_encoded_source_file="$(builtin printf '%s' "$__sspad_source_file" | command base64 -w0 2>/dev/null)"
+    fi
+    builtin printf 'P\t%s\t%s\t%s\t%s\n' "$__sspad_user_line" "$__sspad_depth" \
+        "$__sspad_encoded_command" "$__sspad_encoded_source_file" >&196
 
     local __sspad_encoded_variables
     __sspad_encoded_variables="$(builtin declare -p 2>/dev/null | command base64 -w0 2>/dev/null)"
@@ -448,10 +474,20 @@ trap '__sspad_debug "$BASH_COMMAND"' DEBUG
         runtimeScript.replace("__SSPAD_DEBUG_MODE_VALUE__", debugStartPaused ? "start" : "run");
         runtimeScript += captureHistory
             ? QByteArray("SSPAD_CAPTURE_HISTORY=1\n") : QByteArray("SSPAD_CAPTURE_HISTORY=0\n");
-        runtimeScript.append("SSPAD_USER_SCRIPT_START_LINE=$((LINENO + 1))\n");
-    } else {
-        runtimeScript.append("SSPAD_USER_SCRIPT_START_LINE=$((LINENO + 1))\n");
     }
+    runtimeScript.append(R"SSPAD(
+bash() {
+    if (($# > 0)) && [[ "$1" != -* && -f "$1" && -n "${SSPAD_RUNTIME_FILE-}" ]]; then
+        BASH_ENV="$SSPAD_RUNTIME_FILE" SSPAD_BASH_ENV_CHILD=1 command bash "$@"
+    else
+        command bash "$@"
+    fi
+}
+if [[ "${SSPAD_BASH_ENV_CHILD-0}" == "1" ]]; then
+    return 0
+fi
+)SSPAD");
+    runtimeScript.append("SSPAD_USER_SCRIPT_START_LINE=$((LINENO + 1))\n");
     if (userScriptStartLine)
         *userScriptStartLine = runtimeScript.count('\n') + 1;
     runtimeScript.append(userScript);
@@ -917,9 +953,19 @@ public:
         debuggerContinueExitButton = new QPushButton(QStringLiteral("Continue and Exit Debug"), debuggerControls);
         debuggerContinueExitButton->setToolTip(QStringLiteral("Run freely until the next breakpoint, then resume debugging"));
         connect(debuggerContinueButton, &QPushButton::clicked, this,
-                [this]() { sendDebuggerCommand('c'); });
+                [this]() {
+            if (externalDebuggerOwner)
+                externalDebuggerOwner->sendDebuggerCommand('c');
+            else
+                sendDebuggerCommand('c');
+        });
         connect(debuggerContinueExitButton, &QPushButton::clicked, this,
-                [this]() { continueAndExitDebug(); });
+                [this]() {
+            if (externalDebuggerOwner)
+                externalDebuggerOwner->continueAndExitDebug();
+            else
+                continueAndExitDebug();
+        });
         debuggerControlsLayout->addWidget(debuggerContinueButton);
         debuggerControlsLayout->addWidget(debuggerContinueExitButton);
         debuggerControlsLayout->addStretch(1);
@@ -1563,6 +1609,12 @@ public:
             scriptEdit->setDebugLine(0);
             debuggerEnabled = false;
             debuggerPaused = false;
+            if (externalDebuggerWindow) {
+                externalDebuggerWindow->clearNestedDebuggerPause();
+                externalDebuggerWindow.clear();
+            }
+            if (externalDebuggerOwner)
+                clearNestedDebuggerPause();
             debuggerVariables.clear();
             pendingImmediateExpression.clear();
             debuggerBanner->hide();
@@ -1704,6 +1756,76 @@ public:
         scriptEdit->setTextCursor(cursor);
         scriptEdit->centerCursor();
         scriptEdit->setFocus();
+    }
+
+    void navigateToScriptLine(const QString &path, int line)
+    {
+        if (path.isEmpty() || line < 1)
+            return;
+        const QString normalizedPath = normalizedScriptPath(path);
+        ShellScratchpadWindow *target = nullptr;
+        for (ShellScratchpadWindow *window : openScratchpadWindows()) {
+            if (window && !window->currentScriptPath.isEmpty() &&
+                normalizedScriptPath(window->currentScriptPath) == normalizedPath) {
+                target = window;
+                break;
+            }
+        }
+        if (!target) {
+            target = new ShellScratchpadWindow(QFileInfo(normalizedPath).absolutePath(), normalizedPath, false);
+            target->show();
+        }
+        target->showNormal();
+        target->raise();
+        target->activateWindow();
+        if (target != this) {
+            if (externalDebuggerWindow && externalDebuggerWindow != target)
+                externalDebuggerWindow->clearNestedDebuggerPause();
+            externalDebuggerWindow = target;
+            target->externalDebuggerOwner = this;
+        }
+        const QTextBlock block = target->scriptEdit->document()->findBlockByNumber(line - 1);
+        if (!block.isValid())
+            return;
+        if (target != this) {
+            target->showNestedDebuggerPause(line);
+            return;
+        }
+        target->scriptEdit->revealPosition(block.position());
+        target->scriptEdit->setTextCursor(QTextCursor(block));
+        target->scriptEdit->centerCursor();
+        target->scriptEdit->setFocus();
+    }
+
+    void showNestedDebuggerPause(int line)
+    {
+        const QTextBlock block = scriptEdit->document()->findBlockByNumber(line - 1);
+        if (!block.isValid())
+            return;
+        debuggerBanner->setText(QStringLiteral("DEBUG MODE — nested script paused at line %1").arg(line));
+        debuggerBanner->show();
+        debuggerControlsPanel->show();
+        debuggerContinueButton->setEnabled(true);
+        debuggerContinueExitButton->setEnabled(true);
+        scriptEdit->setReadOnly(true);
+        scriptEdit->revealPosition(block.position());
+        scriptEdit->setDebugLine(line);
+        scriptEdit->setTextCursor(QTextCursor(block));
+        scriptEdit->centerCursor();
+        scriptEdit->setFocus();
+    }
+
+    void clearNestedDebuggerPause()
+    {
+        if (!externalDebuggerOwner)
+            return;
+        debuggerBanner->hide();
+        debuggerControlsPanel->hide();
+        debuggerContinueButton->setEnabled(false);
+        debuggerContinueExitButton->setEnabled(false);
+        scriptEdit->setReadOnly(false);
+        scriptEdit->setDebugLine(0);
+        externalDebuggerOwner.clear();
     }
 
     ~ShellScratchpadWindow() override
@@ -1920,6 +2042,8 @@ private:
     QWidget *variablesPanel = nullptr;
     QLabel *debuggerBanner = nullptr;
     QWidget *debuggerControlsPanel = nullptr;
+    QPointer<ShellScratchpadWindow> externalDebuggerOwner;
+    QPointer<ShellScratchpadWindow> externalDebuggerWindow;
     QLineEdit *variablesFilter = nullptr;
     QTreeWidget *variablesTree = nullptr;
     QWidget *immediatePanel = nullptr;
@@ -4647,6 +4771,8 @@ df -ih
             statusBar()->showMessage(QStringLiteral("Could not send debugger command"), 3000);
             return;
         }
+        if (externalDebuggerWindow)
+            externalDebuggerWindow->clearNestedDebuggerPause();
         debuggerPaused = false;
         scriptEdit->setDebugLine(0);
         runStatusLabel->setText(QStringLiteral("Running"));
@@ -4848,23 +4974,35 @@ df -ih
                 debuggerCurrentDepth = FIELDS[2].toInt();
                 const int LINE = FIELDS[1].toInt();
                 const QString COMMAND = QString::fromUtf8(QByteArray::fromBase64(FIELDS[3]));
+                const QString SOURCE_PATH = FIELDS.size() >= 5
+                    ? QString::fromUtf8(QByteArray::fromBase64(FIELDS[4])) : QString();
                 debuggerVariables.clear();
                 refreshDebuggerVariableTree();
                 if (completionController)
                     completionController->setRuntimeVariables({});
                 if (immediateCompletionController)
                     immediateCompletionController->setRuntimeVariables({});
-                const QTextBlock currentBlock = scriptEdit->document()->findBlockByNumber(LINE - 1);
-                if (currentBlock.isValid()) {
-                    scriptEdit->revealPosition(currentBlock.position());
-                    scriptEdit->setDebugLine(LINE);
-                    scriptEdit->setTextCursor(QTextCursor(currentBlock));
-                    scriptEdit->centerCursor();
+                if (!SOURCE_PATH.isEmpty()) {
+                    navigateToScriptLine(SOURCE_PATH, LINE);
+                    statusBar()->showMessage(QStringLiteral("Paused at %1:%2: %3")
+                        .arg(QFileInfo(SOURCE_PATH).fileName()).arg(LINE).arg(COMMAND));
+                } else {
+                    if (externalDebuggerWindow) {
+                        externalDebuggerWindow->clearNestedDebuggerPause();
+                        externalDebuggerWindow.clear();
+                    }
+                    const QTextBlock currentBlock = scriptEdit->document()->findBlockByNumber(LINE - 1);
+                    if (currentBlock.isValid()) {
+                        scriptEdit->revealPosition(currentBlock.position());
+                        scriptEdit->setDebugLine(LINE);
+                        scriptEdit->setTextCursor(QTextCursor(currentBlock));
+                        scriptEdit->centerCursor();
+                    }
+                    statusBar()->showMessage(QStringLiteral("Paused at line %1: %2").arg(LINE).arg(COMMAND));
                 }
                 runStatusLabel->setText(QStringLiteral("Paused at line %1").arg(LINE));
                 debuggerBanner->setText(QStringLiteral("BREAK MODE — paused before line %1").arg(LINE));
                 debuggerBanner->setStyleSheet(QStringLiteral("QLabel { background: #a52a2a; color: white; font-weight: bold; padding: 6px; border-radius: 3px; }"));
-                statusBar()->showMessage(QStringLiteral("Paused at line %1: %2").arg(LINE).arg(COMMAND));
                 updateDebuggerActions();
             } else if (FIELDS[0] == "V" && FIELDS.size() >= 2) {
                 const QString DECLARATIONS = QString::fromUtf8(QByteArray::fromBase64(FIELDS[1]));
@@ -5169,6 +5307,7 @@ df -ih
         for (auto it = OVERRIDES.begin(); it != OVERRIDES.end(); ++it)
             runEnvironment.insert(it.key(), it.value().toString());
         runEnvironment.insert(QStringLiteral("PWD"), DIRECTORY_INFO.absoluteFilePath());
+        runEnvironment.insert(QStringLiteral("SSPAD_RUNTIME_FILE"), runtimeScriptPath);
         process.setProcessEnvironment(runEnvironment);
         process.setProgram(QStringLiteral("/bin/bash"));
         process.setArguments({QStringLiteral("--noprofile"), QStringLiteral("--norc"),
