@@ -40,11 +40,11 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
-The script installs supported system build prerequisites, builds the app, installs it into `~/.local`, and refreshes the KDE application cache when available. It supports Fedora, Debian/Ubuntu and derivatives, openSUSE, and Arch-based distributions. It also installs the Dolphin/KIO service menu under `~/.local/share/kio/servicemenus/`.
+The script installs supported system build prerequisites, including Qt 6.12 or newer, builds the app, installs it into `~/.local`, and refreshes the KDE application cache when available. It supports Fedora, Debian/Ubuntu and derivatives, openSUSE, and Arch-based distributions. On SteamOS, it uses a Fedora Distrobox container for build dependencies and keeps the app and launcher in your home directory, so it does not need to make the host filesystem writable. SteamOS must have `distrobox` and its container engine (`podman` or `docker`) available. It also installs the Dolphin/KIO service menu under `~/.local/share/kio/servicemenus/`.
 
 ## Manual build
 
-Install a C++ compiler, CMake, and Qt 6.6 or newer Widgets development files from your distribution's package manager. Qt 6.6 is required for the child-process setup used to execute scripts from an inherited in-memory file descriptor. Then run:
+Install a C++ compiler, CMake, and Qt 6.12 or newer Core and Widgets development files from your distribution's package manager. Then run:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release

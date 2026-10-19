@@ -6,6 +6,7 @@
 
 #include <QDir>
 #include <QFileInfo>
+#include <QGuiApplication>
 #include <QKeyEvent>
 #include <QListWidget>
 #include <QMouseEvent>
@@ -15,6 +16,7 @@
 #include <QProcess>
 #include <QStandardPaths>
 #include <QRegularExpression>
+#include <QScreen>
 #include <QSet>
 #include <QHash>
 #include <QTextBlock>
@@ -212,12 +214,14 @@ bool insideSingleQuotedString(const QString &source, qsizetype end)
 CompletionController::CompletionController(QPlainTextEdit *targetEditor, QObject *parent)
     : QObject(parent), editor(targetEditor)
 {
+    workingDirectory = QDir::currentPath();
     popup = new QListWidget(editor);
     popup->setWindowFlags(Qt::ToolTip | Qt::FramelessWindowHint);
     popup->setFocusPolicy(Qt::NoFocus);
     popup->setMouseTracking(true);
     popup->setMaximumHeight(240);
     popup->setMinimumWidth(340);
+    popup->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     popup->hide();
     popup->setStyleSheet(QStringLiteral("QListWidget { background: #25282d; color: #e5e7eb; border: 1px solid #697586; } QListWidget::item:selected { background: #46566b; }"));
     popup->setStyleSheet(QStringLiteral("QListWidget { background: #25282d; color: #e5e7eb; border: 1px solid #697586; } QListWidget::item:selected { background: #46566b; } QToolTip { background: #25282d; color: #e5e7eb; border: 1px solid #697586; padding: 6px; }"));
@@ -265,6 +269,12 @@ CompletionController::CompletionController(QPlainTextEdit *targetEditor, QObject
     connect(&hoverDescriptionTimer, &QTimer::timeout, this, [this]() { showHoverDescription(); });
     refreshCommandCache();
     refreshSnippets();
+}
+
+void CompletionController::setWorkingDirectory(const QString &path)
+{
+    workingDirectory = path.isEmpty() ? QDir::currentPath() : QDir::cleanPath(path);
+    updateSuggestions();
 }
 
 bool CompletionController::eventFilter(QObject *watched, QEvent *event)
@@ -519,8 +529,31 @@ void CompletionController::setProfileEnvironmentVariables(const QStringList &nam
 void CompletionController::setRuntimeVariables(const QHash<QString, QString> &variables)
 {
     runtimeVariables = variables;
+    if (editor && editor->hasFocus())
+        updateSuggestions();
     if (hoverTokenStart >= 0)
         updateHoverTarget(hoverPosition);
+}
+
+void CompletionController::setSourcedScriptSymbols(const QVector<ScriptSymbol> &symbols)
+{
+    sourcedScriptSymbols = symbols;
+    if (editor)
+        refreshScriptSymbols(editor->toPlainText());
+}
+
+void CompletionController::setAdditionalScriptSymbols(const QVector<ScriptSymbol> &symbols)
+{
+    additionalScriptSymbols = symbols;
+    if (editor) {
+        refreshScriptSymbols(editor->toPlainText());
+        updateSuggestions();
+    }
+}
+
+bool CompletionController::hasVisibleSuggestions() const
+{
+    return popup && popup->isVisible();
 }
 
 void CompletionController::startNextDescriptionLookupBatch()
@@ -716,12 +749,29 @@ void CompletionController::refreshScriptSymbols(const QString &source)
         if (latestValue)
             symbol.value = latestValue->value;
     }
+
+    for (const ScriptSymbol &externalSymbol : sourcedScriptSymbols) {
+        const bool alreadyKnown = std::any_of(knownScriptSymbols.cbegin(), knownScriptSymbols.cend(),
+            [&externalSymbol](const ScriptSymbol &symbol) { return symbol.name == externalSymbol.name; });
+        if (!alreadyKnown)
+            knownScriptSymbols.append(externalSymbol);
+    }
+    for (const ScriptSymbol &additionalSymbol : additionalScriptSymbols) {
+        const bool alreadyKnown = std::any_of(knownScriptSymbols.cbegin(), knownScriptSymbols.cend(),
+            [&additionalSymbol](const ScriptSymbol &symbol) { return symbol.name == additionalSymbol.name; });
+        if (!alreadyKnown)
+            knownScriptSymbols.append(additionalSymbol);
+    }
 }
 
 void CompletionController::updateSuggestions()
 {
     if (!editor)
         return;
+    if (!editor->hasFocus()) {
+        popup->hide();
+        return;
+    }
     const QString SOURCE = editor->toPlainText();
     refreshScriptSymbols(SOURCE);
     const QTextCursor CURSOR = editor->textCursor();
@@ -751,9 +801,8 @@ void CompletionController::updateSuggestions()
             break;
         }
     }
-    if ((CONTEXT_TOKEN && (CONTEXT_TOKEN->kind == Syntax::TokenKind::Comment ||
-                           CONTEXT_TOKEN->kind == Syntax::TokenKind::HereDocContent)) ||
-        insideSingleQuotedString(SOURCE, POSITION)) {
+    if (CONTEXT_TOKEN && (CONTEXT_TOKEN->kind == Syntax::TokenKind::Comment ||
+                          CONTEXT_TOKEN->kind == Syntax::TokenKind::HereDocContent)) {
         popup->hide();
         QToolTip::hideText();
         return;
@@ -781,12 +830,6 @@ void CompletionController::updateSuggestions()
     const bool SPECIAL_VARIABLE = POSITION >= 2 && SOURCE.at(POSITION - 2) == QLatin1Char('$') &&
         QStringLiteral("?#@*!$0123456789").contains(SOURCE.at(POSITION - 1));
     const bool VARIABLE_POSITION = BRACED_VARIABLE || SIMPLE_VARIABLE || SPECIAL_VARIABLE;
-    if (CONTEXT_TOKEN && (CONTEXT_TOKEN->kind == Syntax::TokenKind::StringContent ||
-                          CONTEXT_TOKEN->kind == Syntax::TokenKind::StringDelimiter) && !VARIABLE_POSITION) {
-        popup->hide();
-        QToolTip::hideText();
-        return;
-    }
     QString PREFIX = SOURCE.mid(wordStart, POSITION - wordStart);
     if (SPECIAL_VARIABLE)
         PREFIX = SOURCE.mid(POSITION - 1, 1);
@@ -815,6 +858,18 @@ void CompletionController::updateSuggestions()
         if (MATCH.hasMatch())
             currentCommand = MATCH.captured(1);
     }
+    const QString NORMALIZED_COMMAND = currentCommand.section(QLatin1Char('/'), -1).toLower();
+    const bool SOURCE_PATH_POSITION = !commandPosition &&
+        (NORMALIZED_COMMAND == QLatin1String("source") || NORMALIZED_COMMAND == QLatin1String("."));
+    const bool IN_STRING = CONTEXT_TOKEN &&
+        (CONTEXT_TOKEN->kind == Syntax::TokenKind::StringContent ||
+         CONTEXT_TOKEN->kind == Syntax::TokenKind::StringDelimiter);
+    if (!VARIABLE_POSITION && !SOURCE_PATH_POSITION &&
+        (IN_STRING || insideSingleQuotedString(SOURCE, POSITION))) {
+        popup->hide();
+        QToolTip::hideText();
+        return;
+    }
 
     currentSuggestions.clear();
     auto append = [this](const QString &text, const QString &description, const QString &category) {
@@ -833,6 +888,8 @@ void CompletionController::updateSuggestions()
         const QProcessEnvironment ENVIRONMENT = QProcessEnvironment::systemEnvironment();
         for (const QString &name : ENVIRONMENT.keys())
             addVariable(name, QStringLiteral("Inherited environment variable."));
+        for (auto it = runtimeVariables.cbegin(); it != runtimeVariables.cend(); ++it)
+            addVariable(it.key(), QStringLiteral("Variable captured from the paused Bash process.\n%1").arg(it.value()));
         for (const QString &name : profileEnvironmentVariables)
             addVariable(name, QStringLiteral("Active execution profile override."));
         for (const ScriptSymbol &symbol : knownScriptSymbols) {
@@ -893,7 +950,6 @@ void CompletionController::updateSuggestions()
             if (!BUILTINS.contains(word))
                 append(word, commandDescription(word), QStringLiteral("Command"));
     } else {
-        const QString NORMALIZED_COMMAND = currentCommand.section(QLatin1Char('/'), -1).toLower();
         const QStringList OPTIONS = argumentCatalog().value(NORMALIZED_COMMAND);
         for (const QString &option : OPTIONS)
             append(option, optionDescription(NORMALIZED_COMMAND, option), QStringLiteral("Argument"));
@@ -901,6 +957,42 @@ void CompletionController::updateSuggestions()
             currentSuggestions.append(Suggestion{snippet.name, snippet.description,
                                                  QStringLiteral("Snippet"), snippet.code, snippet.highlightPoints,
                                                  snippet.autoChangeSections});
+        if (SOURCE_PATH_POSITION && !VARIABLE_POSITION) {
+            QString pathPrefix = PREFIX;
+            QString relativeDirectory;
+            const qsizetype slash = pathPrefix.lastIndexOf(QLatin1Char('/'));
+            if (slash >= 0) {
+                relativeDirectory = pathPrefix.left(slash + 1);
+                pathPrefix = pathPrefix.mid(slash + 1);
+            }
+            QString lookupDirectory;
+            if (relativeDirectory.startsWith(QLatin1Char('/'))) {
+                lookupDirectory = relativeDirectory;
+            } else if (relativeDirectory.startsWith(QStringLiteral("~/"))) {
+                lookupDirectory = QDir::home().filePath(relativeDirectory.mid(2));
+            } else if (relativeDirectory == QStringLiteral("~")) {
+                lookupDirectory = QDir::homePath();
+            } else {
+                lookupDirectory = QDir(workingDirectory).filePath(relativeDirectory);
+            }
+            const QFileInfo directoryInfo(lookupDirectory);
+            if (directoryInfo.exists() && directoryInfo.isDir()) {
+                const QFileInfoList entries = QDir(lookupDirectory).entryInfoList(
+                    QDir::Dirs | QDir::Files | QDir::NoDotAndDotDot, QDir::Name | QDir::DirsFirst);
+                for (const QFileInfo &entry : entries) {
+                    const bool isDirectory = entry.isDir();
+                    if (!isDirectory && !entry.fileName().endsWith(QStringLiteral(".sh"), Qt::CaseInsensitive))
+                        continue;
+                    if (!entry.fileName().startsWith(pathPrefix, Qt::CaseInsensitive))
+                        continue;
+                    const QString suggestion = relativeDirectory + entry.fileName() +
+                        (isDirectory ? QStringLiteral("/") : QString());
+                    append(suggestion, isDirectory ? QStringLiteral("Directory; continue the path.")
+                                                   : QStringLiteral("Shell script file."),
+                           isDirectory ? QStringLiteral("Directory") : QStringLiteral("Shell script"));
+                }
+            }
+        }
     }
 
     struct RankedSuggestion { Suggestion suggestion; int tier; int score; };
@@ -949,7 +1041,7 @@ void CompletionController::updateSuggestions()
         auto *item = new QListWidgetItem(QStringLiteral("%1    %2").arg(suggestion.text, suggestion.category), popup);
         item->setData(Qt::UserRole, index);
     }
-    if ((PREFIX.isEmpty() && !VARIABLE_POSITION) || popup->count() == 0) {
+    if ((PREFIX.isEmpty() && !VARIABLE_POSITION && !SOURCE_PATH_POSITION) || popup->count() == 0) {
         selectedDescriptionTimer.stop();
         popup->hide();
         QToolTip::hideText();
@@ -966,8 +1058,30 @@ void CompletionController::updateSuggestions()
 void CompletionController::positionPopup()
 {
     const QRect CURSOR_RECT = editor->cursorRect();
-    const QPoint BELOW = editor->viewport()->mapToGlobal(CURSOR_RECT.bottomLeft() + QPoint(0, 3));
-    popup->move(BELOW);
+    QPoint below = editor->viewport()->mapToGlobal(CURSOR_RECT.bottomLeft() + QPoint(0, 3));
+    QScreen *screen = QGuiApplication::screenAt(below);
+    if (!screen)
+        screen = QGuiApplication::primaryScreen();
+    constexpr int minimumWidth = 340;
+    if (screen) {
+        const QRect screenGeometry = screen->geometry();
+        int availableWidth = qMax(1, screenGeometry.right() - below.x() + 1);
+        if (availableWidth < minimumWidth && screenGeometry.width() >= minimumWidth) {
+            below.setX(screenGeometry.right() - minimumWidth + 1);
+            availableWidth = qMax(1, screenGeometry.right() - below.x() + 1);
+        }
+        const int desiredWidth = qMax(minimumWidth, popup->sizeHintForColumn(0) + 2 * popup->frameWidth() + 12);
+        const int width = qMax(1, qMin(desiredWidth, availableWidth));
+        popup->setMinimumWidth(qMin(minimumWidth, availableWidth));
+        popup->setMaximumWidth(availableWidth);
+        popup->resize(width, popup->height());
+    } else {
+        popup->setMinimumWidth(minimumWidth);
+        popup->setMaximumWidth(QWIDGETSIZE_MAX);
+        popup->resize(qMax(minimumWidth, popup->sizeHintForColumn(0) + 2 * popup->frameWidth() + 12),
+                      popup->height());
+    }
+    popup->move(below);
 }
 
 void CompletionController::acceptCurrentSuggestion()

@@ -27,13 +27,19 @@ public:
         int declarationColumn = 1;
         bool readOnly = false;
         QString value;
+        QString sourcePath;
+        int sourceLine = 0;
     };
 
     explicit CompletionController(QPlainTextEdit *targetEditor, QObject *parent = nullptr);
     void refreshCommandCache();
     void refreshSnippets();
+    void setWorkingDirectory(const QString &path);
     void setProfileEnvironmentVariables(const QStringList &names);
     void setRuntimeVariables(const QHash<QString, QString> &variables);
+    void setSourcedScriptSymbols(const QVector<ScriptSymbol> &symbols);
+    void setAdditionalScriptSymbols(const QVector<ScriptSymbol> &symbols);
+    bool hasVisibleSuggestions() const;
     const QVector<ScriptSymbol> &scriptSymbols() const { return knownScriptSymbols; }
 
 protected:
@@ -54,6 +60,7 @@ private:
     QListWidget *popup = nullptr;
     QProcess *descriptionLookupProcess = nullptr;
     QStringList systemCommands;
+    QString workingDirectory;
     QStringList profileEnvironmentVariables;
     QHash<QString, QString> runtimeVariables;
     QVector<Snippets::Snippet> snippets;
@@ -65,6 +72,8 @@ private:
     qsizetype descriptionLookupOffset = 0;
     QVector<Suggestion> currentSuggestions;
     QVector<ScriptSymbol> knownScriptSymbols;
+    QVector<ScriptSymbol> sourcedScriptSymbols;
+    QVector<ScriptSymbol> additionalScriptSymbols;
     qsizetype replacementStart = 0;
     qsizetype replacementEnd = 0;
     QString currentCommand;

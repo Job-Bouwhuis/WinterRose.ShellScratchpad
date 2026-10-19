@@ -15,11 +15,14 @@
 #include <QDir>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QDesktopServices>
 #include <QDockWidget>
 #include <QEvent>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFileIconProvider>
+#include <QDirIterator>
 #include <QFormLayout>
 #include <QFontDatabase>
 #include <QHash>
@@ -34,6 +37,10 @@
 #include <QList>
 #include <QListWidget>
 #include <QTreeWidget>
+#include <QUrl>
+#include <QTabWidget>
+#include <QTabBar>
+#include <QToolBar>
 #include <QLineEdit>
 #include <QElapsedTimer>
 #include <QMetaObject>
@@ -74,6 +81,7 @@
 #include <QRunnable>
 #include <QVBoxLayout>
 #include <QWidget>
+#include <QWidgetAction>
 
 #include <functional>
 #include <atomic>
@@ -111,7 +119,8 @@ constexpr char INPUT_MARKER_END = '\x1f';
 QByteArray buildRuntimeScript(const QByteArray &userScript, bool handleSudoWithDialog,
                               bool reuseSudoPassword, bool captureHistory,
                               bool debuggingEnabled, const QSet<int> &breakpoints,
-                              int sourceLineOffset, bool debugStartPaused)
+                              int sourceLineOffset, bool debugStartPaused,
+                              int *userScriptStartLine)
 {
     static const QByteArray RUNTIME_PRELUDE = R"SSPAD(
 # Keep a separate duplicate of the app's input stream for prompts and sudo.
@@ -429,6 +438,8 @@ trap '__sspad_debug "$BASH_COMMAND"' DEBUG
     } else {
         runtimeScript.append("SSPAD_USER_SCRIPT_START_LINE=$((LINENO + 1))\n");
     }
+    if (userScriptStartLine)
+        *userScriptStartLine = runtimeScript.count('\n') + 1;
     runtimeScript.append(userScript);
     if (!runtimeScript.endsWith('\n'))
         runtimeScript.append('\n');
@@ -477,6 +488,121 @@ QList<ShellScratchpadWindow *> &openScratchpadWindows()
 {
     static QList<ShellScratchpadWindow *> windows;
     return windows;
+}
+
+QString normalizedScriptPath(const QString &path)
+{
+    const QFileInfo info(path);
+    const QString canonical = info.canonicalFilePath();
+    return canonical.isEmpty() ? QDir::cleanPath(info.absoluteFilePath()) : canonical;
+}
+
+QVector<ShellScratchpad::Completion::CompletionController::ScriptSymbol>
+findSourcedScriptSymbols(const QString &entryPath, const QString &entryContent, const QString &baseDirectory)
+{
+    using ScriptSymbol = ShellScratchpad::Completion::CompletionController::ScriptSymbol;
+    QHash<QString, ScriptSymbol> symbolsByName;
+    QSet<QString> visited;
+    const QRegularExpression SOURCE_DIRECTIVE(
+        QStringLiteral(R"REGEX(^\s*(?:source|\.)\s+(?:'([^']+)'|"([^"]+)"|([^;\s]+)))REGEX"));
+    const QRegularExpression ASSIGNMENT(
+        QStringLiteral(R"(^\s*(?:(?:export|readonly|local)\s+|declare\s+(?:-[A-Za-z]+\s+)?|typeset\s+(?:-[A-Za-z]+\s+)?)*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$)"));
+    const QRegularExpression FUNCTION(
+        QStringLiteral(R"(^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\))?\s*\{)"));
+
+    std::function<void(const QString &, int, const QString &, bool)> scanFile =
+        [&](const QString &requestedPath, int depth, const QString &suppliedContent, bool hasSuppliedContent) {
+        if (depth > 16)
+            return;
+        const QString path = normalizedScriptPath(requestedPath);
+        if (visited.contains(path))
+            return;
+        visited.insert(path);
+        QHash<QString, QString> staticValues;
+        QString content = suppliedContent;
+        if (!hasSuppliedContent) {
+            QFile file(path);
+            if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
+                return;
+            content = QString::fromUtf8(file.readAll());
+        }
+        const QStringList lines = content.split(QLatin1Char('\n'));
+        for (int lineIndex = 0; lineIndex < lines.size(); ++lineIndex) {
+            const QString line = lines.at(lineIndex);
+            const auto sourceMatch = SOURCE_DIRECTIVE.match(line);
+            if (sourceMatch.hasMatch()) {
+                QString included = sourceMatch.captured(1);
+                if (included.isEmpty()) included = sourceMatch.captured(2);
+                if (included.isEmpty()) included = sourceMatch.captured(3);
+                included.replace(QStringLiteral("${BASH_SOURCE%/*}"), QFileInfo(path).absolutePath());
+                included.replace(QStringLiteral("${BASH_SOURCE[0]}"), path);
+                included.replace(QStringLiteral("${BASH_SOURCE}"), path);
+                static const QRegularExpression SIMPLE_VARIABLE(QStringLiteral(R"(\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?)"));
+                auto variableMatch = SIMPLE_VARIABLE.globalMatch(included);
+                QString expanded;
+                qsizetype consumed = 0;
+                while (variableMatch.hasNext()) {
+                    const auto match = variableMatch.next();
+                    expanded += included.mid(consumed, match.capturedStart() - consumed);
+                    expanded += staticValues.value(match.captured(1), match.captured());
+                    consumed = match.capturedEnd();
+                }
+                expanded += included.mid(consumed);
+                included = expanded;
+                included = QDir::cleanPath(included);
+                if (!included.isEmpty() && !included.contains(QLatin1Char('$')) &&
+                    !included.contains(QStringLiteral("$("))) {
+                    const QFileInfo relativeToWorkingDirectory(QDir(baseDirectory).filePath(included));
+                    const QString resolved = relativeToWorkingDirectory.absoluteFilePath();
+                    if (QFileInfo::exists(resolved))
+                        scanFile(resolved, depth + 1, QString(), false);
+                }
+            }
+
+            auto addSymbol = [&](const QRegularExpression &expression, bool function) {
+                const auto match = expression.match(line);
+                if (!match.hasMatch())
+                    return;
+                const QString name = match.captured(1);
+                if (symbolsByName.contains(name))
+                    return;
+                ScriptSymbol symbol;
+                symbol.name = name;
+                symbol.kind = function ? ScriptSymbol::Kind::Function : ScriptSymbol::Kind::Variable;
+                symbol.sourcePath = path;
+                symbol.sourceLine = lineIndex + 1;
+                symbol.readOnly = line.trimmed().startsWith(QStringLiteral("readonly "));
+                symbolsByName.insert(name, symbol);
+            };
+            const auto assignmentMatch = ASSIGNMENT.match(line);
+            if (assignmentMatch.hasMatch()) {
+                QString value = assignmentMatch.captured(2).trimmed();
+                if (value.size() >= 2 && ((value.startsWith(QLatin1Char('"')) && value.endsWith(QLatin1Char('"'))) ||
+                    (value.startsWith(QLatin1Char('\'')) && value.endsWith(QLatin1Char('\'')))))
+                    value = value.mid(1, value.size() - 2);
+                if (value.contains(QStringLiteral("dirname")) && value.contains(QStringLiteral("BASH_SOURCE")))
+                    value = QFileInfo(path).absolutePath();
+                value.replace(QStringLiteral("${BASH_SOURCE%/*}"), QFileInfo(path).absolutePath());
+                value.replace(QStringLiteral("${BASH_SOURCE[0]}"), path);
+                value.replace(QStringLiteral("${BASH_SOURCE}"), path);
+                staticValues.insert(assignmentMatch.captured(1), value);
+                addSymbol(ASSIGNMENT, false);
+            }
+            addSymbol(FUNCTION, true);
+        }
+    };
+
+    if (!entryPath.isEmpty()) {
+        scanFile(entryPath, 0, QString(), false);
+    } else if (!entryContent.isEmpty()) {
+        const QString syntheticPath = QDir(baseDirectory).filePath(QStringLiteral(".shellscratchpad-unsaved.sh"));
+        scanFile(syntheticPath, 0, entryContent, true);
+    }
+    QVector<ScriptSymbol> symbols;
+    symbols.reserve(symbolsByName.size());
+    for (auto it = symbolsByName.cbegin(); it != symbolsByName.cend(); ++it)
+        symbols.append(it.value());
+    return symbols;
 }
 
 class KeyChordDispatcher final : public QObject
@@ -618,27 +744,31 @@ public:
         setWindowIcon(QIcon::fromTheme(QStringLiteral("shell-scratchpad")));
         resize(980, 760);
         setMinimumSize(640, 480);
+        setDockOptions(QMainWindow::AllowTabbedDocks | QMainWindow::AllowNestedDocks |
+                       QMainWindow::AnimatedDocks);
         openScratchpadWindows().append(this);
 
-        auto *central = new QWidget(this);
-        auto *pageLayout = new QVBoxLayout(central);
-        pageLayout->setContentsMargins(18, 16, 18, 14);
-        pageLayout->setSpacing(10);
-
+        executionControlsWidget = new QWidget(this);
+        auto *executionControlsLayout = new QVBoxLayout(executionControlsWidget);
+        executionControlsLayout->setContentsMargins(6, 6, 6, 6);
+        executionControlsLayout->setSpacing(8);
         auto *directoryRow = new QHBoxLayout();
         directoryRow->setSpacing(8);
-        auto *directoryLabel = new QLabel(QStringLiteral("Working directory"), central);
+        auto *directoryLabel = new QLabel(QStringLiteral("Working directory"), executionControlsWidget);
         directoryEdit = new QLineEdit(
-            initialWorkingDirectory.isEmpty() ? QDir::homePath() : initialWorkingDirectory, central);
+            initialWorkingDirectory.isEmpty() ? QDir::homePath() : initialWorkingDirectory, executionControlsWidget);
         directoryEdit->setClearButtonEnabled(true);
+        directoryEdit->setStyleSheet(QStringLiteral(
+            "QLineEdit { color: #f1f3f5; background-color: #25282d; "
+            "selection-color: #ffffff; selection-background-color: #3d6387; }"));
         defaultWorkingDirectory = directoryEdit->text();
         directoryEdit->setPlaceholderText(QStringLiteral("Directory used by the script, e.g. ~/Projects"));
-        runProfileCombo = new QComboBox(central);
+        runProfileCombo = new QComboBox(executionControlsWidget);
         runProfileCombo->setMinimumWidth(140);
         runProfileCombo->setToolTip(QStringLiteral("Select a saved working-directory and environment profile"));
-        auto *manageProfilesButton = new QPushButton(QStringLiteral("Profiles…"), central);
+        auto *manageProfilesButton = new QPushButton(QStringLiteral("Profiles…"), executionControlsWidget);
         connect(manageProfilesButton, &QPushButton::clicked, this, [this]() { manageRunProfiles(); });
-        auto *browseButton = new QPushButton(QStringLiteral("Browse…"), central);
+        auto *browseButton = new QPushButton(QStringLiteral("Browse…"), executionControlsWidget);
         connect(browseButton, &QPushButton::clicked, this, [this]() {
             const QString SELECTED_DIRECTORY = QFileDialog::getExistingDirectory(
                 this, QStringLiteral("Choose working directory"), expandedWorkingDirectory());
@@ -648,9 +778,12 @@ public:
         directoryRow->addWidget(directoryLabel);
         directoryRow->addWidget(directoryEdit, 1);
         directoryRow->addWidget(browseButton);
-        directoryRow->addWidget(runProfileCombo);
-        directoryRow->addWidget(manageProfilesButton);
-        pageLayout->addLayout(directoryRow);
+        auto *profileRow = new QHBoxLayout();
+        profileRow->addWidget(new QLabel(QStringLiteral("Execution profile"), executionControlsWidget));
+        profileRow->addWidget(runProfileCombo, 1);
+        profileRow->addWidget(manageProfilesButton);
+        executionControlsLayout->addLayout(directoryRow);
+        executionControlsLayout->addLayout(profileRow);
         loadRunProfiles();
         connect(runProfileCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int index) {
             if (index == 0) {
@@ -679,17 +812,10 @@ public:
             refreshCompletionProfileVariables();
         });
 
-        splitter = new QSplitter(Qt::Vertical, central);
-        splitter->setChildrenCollapsible(false);
-        splitter->setHandleWidth(7);
-
-        scriptSideSplitter = new QSplitter(Qt::Horizontal, splitter);
-        scriptSideSplitter->setChildrenCollapsible(false);
-        auto *scriptPanel = new QWidget(scriptSideSplitter);
+        auto *scriptPanel = new QWidget(this);
         auto *scriptLayout = new QVBoxLayout(scriptPanel);
         scriptLayout->setContentsMargins(0, 0, 0, 0);
         scriptLayout->setSpacing(6);
-        auto *scriptHeading = new QLabel(QStringLiteral("Bash script"), scriptPanel);
         debuggerBanner = new QLabel(scriptPanel);
         debuggerBanner->setVisible(false);
         debuggerBanner->setStyleSheet(QStringLiteral("QLabel { background: #8f2525; color: white; font-weight: bold; padding: 6px; border-radius: 3px; }"));
@@ -706,6 +832,13 @@ public:
         scriptEdit->document()->setModified(false);
         new ShellScratchpad::Syntax::SyntaxHighlighter(scriptEdit);
         completionController = new ShellScratchpad::Completion::CompletionController(scriptEdit, scriptEdit);
+        completionController->setWorkingDirectory(expandedWorkingDirectory());
+        connect(directoryEdit, &QLineEdit::textChanged, this, [this]() {
+            if (completionController)
+                completionController->setWorkingDirectory(expandedWorkingDirectory());
+            if (immediateCompletionController)
+                immediateCompletionController->setWorkingDirectory(expandedWorkingDirectory());
+        });
         connect(scriptEdit, &QPlainTextEdit::textChanged, this, [this]() { refreshNavigationSymbols(); });
         connect(scriptEdit, &ShellScratchpad::CodeEditor::symbolNavigationRequested, this,
                 [this](const QString &name) {
@@ -719,6 +852,10 @@ public:
                 [&name](const auto &candidate) { return candidate.name == name; });
             if (symbol == symbols.cend())
                 return;
+            if (!symbol->sourcePath.isEmpty()) {
+                navigateToSourcedIdentifier(symbol->sourcePath, name, symbol->sourceLine);
+                return;
+            }
             scriptEdit->revealPosition(symbol->declarationOffset);
             QTextCursor declaration(scriptEdit->document());
             declaration.setPosition(static_cast<int>(symbol->declarationOffset));
@@ -728,7 +865,6 @@ public:
             scriptEdit->setFocus();
         });
         refreshCompletionProfileVariables();
-        scriptLayout->addWidget(scriptHeading);
         scriptLayout->addWidget(debuggerBanner);
         scriptSearchRow = new QWidget(scriptPanel);
         auto *scriptSearchLayout = new QHBoxLayout(scriptSearchRow);
@@ -780,7 +916,7 @@ public:
         scriptFindEdit->installEventFilter(this);
         scriptLayout->addWidget(scriptEdit, 1);
 
-        variablesPanel = new QWidget(scriptSideSplitter);
+        variablesPanel = new QWidget(this);
         auto *variablesLayout = new QVBoxLayout(variablesPanel);
         variablesLayout->setContentsMargins(5, 0, 0, 0);
         auto *variablesHeading = new QLabel(QStringLiteral("Paused Bash variables"), variablesPanel);
@@ -800,15 +936,85 @@ public:
         variablesLayout->addWidget(variablesTree, 1);
         variablesPanel->hide();
         connect(variablesFilter, &QLineEdit::textChanged, this, [this]() { refreshDebuggerVariableTree(); });
-        scriptSideSplitter->addWidget(scriptPanel);
-        scriptSideSplitter->addWidget(variablesPanel);
-        scriptSideSplitter->setStretchFactor(0, 3);
-        scriptSideSplitter->setStretchFactor(1, 1);
-        scriptSideSplitter->setSizes({760, 280});
+        scriptDock = new QDockWidget(QStringLiteral("Script Editor"), this);
+        scriptDock->setObjectName(QStringLiteral("scriptEditorDock"));
+        scriptDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable);
+        scriptDock->setWidget(scriptPanel);
+        addDockWidget(Qt::LeftDockWidgetArea, scriptDock);
+        editorTabBar = new QTabBar(scriptPanel);
+        editorTabBar->setObjectName(QStringLiteral("editorTabs"));
+        editorTabBar->setTabsClosable(false);
+        editorTabBar->setMovable(true);
+        editorTabBar->addTab(QStringLiteral("Quick Script"));
+        scriptLayout->insertWidget(scriptLayout->indexOf(scriptEdit), editorTabBar);
+        connect(editorTabBar, &QTabBar::currentChanged, this, [this](int index) {
+            if (folderMode)
+                switchFolderFile(index);
+        });
+        connect(editorTabBar, &QTabBar::tabCloseRequested, this, [this](int index) {
+            closeFolderFileTab(index);
+        });
+        variablesDock = new QDockWidget(QStringLiteral("Variables"), this);
+        variablesDock->setObjectName(QStringLiteral("variablesDock"));
+        variablesDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable |
+                                   QDockWidget::DockWidgetClosable);
+        variablesDock->setMinimumWidth(320);
+        variablesDock->setWidget(variablesPanel);
+        addDockWidget(Qt::RightDockWidgetArea, variablesDock);
+        variablesDock->hide();
+        folderBrowserDock = new QDockWidget(QStringLiteral("Files"), this);
+        folderBrowserDock->setObjectName(QStringLiteral("folderBrowserDock"));
+        folderBrowserDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable |
+                                       QDockWidget::DockWidgetClosable);
+        auto *folderPanel = new QWidget(folderBrowserDock);
+        auto *folderLayout = new QVBoxLayout(folderPanel);
+        folderLayout->setContentsMargins(4, 4, 4, 4);
+        auto *folderControls = new QHBoxLayout;
+        auto *newFolderButton = new QToolButton(folderPanel);
+        newFolderButton->setText(QStringLiteral("Dir"));
+        newFolderButton->setToolTip(QStringLiteral("Create a new folder"));
+        auto *newFileButton = new QToolButton(folderPanel);
+        newFileButton->setText(QStringLiteral("File"));
+        newFileButton->setToolTip(QStringLiteral("Create a new file"));
+        auto *newScriptButton = new QToolButton(folderPanel);
+        newScriptButton->setText(QStringLiteral("Sh"));
+        newScriptButton->setToolTip(QStringLiteral("Create a new shell script"));
+        for (QToolButton *button : {newFolderButton, newFileButton, newScriptButton})
+            button->setMinimumWidth(0);
+        folderControls->addWidget(newFolderButton);
+        folderControls->addWidget(newFileButton);
+        folderControls->addWidget(newScriptButton);
+        folderLayout->addLayout(folderControls);
+        folderFileBrowser = new QTreeWidget(folderPanel);
+        folderFileBrowser->setColumnCount(1);
+        folderFileBrowser->setHeaderHidden(true);
+        folderFileBrowser->setRootIsDecorated(true);
+        folderLayout->addWidget(folderFileBrowser, 1);
+        folderBrowserDock->setWidget(folderPanel);
+        folderBrowserDock->setMinimumWidth(90);
+        folderBrowserDock->setMaximumWidth(350);
+        addDockWidget(Qt::RightDockWidgetArea, folderBrowserDock);
+        splitDockWidget(scriptDock, folderBrowserDock, Qt::Horizontal);
+        resizeDocks({scriptDock, folderBrowserDock}, {880, 100}, Qt::Horizontal);
+        folderBrowserDock->hide();
+        connect(newFolderButton, &QPushButton::clicked, this, [this]() { createFolderBrowserEntry(true); });
+        connect(newFileButton, &QPushButton::clicked, this, [this]() { createFolderBrowserEntry(false); });
+        connect(newScriptButton, &QPushButton::clicked, this, [this]() { createNewScript(); });
+        connect(folderFileBrowser, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem *item, int) {
+            if (!item || item->data(0, Qt::UserRole).toString().isEmpty()
+                || item->data(0, Qt::UserRole + 1).toString() == QLatin1String("folder"))
+                return;
+            openFolderFile(item->data(0, Qt::UserRole).toString());
+        });
+        folderFileBrowser->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(folderFileBrowser, &QTreeWidget::customContextMenuRequested, this, [this](const QPoint &position) {
+            QTreeWidgetItem *item = folderFileBrowser->itemAt(position);
+            if (!item)
+                return;
+            showFolderBrowserContextMenu(item, folderFileBrowser->viewport()->mapToGlobal(position));
+        });
 
-        outputSideSplitter = new QSplitter(Qt::Horizontal, splitter);
-        outputSideSplitter->setChildrenCollapsible(false);
-        outputPanel = new QWidget(outputSideSplitter);
+        outputPanel = new QWidget(this);
         auto *outputLayout = new QVBoxLayout(outputPanel);
         outputLayout->setContentsMargins(0, 0, 0, 0);
         outputLayout->setSpacing(6);
@@ -877,7 +1083,7 @@ public:
         outputLayout->addWidget(outputSearchRow);
         outputLayout->addWidget(outputEdit, 1);
 
-        immediatePanel = new QWidget(outputSideSplitter);
+        immediatePanel = new QWidget(this);
         auto *immediateLayout = new QVBoxLayout(immediatePanel);
         immediateLayout->setContentsMargins(5, 0, 0, 0);
         auto *immediateHeading = new QLabel(QStringLiteral("Immediate"), immediatePanel);
@@ -886,53 +1092,86 @@ public:
         immediateOutputEdit->setReadOnly(true);
         immediateOutputEdit->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
         immediateOutputEdit->setPlaceholderText(QStringLiteral("Results from expressions run in the paused Bash process appear here."));
+        immediateHistoryList = new QListWidget(immediatePanel);
+        immediateHistoryList->setWordWrap(true);
+        immediateHistoryList->setToolTip(QStringLiteral("Commands evaluated during this app session. Double-click an entry to edit it in the Immediate input."));
+        auto *immediateTabs = new QTabWidget(immediatePanel);
+        immediateTabs->addTab(immediateOutputEdit, QStringLiteral("Output"));
+        immediateTabs->addTab(immediateHistoryList, QStringLiteral("History"));
         auto *immediateEntryRow = new QHBoxLayout();
-        immediateInputEdit = new QLineEdit(immediatePanel);
+        immediateInputEdit = new QPlainTextEdit(immediatePanel);
+        immediateInputEdit->setObjectName(QStringLiteral("immediateInputEdit"));
         immediateInputEdit->setPlaceholderText(QStringLiteral("Bash expression or command…"));
         immediateInputEdit->setToolTip(QStringLiteral("Runs in the live paused shell; assignments and side effects persist."));
+        immediateInputEdit->setLineWrapMode(QPlainTextEdit::NoWrap);
+        immediateInputEdit->setTabChangesFocus(true);
+        immediateInputEdit->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        immediateInputEdit->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        immediateInputEdit->setFixedHeight(immediateInputEdit->fontMetrics().height() + 14);
+        immediateCompletionController = new ShellScratchpad::Completion::CompletionController(
+            immediateInputEdit, immediateInputEdit);
+        immediateCompletionController->setWorkingDirectory(expandedWorkingDirectory());
+        immediateCompletionController->setAdditionalScriptSymbols(completionController->scriptSymbols());
+        refreshCompletionProfileVariables();
         immediateRunButton = new QPushButton(QStringLiteral("Run"), immediatePanel);
         immediateEntryRow->addWidget(immediateInputEdit, 1);
         immediateEntryRow->addWidget(immediateRunButton);
         immediateLayout->addWidget(immediateHeading);
-        immediateLayout->addWidget(immediateOutputEdit, 1);
+        immediateLayout->addWidget(immediateTabs, 1);
         immediateLayout->addLayout(immediateEntryRow);
         immediatePanel->hide();
         connect(immediateRunButton, &QPushButton::clicked, this, [this]() { evaluateImmediate(); });
-        connect(immediateInputEdit, &QLineEdit::returnPressed, this, [this]() { evaluateImmediate(); });
-        outputSideSplitter->addWidget(outputPanel);
-        outputSideSplitter->addWidget(immediatePanel);
-        outputSideSplitter->setStretchFactor(0, 2);
-        outputSideSplitter->setStretchFactor(1, 1);
-        outputSideSplitter->setSizes({650, 350});
-
-        splitter->addWidget(scriptSideSplitter);
-        splitter->addWidget(outputSideSplitter);
-        splitter->setStretchFactor(0, 3);
-        splitter->setStretchFactor(1, 2);
-        pageLayout->addWidget(splitter, 1);
-
+        connect(immediateHistoryList, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem *item) {
+            if (!item)
+                return;
+            immediateInputEdit->setPlainText(item->text());
+            immediateInputEdit->moveCursor(QTextCursor::End);
+            immediateInputEdit->setFocus();
+        });
+        connect(immediateInputEdit, &QPlainTextEdit::textChanged, this, [this]() {
+            if (!loadingImmediateHistory && immediateHistoryIndex >= 0) {
+                immediateHistoryIndex = -1;
+                immediateHistoryDraft.clear();
+            }
+        });
+        immediateInputEdit->installEventFilter(this);
+        outputDock = new QDockWidget(QStringLiteral("Output"), this);
+        outputDock->setObjectName(QStringLiteral("outputDock"));
+        outputDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable |
+                                QDockWidget::DockWidgetClosable);
+        outputDock->setWidget(outputPanel);
+        addDockWidget(Qt::BottomDockWidgetArea, outputDock);
+        immediateDock = new QDockWidget(QStringLiteral("Immediate"), this);
+        immediateDock->setObjectName(QStringLiteral("immediateDock"));
+        immediateDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable |
+                                   QDockWidget::DockWidgetClosable);
+        immediateDock->setWidget(immediatePanel);
+        addDockWidget(Qt::RightDockWidgetArea, immediateDock);
+        splitDockWidget(immediateDock, variablesDock, Qt::Horizontal);
+        immediateDock->hide();
         auto *buttonRow = new QHBoxLayout();
         buttonRow->setSpacing(8);
-        runButton = new QPushButton(QStringLiteral("▶  Run script"), central);
+        runButton = new QPushButton(QStringLiteral("▶  Run script"), scriptPanel);
         runButton->setObjectName(QStringLiteral("runButton"));
         runButton->setDefault(true);
-        stopButton = new QPushButton(QStringLiteral("■  Stop"), central);
+        stopButton = new QPushButton(QStringLiteral("■  Stop"), scriptPanel);
         stopButton->setEnabled(false);
-        runStatusLabel = new QLabel(QStringLiteral("Ready"), central);
-        runDurationLabel = new QLabel(QStringLiteral(""), central);
-        auto *saveButton = new QPushButton(QStringLiteral("Save script"), central);
+        runStatusLabel = new QLabel(QStringLiteral("Ready"), scriptPanel);
+        runDurationLabel = new QLabel(QStringLiteral(""), scriptPanel);
+        auto *saveButton = new QPushButton(QStringLiteral("Save script"), scriptPanel);
         saveButton->setToolTip(QStringLiteral("Save the script and make it executable."));
         connect(saveButton, &QPushButton::clicked, this, [this]() { saveScript(); });
-        auto *newButton = new QPushButton(QStringLiteral("New script"), central);
+        auto *newButton = new QPushButton(QStringLiteral("New script"), scriptPanel);
         connect(newButton, &QPushButton::clicked, this, [this]() { createNewScript(); });
         buttonRow->addWidget(runButton);
         buttonRow->addWidget(stopButton);
         buttonRow->addStretch(1);
         buttonRow->addWidget(saveButton);
         buttonRow->addWidget(newButton);
-        pageLayout->addLayout(buttonRow);
+        runControlsPanel = new QWidget(this);
+        runControlsPanel->setLayout(buttonRow);
+        scriptLayout->addWidget(runControlsPanel);
 
-        setCentralWidget(central);
 
         outputFilterPool.setMaxThreadCount(1);
         outputFilterTimer.setSingleShot(true);
@@ -942,7 +1181,16 @@ public:
                 [this](bool) { updateWindowTitle(); });
         connect(scriptEdit, &QPlainTextEdit::textChanged, this, [this]() {
             updateWindowTitle();
-            scriptEdit->setTextDecorations({});
+            diagnosticDecorations.clear();
+            applyDiagnosticDecorations();
+            if (diagnosticsList && diagnosticsList->count() > 0) {
+                outputDock->hide();
+                diagnosticsDock->show();
+                diagnosticsDock->raise();
+            } else {
+                diagnosticsDock->hide();
+                outputDock->hide();
+            }
             if (recoveryEnabled)
                 recoveryTimer.start();
             latestDraftTimer.start();
@@ -962,11 +1210,30 @@ public:
         configureShellCheckProcess();
         diagnosticsDock = new QDockWidget(QStringLiteral("Script Diagnostics"), this);
         diagnosticsDock->setObjectName(QStringLiteral("scriptDiagnosticsDock"));
-        diagnosticsList = new QListWidget(diagnosticsDock);
+        diagnosticsDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable |
+                                     QDockWidget::DockWidgetClosable);
+        auto *diagnosticsContents = new QWidget(diagnosticsDock);
+        auto *diagnosticsLayout = new QVBoxLayout(diagnosticsContents);
+        diagnosticsLayout->setContentsMargins(6, 4, 6, 6);
+        auto *diagnosticsToolbar = new QHBoxLayout();
+        diagnosticsToolbar->addStretch(1);
+        auto *acknowledgeRuntimeErrorsButton = new QPushButton(QStringLiteral("Acknowledge"), diagnosticsContents);
+        acknowledgeRuntimeErrorsButton->setToolTip(QStringLiteral("Dismiss runtime errors from the previous run."));
+        connect(acknowledgeRuntimeErrorsButton, &QPushButton::clicked, this, [this]() {
+            acknowledgeRuntimeErrors();
+        });
+        diagnosticsToolbar->addWidget(acknowledgeRuntimeErrorsButton);
+        diagnosticsList = new QListWidget(diagnosticsContents);
         diagnosticsList->setAlternatingRowColors(true);
-        diagnosticsDock->setWidget(diagnosticsList);
+        diagnosticsLayout->addLayout(diagnosticsToolbar);
+        diagnosticsLayout->addWidget(diagnosticsList, 1);
+        diagnosticsDock->setWidget(diagnosticsContents);
         addDockWidget(Qt::BottomDockWidgetArea, diagnosticsDock);
+        tabifyDockWidget(outputDock, diagnosticsDock);
+        outputDock->hide();
         diagnosticsDock->hide();
+        resizeDocks({outputDock}, {150}, Qt::Vertical);
+        resizeDocks({immediateDock, variablesDock}, {340, 480}, Qt::Horizontal);
         connect(diagnosticsList, &QListWidget::itemActivated, this, [this](QListWidgetItem *item) {
             const int FIX_START = item->data(Qt::UserRole + 5).toInt();
             const int FIX_LENGTH = item->data(Qt::UserRole + 6).toInt();
@@ -1082,8 +1349,15 @@ public:
                             QStringLiteral("Go to declaration of %1").arg(symbolName));
                         const qsizetype DECLARATION_OFFSET = SYMBOL->declarationOffset;
                         const qsizetype DECLARATION_LENGTH = symbolName.size();
+                        const QString SOURCE_PATH = SYMBOL->sourcePath;
+                        const int SOURCE_LINE = SYMBOL->sourceLine;
                         connect(declarationAction, &QAction::triggered, this,
-                                [this, DECLARATION_OFFSET, DECLARATION_LENGTH]() {
+                                [this, DECLARATION_OFFSET, DECLARATION_LENGTH, SOURCE_PATH, SOURCE_LINE,
+                                 symbolName]() {
+                            if (!SOURCE_PATH.isEmpty()) {
+                                navigateToSourcedIdentifier(SOURCE_PATH, symbolName, SOURCE_LINE);
+                                return;
+                            }
                             scriptEdit->revealPosition(DECLARATION_OFFSET);
                             QTextCursor declaration(scriptEdit->document());
                             declaration.setPosition(static_cast<int>(DECLARATION_OFFSET));
@@ -1127,11 +1401,17 @@ public:
                 const QListWidgetItem *diagnostic = diagnosticsList->item(row);
                 if (diagnostic->data(Qt::UserRole).toInt() != RIGHT_CLICKED_LINE)
                     continue;
-                lineErrors.append(QStringLiteral("%1 SC%2 at column %3: %4")
-                    .arg(diagnostic->data(Qt::UserRole + 3).toString().toUpper())
-                    .arg(diagnostic->data(Qt::UserRole + 1).toInt(), 4, 10, QLatin1Char('0'))
-                    .arg(diagnostic->data(Qt::UserRole + 2).toInt())
-                    .arg(diagnostic->data(Qt::UserRole + 4).toString()));
+                if (diagnostic->data(Qt::UserRole + 5).toString() == QLatin1String("runtime")) {
+                    lineErrors.append(QStringLiteral("Runtime error at column %1: %2")
+                        .arg(diagnostic->data(Qt::UserRole + 2).toInt())
+                        .arg(diagnostic->data(Qt::UserRole + 4).toString()));
+                } else {
+                    lineErrors.append(QStringLiteral("%1 SC%2 at column %3: %4")
+                        .arg(diagnostic->data(Qt::UserRole + 3).toString().toUpper())
+                        .arg(diagnostic->data(Qt::UserRole + 1).toInt(), 4, 10, QLatin1Char('0'))
+                        .arg(diagnostic->data(Qt::UserRole + 2).toInt())
+                        .arg(diagnostic->data(Qt::UserRole + 4).toString()));
+                }
             }
             if (!lineErrors.isEmpty()) {
                 QAction *copyLineAndErrors = contextMenu.addAction(QStringLiteral("Copy Line and Diagnostics"));
@@ -1214,10 +1494,15 @@ public:
             debuggerVariables.clear();
             pendingImmediateExpression.clear();
             debuggerBanner->hide();
+            folderBrowserDock->setVisible(folderMode);
+            variablesDock->hide();
+            immediateDock->hide();
             variablesPanel->hide();
             immediatePanel->hide();
             if (completionController)
                 completionController->setRuntimeVariables({});
+            if (immediateCompletionController)
+                immediateCompletionController->setRuntimeVariables({});
             updateDebuggerActions();
             if (toggleBreakpointAction)
                 toggleBreakpointAction->setEnabled(true);
@@ -1237,6 +1522,8 @@ public:
                 runStatusLabel->setText(QStringLiteral("Terminated"));
                 statusBar()->showMessage(QStringLiteral("Script process terminated"));
             }
+            if (!stopRequested && exitStatus == QProcess::NormalExit && exitCode != 0)
+                appendPostRunDiagnostics(exitCode);
             stopRequested = false;
         });
         connect(&process, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
@@ -1253,6 +1540,7 @@ public:
                 debuggerPaused = false;
                 pendingImmediateExpression.clear();
                 debuggerBanner->hide();
+                folderBrowserDock->setVisible(folderMode);
                 variablesPanel->hide();
                 immediatePanel->hide();
                 scriptEdit->setReadOnly(false);
@@ -1288,6 +1576,60 @@ public:
         placeCaretAtEndOfFirstLine();
     }
 
+    void navigateToSourcedIdentifier(const QString &path, const QString &name, int preferredLine)
+    {
+        const QString normalizedPath = normalizedScriptPath(path);
+        ShellScratchpadWindow *target = nullptr;
+        for (ShellScratchpadWindow *window : openScratchpadWindows()) {
+            if (window && !window->currentScriptPath.isEmpty() &&
+                normalizedScriptPath(window->currentScriptPath) == normalizedPath) {
+                target = window;
+                break;
+            }
+        }
+        if (!target) {
+            target = new ShellScratchpadWindow(QFileInfo(normalizedPath).absolutePath(), normalizedPath, false);
+            target->show();
+        }
+        target->showNormal();
+        target->raise();
+        target->activateWindow();
+        target->highlightIdentifier(name, preferredLine);
+    }
+
+    void highlightIdentifier(const QString &name, int preferredLine)
+    {
+        if (!scriptEdit || name.isEmpty())
+            return;
+        QTextBlock block = scriptEdit->document()->findBlockByNumber(qMax(0, preferredLine - 1));
+        QRegularExpression identifier(QStringLiteral("\\b") + QRegularExpression::escape(name) +
+                                      QStringLiteral("\\b"));
+        auto findInBlock = [&identifier, this](const QTextBlock &candidate) {
+            return identifier.match(candidate.text());
+        };
+        QRegularExpressionMatch match = block.isValid() ? findInBlock(block) : QRegularExpressionMatch();
+        if (!match.hasMatch()) {
+            for (QTextBlock candidate = scriptEdit->document()->begin(); candidate.isValid();
+                 candidate = candidate.next()) {
+                match = findInBlock(candidate);
+                if (match.hasMatch()) {
+                    block = candidate;
+                    break;
+                }
+            }
+        }
+        if (!block.isValid() || !match.hasMatch())
+            return;
+        const int start = block.position() + match.capturedStart();
+        scriptEdit->revealPosition(start);
+        QTextCursor cursor(scriptEdit->document());
+        cursor.setPosition(start);
+        cursor.setPosition(start + name.size(), QTextCursor::KeepAnchor);
+        scriptEdit->setTextCursor(cursor);
+        scriptEdit->centerCursor();
+        scriptEdit->setFocus();
+    }
+
     ~ShellScratchpadWindow() override
     {
         outputFilterTimer.stop();
@@ -1300,9 +1642,47 @@ public:
         openScratchpadWindows().removeAll(this);
     }
 
+    void openFolderOnStartup(const QString &path)
+    {
+        openFolderPath(path);
+    }
+
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override
     {
+        if (watched == immediateInputEdit && event->type() == QEvent::KeyPress) {
+            auto *keyEvent = static_cast<QKeyEvent *>(event);
+            if ((keyEvent->key() == Qt::Key_Up || keyEvent->key() == Qt::Key_Down)
+                && !(immediateCompletionController && immediateCompletionController->hasVisibleSuggestions())) {
+                if (immediateCommandHistory.isEmpty())
+                    return false;
+                if (keyEvent->key() == Qt::Key_Up) {
+                    if (immediateHistoryIndex < 0) {
+                        immediateHistoryDraft = immediateInputEdit->toPlainText();
+                        immediateHistoryIndex = immediateCommandHistory.size();
+                    }
+                    immediateHistoryIndex = qMax(0, immediateHistoryIndex - 1);
+                    loadImmediateHistoryEntry(immediateCommandHistory.at(immediateHistoryIndex));
+                } else if (immediateHistoryIndex >= 0) {
+                    ++immediateHistoryIndex;
+                    if (immediateHistoryIndex >= immediateCommandHistory.size()) {
+                        immediateHistoryIndex = -1;
+                        loadImmediateHistoryEntry(immediateHistoryDraft);
+                        immediateHistoryDraft.clear();
+                    } else {
+                        loadImmediateHistoryEntry(immediateCommandHistory.at(immediateHistoryIndex));
+                    }
+                }
+                return true;
+            }
+            const bool IS_ENTER = keyEvent->key() == Qt::Key_Return || keyEvent->key() == Qt::Key_Enter;
+            if (IS_ENTER && keyEvent->modifiers() == Qt::NoModifier) {
+                if (immediateCompletionController && immediateCompletionController->hasVisibleSuggestions())
+                    return false;
+                evaluateImmediate();
+                return true;
+            }
+        }
         if (watched == outputFindEdit && event->type() == QEvent::KeyPress) {
             auto *keyEvent = static_cast<QKeyEvent *>(event);
             if (keyEvent->key() == Qt::Key_Escape) {
@@ -1392,6 +1772,10 @@ protected:
             process.kill();
             process.waitForFinished(1500);
         }
+        if (!closeFolderMode()) {
+            event->ignore();
+            return;
+        }
         if (!confirmReplaceDocument()) {
             event->ignore();
             return;
@@ -1414,18 +1798,49 @@ private:
     QWidget *outputSearchRow = nullptr;
     QAction *outputFindCaseSensitiveAction = nullptr;
     QWidget *outputPanel = nullptr;
-    QSplitter *splitter = nullptr;
-    QSplitter *scriptSideSplitter = nullptr;
-    QSplitter *outputSideSplitter = nullptr;
+    QDockWidget *outputDock = nullptr;
+    QDockWidget *scriptDock = nullptr;
+    QDockWidget *variablesDock = nullptr;
+    QDockWidget *immediateDock = nullptr;
+    QDockWidget *folderBrowserDock = nullptr;
+    QWidget *runControlsPanel = nullptr;
+    QTabBar *editorTabBar = nullptr;
+    QTreeWidget *folderFileBrowser = nullptr;
+    QFileIconProvider folderIconProvider;
+    QAction *folderBrowserAction = nullptr;
+    QAction *folderMenuAction = nullptr;
+    QAction *closeFolderMenuAction = nullptr;
+    QAction *variablesDockAction = nullptr;
+    QAction *immediateDockAction = nullptr;
+    bool folderMode = false;
+    bool switchingFolderFile = false;
+    QString folderRootPath;
+    QString activeFolderFilePath;
+    QString quickModeScriptPath;
+    QString quickModeContents;
+    bool quickModeModified = false;
+    struct FolderFileState {
+        QString contents;
+        int cursorPosition = 0;
+        bool modified = false;
+    };
+    QHash<QString, FolderFileState> folderFileStates;
     QWidget *variablesPanel = nullptr;
     QLabel *debuggerBanner = nullptr;
     QLineEdit *variablesFilter = nullptr;
     QTreeWidget *variablesTree = nullptr;
     QWidget *immediatePanel = nullptr;
     QPlainTextEdit *immediateOutputEdit = nullptr;
-    QLineEdit *immediateInputEdit = nullptr;
+    QPlainTextEdit *immediateInputEdit = nullptr;
+    QListWidget *immediateHistoryList = nullptr;
+    QStringList immediateCommandHistory;
+    QString immediateHistoryDraft;
+    int immediateHistoryIndex = -1;
+    bool loadingImmediateHistory = false;
+    QPointer<ShellScratchpad::Completion::CompletionController> immediateCompletionController;
     QPushButton *immediateRunButton = nullptr;
     QLineEdit *directoryEdit = nullptr;
+    QWidget *executionControlsWidget = nullptr;
     QString defaultWorkingDirectory;
     QComboBox *runProfileCombo = nullptr;
     QAction *clearOutputEachRunAction = nullptr;
@@ -1448,6 +1863,7 @@ private:
     QTimer killTimer;
     QTimer promptTimer;
     QByteArray pendingOutput;
+    QByteArray runDiagnosticOutput;
     QString outputContent;
     QElapsedTimer runElapsed;
     OutputMatchHighlighter *outputMatchHighlighter = nullptr;
@@ -1485,6 +1901,7 @@ private:
     QDockWidget *diagnosticsDock = nullptr;
     QListWidget *diagnosticsList = nullptr;
     QString activeShellCheckScript;
+    QString currentRunSourceText;
     quint64 shellCheckGeneration = 0;
     quint64 activeShellCheckGeneration = 0;
     bool shellCheckPending = false;
@@ -1494,6 +1911,9 @@ private:
     bool runForceDebugAfterShellCheck = false;
     bool applyingScriptRunProfile = false;
     int currentHistoryLineOffset = 0;
+    int currentRunUserScriptStartLine = 1;
+    QVector<ShellScratchpad::CodeEditor::TextDecoration> diagnosticDecorations;
+    QVector<ShellScratchpad::CodeEditor::TextDecoration> runtimeDiagnosticDecorations;
     QString latestDraftSnapshot;
     bool recoveryEnabled = false;
     bool recoveryDraftOwned = false;
@@ -1585,6 +2005,16 @@ private:
         QAction *openAction = fileMenu->addAction(QStringLiteral("Open Script…"));
         openAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+O")));
         connect(openAction, &QAction::triggered, this, [this]() { openScript(); });
+        QAction *openFolderAction = fileMenu->addAction(QStringLiteral("Open Folder…"));
+        connect(openFolderAction, &QAction::triggered, this, [this]() { chooseFolderToOpen(); });
+        QAction *currentScriptFolderAction = fileMenu->addAction(QStringLiteral("Open Current Script’s Folder"));
+        connect(currentScriptFolderAction, &QAction::triggered, this, [this]() { openCurrentScriptFolder(); });
+        QAction *closeFolderAction = fileMenu->addAction(QStringLiteral("Close Folder"));
+        connect(closeFolderAction, &QAction::triggered, this, [this]() { closeFolderMode(); });
+        folderMenuAction = currentScriptFolderAction;
+        closeFolderMenuAction = closeFolderAction;
+        closeFolderMenuAction->setEnabled(false);
+        currentScriptFolderAction->setEnabled(!currentScriptPath.isEmpty());
         QAction *saveAction = fileMenu->addAction(QStringLiteral("Save Script…"));
         saveAction->setShortcut(QKeySequence::Save);
         connect(saveAction, &QAction::triggered, this, [this]() {
@@ -1693,13 +2123,6 @@ private:
         });
         QAction *clearScriptAction = scriptMenu->addAction(QStringLiteral("Clear Script"));
         connect(clearScriptAction, &QAction::triggered, this, [this]() { createNewScript(); });
-        QAction *setWorkingDirectoryAction = scriptMenu->addAction(QStringLiteral("Set Working Directory…"));
-        connect(setWorkingDirectoryAction, &QAction::triggered, this, [this]() {
-            const QString DIRECTORY = QFileDialog::getExistingDirectory(
-                this, QStringLiteral("Choose working directory"), expandedWorkingDirectory());
-            if (!DIRECTORY.isEmpty())
-                directoryEdit->setText(QDir::cleanPath(DIRECTORY));
-        });
         scriptMenu->addSeparator();
         QAction *quickSavedScriptsAction = scriptMenu->addAction(QStringLiteral("Quick Saved Scripts…"));
         quickSavedScriptsAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+Q")));
@@ -1707,18 +2130,105 @@ private:
         QAction *saveQuickScriptAction = scriptMenu->addAction(QStringLiteral("Save Quick Script…"));
         connect(saveQuickScriptAction, &QAction::triggered, this, [this]() { saveQuickScript(); });
 
+        QMenu *executionMenu = menuBar()->addMenu(QStringLiteral("&Execution"));
+        auto *executionControlsAction = new QWidgetAction(executionMenu);
+        executionControlsAction->setDefaultWidget(executionControlsWidget);
+        executionMenu->addAction(executionControlsAction);
+
         QMenu *viewMenu = menuBar()->addMenu(QStringLiteral("&View"));
-        showOutputAction = viewMenu->addAction(QStringLiteral("Show/Hide Output"));
-        showOutputAction->setCheckable(true);
-        showOutputAction->setChecked(true);
-        connect(showOutputAction, &QAction::toggled, outputPanel, &QWidget::setVisible);
+        viewMenu->addAction(scriptDock->toggleViewAction());
+        showOutputAction = outputDock->toggleViewAction();
+        viewMenu->addAction(showOutputAction);
+        viewMenu->addAction(diagnosticsDock->toggleViewAction());
+        variablesDockAction = variablesDock->toggleViewAction();
+        immediateDockAction = immediateDock->toggleViewAction();
+        variablesDockAction->setEnabled(debuggerEnabled);
+        immediateDockAction->setEnabled(debuggerEnabled);
+        viewMenu->addAction(variablesDockAction);
+        viewMenu->addAction(immediateDockAction);
+        folderBrowserAction = folderBrowserDock->toggleViewAction();
+        folderBrowserAction->setEnabled(folderMode);
+        viewMenu->addAction(folderBrowserAction);
+        viewMenu->addSeparator();
+        QAction *saveLayoutAction = viewMenu->addAction(QStringLiteral("Save Layout…"));
+        connect(saveLayoutAction, &QAction::triggered, this, [this]() {
+            const QString PATH = QFileDialog::getSaveFileName(
+                this, QStringLiteral("Save Editor Layout"), QString(),
+                QStringLiteral("Shell Scratchpad Layout (*.sslayout);;JSON files (*.json)"));
+            if (PATH.isEmpty())
+                return;
+            QJsonObject layout;
+            layout.insert(QStringLiteral("format"), QStringLiteral("shell-scratchpad-layout"));
+            layout.insert(QStringLiteral("version"), 1);
+            layout.insert(QStringLiteral("geometry"), QString::fromLatin1(saveGeometry().toBase64()));
+            layout.insert(QStringLiteral("state"), QString::fromLatin1(saveState(1).toBase64()));
+            QSaveFile file(PATH);
+            if (!file.open(QIODevice::WriteOnly) || file.write(QJsonDocument(layout).toJson(QJsonDocument::Indented)) < 0
+                || !file.commit()) {
+                QMessageBox::warning(this, QStringLiteral("Save Layout"),
+                                     QStringLiteral("Could not save the layout file."));
+            }
+        });
+        QAction *loadLayoutAction = viewMenu->addAction(QStringLiteral("Load Layout…"));
+        connect(loadLayoutAction, &QAction::triggered, this, [this]() {
+            const QString PATH = QFileDialog::getOpenFileName(
+                this, QStringLiteral("Load Editor Layout"), QString(),
+                QStringLiteral("Shell Scratchpad Layout (*.sslayout *.json);;All files (*)"));
+            if (PATH.isEmpty())
+                return;
+            QFile file(PATH);
+            if (!file.open(QIODevice::ReadOnly)) {
+                QMessageBox::warning(this, QStringLiteral("Load Layout"),
+                                     QStringLiteral("Could not read the layout file."));
+                return;
+            }
+            QJsonParseError parseError;
+            const QJsonDocument document = QJsonDocument::fromJson(file.readAll(), &parseError);
+            const QJsonObject layout = document.object();
+            if (parseError.error != QJsonParseError::NoError
+                || layout.value(QStringLiteral("format")).toString() != QStringLiteral("shell-scratchpad-layout")
+                || layout.value(QStringLiteral("version")).toInt() != 1) {
+                QMessageBox::warning(this, QStringLiteral("Load Layout"),
+                                     QStringLiteral("This is not a supported Shell Scratchpad layout file."));
+                return;
+            }
+            const QByteArray geometry = QByteArray::fromBase64(layout.value(QStringLiteral("geometry")).toString().toLatin1());
+            const QByteArray state = QByteArray::fromBase64(layout.value(QStringLiteral("state")).toString().toLatin1());
+            if (geometry.isEmpty() || state.isEmpty() || !restoreGeometry(geometry) || !restoreState(state, 1)) {
+                QMessageBox::warning(this, QStringLiteral("Load Layout"),
+                                     QStringLiteral("The layout file is incomplete or could not be applied."));
+            } else if (!folderMode) {
+                folderBrowserDock->hide();
+                if (folderBrowserAction)
+                    folderBrowserAction->setEnabled(false);
+            }
+            if (!debuggerEnabled) {
+                variablesDock->hide();
+                immediateDock->hide();
+            }
+        });
         viewMenu->addSeparator();
         QAction *resetLayoutAction = viewMenu->addAction(QStringLiteral("Reset Layout"));
         connect(resetLayoutAction, &QAction::triggered, this, [this]() {
-            outputPanel->show();
-            showOutputAction->setChecked(true);
-            const int HEIGHT = qMax(splitter->height(), 1);
-            splitter->setSizes({HEIGHT * 3 / 5, HEIGHT * 2 / 5});
+            diagnosticsDock->hide();
+            outputDock->show();
+            outputDock->raise();
+            scriptDock->show();
+            variablesDock->hide();
+            immediateDock->hide();
+            folderBrowserDock->setVisible(folderMode);
+            addDockWidget(Qt::LeftDockWidgetArea, scriptDock);
+            addDockWidget(Qt::RightDockWidgetArea, variablesDock);
+            addDockWidget(Qt::RightDockWidgetArea, folderBrowserDock);
+            addDockWidget(Qt::BottomDockWidgetArea, outputDock);
+            addDockWidget(Qt::RightDockWidgetArea, immediateDock);
+            splitDockWidget(immediateDock, variablesDock, Qt::Horizontal);
+            if (folderMode) {
+                splitDockWidget(scriptDock, folderBrowserDock, Qt::Horizontal);
+                folderBrowserDock->show();
+            }
+            resizeDocks({outputDock}, {150}, Qt::Vertical);
+            resizeDocks({immediateDock, variablesDock}, {340, 480}, Qt::Horizontal);
         });
         viewMenu->addSeparator();
         const QKeySequence COLLAPSE_ALL_SEQUENCE = QKeySequence::fromString(
@@ -1733,6 +2243,7 @@ private:
         QAction *expandAllAction = viewMenu->addAction(
             QStringLiteral("Expand All Sections\tCtrl+M, Ctrl+P"));
         connect(expandAllAction, &QAction::triggered, scriptEdit, &ShellScratchpad::CodeEditor::expandAllSections);
+
         keyChordDispatcher->registerChord(EXPAND_ALL_SEQUENCE, [this]() { scriptEdit->expandAllSections(); });
         viewMenu->addSeparator();
         QAction *zoomInAction = viewMenu->addAction(QStringLiteral("Zoom In"));
@@ -1812,20 +2323,705 @@ private:
                                "<p><b>Company:</b> WinterRose<br><b>License:</b> MPL-2.0</p>"
                                "<p>Version %1</p>").arg(QCoreApplication::applicationVersion()));
         });
+
+        // Keep Folder with the other top-level menus, after the standard menus.
+        QMenu *folderTopMenu = menuBar()->addMenu(QStringLiteral("&Folder"));
+        folderTopMenu->addAction(openFolderAction);
+        folderTopMenu->addAction(currentScriptFolderAction);
+        folderTopMenu->addAction(closeFolderAction);
+    }
+
+    bool isInsideFolderRoot(const QString &path) const
+    {
+        const QString RELATIVE = QDir(folderRootPath).relativeFilePath(QFileInfo(path).absoluteFilePath());
+        return RELATIVE != QStringLiteral(".") && RELATIVE != QStringLiteral("..")
+            && !RELATIVE.startsWith(QStringLiteral("../")) && !QDir::isAbsolutePath(RELATIVE);
+    }
+
+    void chooseFolderToOpen()
+    {
+        const QString PATH = QFileDialog::getExistingDirectory(
+            this, QStringLiteral("Open Folder"), folderMode ? folderRootPath : expandedWorkingDirectory());
+        if (!PATH.isEmpty())
+            openFolderPath(PATH);
+    }
+
+    void openCurrentScriptFolder()
+    {
+        if (currentScriptPath.isEmpty()) {
+            statusBar()->showMessage(QStringLiteral("Save or open a script first"), 3000);
+            return;
+        }
+        openFolderPath(QFileInfo(currentScriptPath).absolutePath(), currentScriptPath);
+    }
+
+    void refreshFolderBrowser()
+    {
+        if (!folderFileBrowser || folderRootPath.isEmpty())
+            return;
+        folderFileBrowser->clear();
+        auto *scripts = new QTreeWidgetItem(folderFileBrowser, {QStringLiteral("Script Files")});
+        auto *resources = new QTreeWidgetItem(folderFileBrowser, {QStringLiteral("Resource Files")});
+        for (QTreeWidgetItem *category : {scripts, resources}) {
+            category->setData(0, Qt::UserRole, folderRootPath);
+            category->setData(0, Qt::UserRole + 1, QStringLiteral("category"));
+            category->setIcon(0, folderIconProvider.icon(QFileIconProvider::Folder));
+        }
+        scripts->setFlags(scripts->flags() & ~Qt::ItemIsSelectable);
+        resources->setFlags(resources->flags() & ~Qt::ItemIsSelectable);
+        QHash<QString, QTreeWidgetItem *> directoryItems;
+        auto ensureDirectoryNode = [&](QTreeWidgetItem *category, const QString &directory) {
+            if (directory == folderRootPath)
+                return category;
+            const QString relative = QDir(folderRootPath).relativeFilePath(directory);
+            const QStringList parts = relative.split(QDir::separator(), Qt::SkipEmptyParts);
+            QString current = folderRootPath;
+            QTreeWidgetItem *parent = category;
+            for (const QString &part : parts) {
+                current = QDir(current).filePath(part);
+                const QString key = QString::number(reinterpret_cast<quintptr>(category)) + QLatin1Char('|') + current;
+                if (!directoryItems.contains(key)) {
+                    auto *node = new QTreeWidgetItem(parent, {part});
+                    node->setData(0, Qt::UserRole, current);
+                    node->setData(0, Qt::UserRole + 1, QStringLiteral("folder"));
+                    node->setIcon(0, folderIconProvider.icon(QFileIconProvider::Folder));
+                    node->setToolTip(0, current);
+                    directoryItems.insert(key, node);
+                }
+                parent = directoryItems.value(key);
+            }
+            return parent;
+        };
+        QDirIterator directories(folderRootPath, QDir::Dirs | QDir::NoDotAndDotDot, QDirIterator::Subdirectories);
+        while (directories.hasNext()) {
+            const QString directory = directories.next();
+            ensureDirectoryNode(resources, directory);
+        }
+        QDirIterator iterator(folderRootPath, QDir::Files | QDir::NoDotAndDotDot, QDirIterator::Subdirectories);
+        while (iterator.hasNext()) {
+            const QString path = iterator.next();
+            const QFileInfo info(path);
+            const QString suffix = info.suffix().toLower();
+            const bool isScript = suffix == QStringLiteral("sh") || suffix == QStringLiteral("bash")
+                || suffix == QStringLiteral("bats");
+            QTreeWidgetItem *parent = ensureDirectoryNode(isScript ? scripts : resources, info.absolutePath());
+            auto *item = new QTreeWidgetItem(parent, {info.fileName()});
+            item->setData(0, Qt::UserRole, path);
+            item->setData(0, Qt::UserRole + 1, QStringLiteral("file"));
+            item->setIcon(0, folderIconProvider.icon(info));
+            item->setToolTip(0, path);
+        }
+        folderFileBrowser->sortItems(0, Qt::AscendingOrder);
+        // Sorting the tree also sorts category headings; restore their intended order.
+        folderFileBrowser->invisibleRootItem()->removeChild(scripts);
+        folderFileBrowser->invisibleRootItem()->removeChild(resources);
+        folderFileBrowser->insertTopLevelItem(0, scripts);
+        folderFileBrowser->insertTopLevelItem(1, resources);
+        scripts->setExpanded(true);
+        resources->setExpanded(false);
+    }
+
+    void showFolderBrowserContextMenu(QTreeWidgetItem *item, const QPoint &globalPosition)
+    {
+        const QString path = item->data(0, Qt::UserRole).toString();
+        const QString kind = item->data(0, Qt::UserRole + 1).toString();
+        const bool isCategory = kind == QLatin1String("category");
+        if (path.isEmpty() || (kind != QLatin1String("folder") && kind != QLatin1String("file") && !isCategory))
+            return;
+        const bool isDirectory = kind != QLatin1String("file");
+        QMenu menu(this);
+        menu.setAttribute(Qt::WA_NoMouseReplay);
+        QAction *openAction = menu.addAction(isDirectory ? QStringLiteral("Open in File Manager")
+                                                        : QStringLiteral("Open in Editor"));
+        QAction *copyPathAction = menu.addAction(QStringLiteral("Copy Path"));
+        menu.addSeparator();
+        QAction *newFolderAction = nullptr;
+        QAction *newScriptAction = nullptr;
+        QAction *newResourceAction = nullptr;
+        if (isDirectory) {
+            newFolderAction = menu.addAction(QStringLiteral("New Folder…"));
+            newScriptAction = menu.addAction(QStringLiteral("New Script…"));
+            newResourceAction = menu.addAction(QStringLiteral("New Resource File…"));
+            menu.addSeparator();
+        }
+        QAction *renameAction = menu.addAction(QStringLiteral("Rename…"));
+        QAction *deleteAction = isCategory ? nullptr : menu.addAction(QStringLiteral("Delete…"));
+        const QAction *selected = menu.exec(globalPosition);
+        if (selected == openAction) {
+            if (isDirectory)
+                QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+            else
+                openFolderFile(path);
+        } else if (selected == copyPathAction) {
+            QApplication::clipboard()->setText(path);
+        } else if (selected == newFolderAction) {
+            createFolderInDirectory(path);
+        } else if (selected == newScriptAction) {
+            createNewScriptInFolder(path);
+        } else if (selected == newResourceAction) {
+            createResourceFileInFolder(path);
+        } else if (selected == renameAction) {
+            renameFolderBrowserEntry(path, isDirectory);
+        } else if (selected == deleteAction) {
+            deleteFolderBrowserEntry(path, isDirectory);
+        }
+    }
+
+    void renameFolderBrowserEntry(const QString &path, bool isDirectory)
+    {
+        const QFileInfo info(path);
+        bool accepted = false;
+        const QString name = QInputDialog::getText(this, QStringLiteral("Rename"),
+            QStringLiteral("New name:"), QLineEdit::Normal, info.fileName(), &accepted).trimmed();
+        if (!accepted || name.isEmpty() || name == info.fileName())
+            return;
+        if (!validFolderEntryName(name)) {
+            QMessageBox::warning(this, QStringLiteral("Invalid name"), QStringLiteral("Enter a name without a path."));
+            return;
+        }
+        const QString newPath = QDir::cleanPath(QDir(info.absolutePath()).filePath(name));
+        if (QFileInfo::exists(newPath)) {
+            QMessageBox::warning(this, QStringLiteral("Already exists"),
+                                 QStringLiteral("A file or folder with that name already exists."));
+            return;
+        }
+        if (!QDir(info.absolutePath()).rename(info.fileName(), name)) {
+            QMessageBox::warning(this, QStringLiteral("Could not rename"), info.fileName());
+            return;
+        }
+
+        if (isDirectory && QDir::cleanPath(folderRootPath) == QDir::cleanPath(path)) {
+            folderRootPath = newPath;
+            directoryEdit->setText(newPath);
+        }
+        const QString prefix = QDir::cleanPath(path) + QLatin1Char('/');
+        QStringList keys = folderFileStates.keys();
+        for (const QString &oldPath : keys) {
+            if (oldPath != path && (!isDirectory || !oldPath.startsWith(prefix)))
+                continue;
+            const QString updatedPath = oldPath == path ? newPath : newPath + oldPath.mid(path.size());
+            FolderFileState state = folderFileStates.take(oldPath);
+            folderFileStates.insert(updatedPath, state);
+            if (activeFolderFilePath == oldPath)
+                activeFolderFilePath = updatedPath;
+            if (currentScriptPath == oldPath)
+                currentScriptPath = updatedPath;
+            for (int index = 0; index < editorTabBar->count(); ++index) {
+                if (editorTabBar->tabData(index).toString() != oldPath)
+                    continue;
+                editorTabBar->setTabData(index, updatedPath);
+                editorTabBar->setTabToolTip(index, updatedPath);
+                editorTabBar->setTabText(index, (state.modified ? QStringLiteral("*") : QString())
+                                         + QFileInfo(updatedPath).fileName());
+            }
+        }
+        refreshFolderBrowser();
+        updateWindowTitle();
+    }
+
+    void deleteFolderBrowserEntry(const QString &path, bool isDirectory)
+    {
+        const QString description = isDirectory
+            ? QStringLiteral("Delete this folder and everything inside it?")
+            : QStringLiteral("Delete this file?");
+        if (QMessageBox::warning(this, QStringLiteral("Confirm Delete"), description,
+                                 QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Yes)
+            return;
+
+        storeActiveFolderFile();
+        const QString prefix = QDir::cleanPath(path) + QLatin1Char('/');
+        QStringList affected;
+        for (const QString &openPath : folderFileStates.keys()) {
+            if (openPath == path || (isDirectory && openPath.startsWith(prefix)))
+                affected.append(openPath);
+        }
+        for (const QString &openPath : affected) {
+            if (!confirmCloseFolderFile(openPath))
+                return;
+        }
+
+        const bool removed = isDirectory ? QDir(path).removeRecursively() : QFile::remove(path);
+        if (!removed) {
+            QMessageBox::warning(this, QStringLiteral("Could not delete"), path);
+            return;
+        }
+
+        const bool removedActive = affected.contains(activeFolderFilePath);
+        if (removedActive) {
+            activeFolderFilePath.clear();
+            currentScriptPath.clear();
+            scriptEdit->clear();
+            scriptEdit->document()->setModified(false);
+        }
+        for (const QString &openPath : affected)
+            folderFileStates.remove(openPath);
+        for (int index = editorTabBar->count() - 1; index >= 0; --index) {
+            const QString tabPath = editorTabBar->tabData(index).toString();
+            if (tabPath == path || (isDirectory && tabPath.startsWith(prefix)))
+                editorTabBar->removeTab(index);
+        }
+        if (editorTabBar->count() == 0) {
+            switchFolderFile(-1);
+            scriptDock->hide();
+        }
+        refreshFolderBrowser();
+        updateWindowTitle();
+    }
+
+    void createFolderBrowserEntry(bool makeDirectory)
+    {
+        if (!folderMode || folderRootPath.isEmpty())
+            return;
+        if (makeDirectory) {
+            createFolderInDirectory(folderRootPath);
+            return;
+        }
+        createResourceFileInFolder(folderRootPath);
+    }
+
+    bool validFolderEntryName(const QString &name) const
+    {
+        return !name.isEmpty() && QFileInfo(name).fileName() == name
+            && name != QStringLiteral(".") && name != QStringLiteral("..");
+    }
+
+    void createFolderInDirectory(const QString &directory)
+    {
+        bool accepted = false;
+        const QString name = QInputDialog::getText(this, QStringLiteral("New Folder"),
+            QStringLiteral("Folder name:"), QLineEdit::Normal, QString(), &accepted).trimmed();
+        if (!accepted || name.isEmpty())
+            return;
+        if (!validFolderEntryName(name)) {
+            QMessageBox::warning(this, QStringLiteral("Invalid name"), QStringLiteral("Enter a folder name without a path."));
+            return;
+        }
+        const QString path = QDir(directory).filePath(name);
+        if (QFileInfo::exists(path)) {
+            QMessageBox::warning(this, QStringLiteral("Already exists"),
+                                 QStringLiteral("A file or folder with that name already exists."));
+            return;
+        }
+        if (!QDir().mkpath(path)) {
+            QMessageBox::warning(this, QStringLiteral("Could not create folder"), path);
+            return;
+        }
+        refreshFolderBrowser();
+    }
+
+    void createResourceFileInFolder(const QString &directory)
+    {
+        bool accepted = false;
+        const QString name = QInputDialog::getText(this, QStringLiteral("New Resource File"),
+            QStringLiteral("File name:"), QLineEdit::Normal, QString(), &accepted).trimmed();
+        if (!accepted || name.isEmpty())
+            return;
+        if (!validFolderEntryName(name)) {
+            QMessageBox::warning(this, QStringLiteral("Invalid name"), QStringLiteral("Enter a file name without a path."));
+            return;
+        }
+        const QString path = QDir(directory).filePath(name);
+        if (QFileInfo::exists(path)) {
+            QMessageBox::warning(this, QStringLiteral("Already exists"),
+                                 QStringLiteral("A file or folder with that name already exists."));
+            return;
+        }
+        QFile file(path);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::NewOnly)) {
+            QMessageBox::warning(this, QStringLiteral("Could not create file"), file.errorString());
+            return;
+        }
+        file.close();
+        refreshFolderBrowser();
+        openFolderFile(path);
+    }
+
+    bool openFolderPath(const QString &path, const QString &scriptToKeep = QString())
+    {
+        const QString PREVIOUS_SCRIPT_PATH = currentScriptPath;
+        const QString PREVIOUS_CANONICAL_PATH = QFileInfo(currentScriptPath).canonicalFilePath();
+        QString previousContents = scriptEdit->toPlainText();
+        bool previousModified = scriptEdit->document()->isModified();
+        const bool SWITCHING_FROM_QUICK_MODE = !folderMode;
+        if (SWITCHING_FROM_QUICK_MODE && previousModified) {
+            const auto ANSWER = QMessageBox::warning(
+                this, QStringLiteral("Unsaved changes"),
+                QStringLiteral("Save changes to %1 before opening its folder?")
+                    .arg(currentScriptPath.isEmpty() ? QStringLiteral("the script") : QFileInfo(currentScriptPath).fileName()),
+                QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel, QMessageBox::Save);
+            if (ANSWER == QMessageBox::Cancel)
+                return false;
+            if (ANSWER == QMessageBox::Save) {
+                saveScript();
+                if (scriptEdit->document()->isModified())
+                    return false;
+            }
+            previousContents = scriptEdit->toPlainText();
+            previousModified = scriptEdit->document()->isModified();
+            if (ANSWER == QMessageBox::Discard && !currentScriptPath.isEmpty()) {
+                QFile savedFile(currentScriptPath);
+                if (savedFile.open(QIODevice::ReadOnly | QIODevice::Text))
+                    previousContents = QString::fromUtf8(savedFile.readAll());
+                previousModified = false;
+            }
+        }
+        const QString PREVIOUS_CONTENTS = previousContents;
+        const bool PREVIOUS_MODIFIED = previousModified;
+        const QString ROOT = QFileInfo(path).canonicalFilePath().isEmpty()
+            ? QDir::cleanPath(QFileInfo(path).absoluteFilePath())
+            : QFileInfo(path).canonicalFilePath();
+        if (!QFileInfo(ROOT).isDir()) {
+            QMessageBox::warning(this, QStringLiteral("Could not open folder"),
+                                 QStringLiteral("The selected path is not a folder."));
+            return false;
+        }
+        if (folderMode && ROOT != folderRootPath && !closeFolderMode())
+            return false;
+        if (!folderMode) {
+            quickModeScriptPath = currentScriptPath;
+            quickModeContents = PREVIOUS_CONTENTS;
+            quickModeModified = PREVIOUS_MODIFIED;
+            folderRootPath = ROOT;
+            folderMode = true;
+            activeFolderFilePath.clear();
+            folderFileStates.clear();
+            while (editorTabBar->count() > 0)
+                editorTabBar->removeTab(editorTabBar->count() - 1);
+            editorTabBar->setTabsClosable(true);
+            scriptEdit->clear();
+            scriptEdit->document()->setModified(false);
+            currentScriptPath.clear();
+        }
+        folderRootPath = ROOT;
+        refreshFolderBrowser();
+        folderBrowserDock->setVisible(!debuggerEnabled);
+        if (!debuggerEnabled) {
+            resizeDocks({scriptDock, folderBrowserDock}, {880, 100}, Qt::Horizontal);
+            folderBrowserDock->raise();
+        }
+        if (folderBrowserAction)
+            folderBrowserAction->setEnabled(!debuggerEnabled);
+        if (folderMenuAction)
+            folderMenuAction->setEnabled(!currentScriptPath.isEmpty());
+        if (closeFolderMenuAction)
+            closeFolderMenuAction->setEnabled(true);
+        directoryEdit->setText(ROOT);
+        const QString KEEP_SOURCE = scriptToKeep.isEmpty() ? PREVIOUS_SCRIPT_PATH : scriptToKeep;
+        const QString KEEP_CANONICAL = QFileInfo(KEEP_SOURCE).canonicalFilePath();
+        const QString KEEP = KEEP_CANONICAL.isEmpty() ? QFileInfo(KEEP_SOURCE).absoluteFilePath() : KEEP_CANONICAL;
+        const bool KEEP_PREVIOUS_BUFFER = !KEEP.isEmpty()
+            && (KEEP == PREVIOUS_CANONICAL_PATH
+                || KEEP == QFileInfo(PREVIOUS_SCRIPT_PATH).absoluteFilePath());
+        if (!KEEP.isEmpty() && isInsideFolderRoot(KEEP)) {
+            if (folderFileStates.contains(KEEP)) {
+                if (KEEP_PREVIOUS_BUFFER) {
+                    FolderFileState state = folderFileStates.value(KEEP);
+                    state.contents = PREVIOUS_CONTENTS;
+                    state.modified = PREVIOUS_MODIFIED;
+                    folderFileStates.insert(KEEP, state);
+                }
+                openFolderFile(KEEP);
+            } else {
+                FolderFileState state;
+                QFile file(KEEP);
+                if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
+                    return false;
+                state.contents = QString::fromUtf8(file.readAll());
+                state.modified = false;
+                folderFileStates.insert(KEEP, state);
+                const int TAB = editorTabBar->addTab(QFileInfo(KEEP).fileName());
+                editorTabBar->setTabData(TAB, KEEP);
+                editorTabBar->setTabToolTip(TAB, KEEP);
+                editorTabBar->setCurrentIndex(TAB);
+                switchFolderFile(TAB);
+                applyScriptRunProfile(KEEP);
+            }
+        }
+        editorTabBar->setVisible(true);
+        scriptDock->setVisible(editorTabBar->count() > 0);
+        updateWindowTitle();
+        return true;
+    }
+
+    bool openFolderFile(const QString &path)
+    {
+        if (!folderMode)
+            return false;
+        const QString ABSOLUTE_PATH = QFileInfo(path).canonicalFilePath().isEmpty()
+            ? QFileInfo(path).absoluteFilePath() : QFileInfo(path).canonicalFilePath();
+        if (!isInsideFolderRoot(ABSOLUTE_PATH))
+            return false;
+        int tab = -1;
+        for (int index = 0; index < editorTabBar->count(); ++index) {
+            if (editorTabBar->tabData(index).toString() == ABSOLUTE_PATH) {
+                tab = index;
+                break;
+            }
+        }
+        if (tab < 0) {
+            QFile file(ABSOLUTE_PATH);
+            if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                QMessageBox::warning(this, QStringLiteral("Could not open file"), file.errorString());
+                return false;
+            }
+            FolderFileState state;
+            state.contents = QString::fromUtf8(file.readAll());
+            folderFileStates.insert(ABSOLUTE_PATH, state);
+            tab = editorTabBar->addTab(QFileInfo(ABSOLUTE_PATH).fileName());
+            editorTabBar->setTabData(tab, ABSOLUTE_PATH);
+            editorTabBar->setTabToolTip(tab, ABSOLUTE_PATH);
+        }
+        editorTabBar->setCurrentIndex(tab);
+        switchFolderFile(tab);
+        scriptDock->show();
+        refreshFolderBrowser();
+        return true;
+    }
+
+    void storeActiveFolderFile()
+    {
+        if (!folderMode || activeFolderFilePath.isEmpty() || switchingFolderFile)
+            return;
+        FolderFileState &state = folderFileStates[activeFolderFilePath];
+        state.contents = scriptEdit->toPlainText();
+        state.cursorPosition = scriptEdit->textCursor().position();
+        state.modified = scriptEdit->document()->isModified();
+    }
+
+    void switchFolderFile(int index)
+    {
+        if (!folderMode || switchingFolderFile)
+            return;
+        storeActiveFolderFile();
+        const QString PATH = index >= 0 ? editorTabBar->tabData(index).toString() : QString();
+        switchingFolderFile = true;
+        activeFolderFilePath = PATH;
+        currentScriptPath = PATH;
+        if (PATH.isEmpty()) {
+            scriptEdit->clear();
+            scriptEdit->document()->setModified(false);
+        } else {
+            const FolderFileState state = folderFileStates.value(PATH);
+            scriptEdit->setPlainText(state.contents);
+            scriptEdit->document()->setModified(state.modified);
+            QTextCursor cursor(scriptEdit->document());
+            cursor.setPosition(qBound(0, state.cursorPosition, scriptEdit->document()->characterCount() - 1));
+            scriptEdit->setTextCursor(cursor);
+            applyScriptRunProfile(PATH);
+        }
+        scriptDock->setVisible(!PATH.isEmpty());
+        switchingFolderFile = false;
+        clearOutput();
+        updateWindowTitle();
+        refreshNavigationSymbols();
+        if (diagnosticsList)
+            diagnosticsList->clear();
+        diagnosticDecorations.clear();
+    }
+
+    void updateFolderTabLabel(const QString &path)
+    {
+        if (!folderMode || !editorTabBar)
+            return;
+        storeActiveFolderFile();
+        for (int index = 0; index < editorTabBar->count(); ++index) {
+            if (editorTabBar->tabData(index).toString() == path) {
+                const bool MODIFIED = folderFileStates.value(path).modified;
+                editorTabBar->setTabText(index, (MODIFIED ? QStringLiteral("*") : QString()) + QFileInfo(path).fileName());
+                break;
+            }
+        }
+    }
+
+    bool saveFolderFile(const QString &path)
+    {
+        const auto it = folderFileStates.find(path);
+        if (it == folderFileStates.end())
+            return true;
+        QFile file(path);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)
+            || file.write(it->contents.toUtf8()) < 0) {
+            QMessageBox::warning(this, QStringLiteral("Could not save script"),
+                                 QStringLiteral("Could not write %1.").arg(path));
+            return false;
+        }
+        it->modified = false;
+        if (path == activeFolderFilePath)
+            scriptEdit->document()->setModified(false);
+        updateFolderTabLabel(path);
+        return true;
+    }
+
+    bool confirmCloseFolderFile(const QString &path)
+    {
+        auto it = folderFileStates.find(path);
+        if (it == folderFileStates.end() || !it->modified)
+            return true;
+        const auto ANSWER = QMessageBox::warning(
+            this, QStringLiteral("Unsaved changes"),
+            QStringLiteral("Save changes to %1?").arg(QFileInfo(path).fileName()),
+            QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel, QMessageBox::Save);
+        if (ANSWER == QMessageBox::Cancel)
+            return false;
+        if (ANSWER == QMessageBox::Discard) {
+            QFile file(path);
+            if (file.open(QIODevice::ReadOnly | QIODevice::Text))
+                it->contents = QString::fromUtf8(file.readAll());
+            it->modified = false;
+            return true;
+        }
+        return saveFolderFile(path);
+    }
+
+    void closeFolderFileTab(int index)
+    {
+        if (!folderMode || index < 0 || index >= editorTabBar->count())
+            return;
+        const QString PATH = editorTabBar->tabData(index).toString();
+        storeActiveFolderFile();
+        if (!confirmCloseFolderFile(PATH))
+            return;
+        const bool WAS_ACTIVE = PATH == activeFolderFilePath;
+        folderFileStates.remove(PATH);
+        if (WAS_ACTIVE)
+            activeFolderFilePath.clear();
+        editorTabBar->removeTab(index);
+        if (WAS_ACTIVE) {
+            switchFolderFile(editorTabBar->currentIndex());
+        }
+        if (editorTabBar->count() == 0)
+            scriptDock->hide();
+    }
+
+    bool closeFolderMode()
+    {
+        if (!folderMode)
+            return true;
+        storeActiveFolderFile();
+        const QStringList PATHS = folderFileStates.keys();
+        for (const QString &path : PATHS) {
+            if (!confirmCloseFolderFile(path))
+                return false;
+        }
+        const QString PATH = activeFolderFilePath.isEmpty() ? quickModeScriptPath : activeFolderFilePath;
+        FolderFileState ACTIVE = activeFolderFilePath.isEmpty()
+            ? FolderFileState{quickModeContents, 0, quickModeModified}
+            : folderFileStates.value(activeFolderFilePath);
+        folderMode = false;
+        folderRootPath.clear();
+        activeFolderFilePath.clear();
+        folderFileStates.clear();
+        editorTabBar->setTabsClosable(false);
+        while (editorTabBar->count() > 0)
+            editorTabBar->removeTab(editorTabBar->count() - 1);
+        editorTabBar->addTab(QStringLiteral("Quick Script"));
+        editorTabBar->setTabText(0, PATH.isEmpty() ? QStringLiteral("Quick Script") : QFileInfo(PATH).fileName());
+        editorTabBar->setTabToolTip(0, PATH);
+        editorTabBar->setVisible(true);
+        folderBrowserDock->hide();
+        scriptDock->show();
+        if (folderBrowserAction)
+            folderBrowserAction->setEnabled(false);
+        if (closeFolderMenuAction)
+            closeFolderMenuAction->setEnabled(false);
+        currentScriptPath = PATH;
+        scriptEdit->setPlainText(ACTIVE.contents);
+        scriptEdit->document()->setModified(ACTIVE.modified);
+        quickModeScriptPath.clear();
+        quickModeContents.clear();
+        quickModeModified = false;
+        updateWindowTitle();
+        return true;
     }
 
     void createNewScript()
     {
+        if (folderMode) {
+            createNewScriptInFolder(folderRootPath);
+            return;
+        }
         if (process.state() != QProcess::NotRunning || !confirmReplaceDocument(true))
             return;
         clearOutput();
         currentScriptPath.clear();
         scriptEdit->clear();
         scriptEdit->document()->setModified(false);
+        if (editorTabBar && editorTabBar->count() > 0) {
+            editorTabBar->setTabText(0, QStringLiteral("Quick Script"));
+            editorTabBar->setTabToolTip(0, QString());
+        }
         recoveryTimer.stop();
         clearRecoveryDraft();
         updateWindowTitle();
         scriptEdit->setFocus();
+    }
+
+    void createNewScriptInFolder(const QString &directory)
+    {
+        QDialog dialog(this);
+        dialog.setWindowTitle(QStringLiteral("New Script"));
+        auto *layout = new QVBoxLayout(&dialog);
+        auto *form = new QFormLayout;
+        auto *nameEdit = new QLineEdit(&dialog);
+        nameEdit->setPlaceholderText(QStringLiteral("script.sh"));
+        auto *quickScriptCombo = new QComboBox(&dialog);
+        quickScriptCombo->addItem(QStringLiteral("Blank Script"));
+
+        QDir().mkpath(quickSaveDirectory());
+        const QFileInfoList savedScripts = QDir(quickSaveDirectory()).entryInfoList(
+            {QStringLiteral("*.sh")}, QDir::Files, QDir::Name);
+        for (const QFileInfo &info : savedScripts) {
+            if (info.absoluteFilePath() == latestDraftPath())
+                continue;
+            QFile file(info.absoluteFilePath());
+            if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
+                continue;
+            quickScriptCombo->addItem(info.completeBaseName(), QString::fromUtf8(file.readAll()));
+        }
+        for (const auto &script : builtInQuickScripts())
+            quickScriptCombo->addItem(script.first, script.second);
+
+        form->addRow(QStringLiteral("File name:"), nameEdit);
+        form->addRow(QStringLiteral("Start from quickscript:"), quickScriptCombo);
+        layout->addLayout(form);
+        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel, &dialog);
+        connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+        connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+        layout->addWidget(buttons);
+        nameEdit->setFocus();
+        if (dialog.exec() != QDialog::Accepted)
+            return;
+
+        QString name = nameEdit->text().trimmed();
+        if (name.isEmpty()) {
+            QMessageBox::warning(this, QStringLiteral("Name required"), QStringLiteral("Enter a script file name."));
+            return;
+        }
+        if (!name.endsWith(QStringLiteral(".sh"), Qt::CaseInsensitive))
+            name += QStringLiteral(".sh");
+        if (!validFolderEntryName(name)) {
+            QMessageBox::warning(this, QStringLiteral("Invalid name"),
+                                 QStringLiteral("Enter a file name without a directory path."));
+            return;
+        }
+        const QString path = QDir(directory).filePath(name);
+        QFile file(path);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::NewOnly)) {
+            QMessageBox::warning(this, QStringLiteral("Could not create script"), file.errorString());
+            return;
+        }
+        QByteArray contents = quickScriptCombo->currentData().toString().toUtf8();
+        if (file.write(contents) != contents.size()) {
+            const QString error = file.errorString();
+            file.close();
+            QFile::remove(path);
+            QMessageBox::warning(this, QStringLiteral("Could not create script"), error);
+            return;
+        }
+        file.close();
+        QFile::setPermissions(path, QFile::permissions(path) | QFile::ExeOwner | QFile::ExeGroup | QFile::ExeOther);
+        refreshFolderBrowser();
+        openFolderFile(path);
     }
 
     void placeCaretAtEndOfFirstLine()
@@ -1850,6 +3046,13 @@ private:
 
     bool openScriptPath(const QString &path, bool confirmReplace)
     {
+        if (folderMode) {
+            const QString ABSOLUTE_PATH = QFileInfo(path).absoluteFilePath();
+            if (isInsideFolderRoot(ABSOLUTE_PATH))
+                return openFolderFile(ABSOLUTE_PATH);
+            if (!closeFolderMode())
+                return false;
+        }
         QFile file(path);
         if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
             QMessageBox::warning(this, QStringLiteral("Could not open script"),
@@ -1861,6 +3064,10 @@ private:
             return false;
         clearOutput();
         currentScriptPath = QFileInfo(path).absoluteFilePath();
+        if (editorTabBar && editorTabBar->count() > 0) {
+            editorTabBar->setTabText(0, QFileInfo(currentScriptPath).fileName());
+            editorTabBar->setTabToolTip(0, currentScriptPath);
+        }
         applyScriptRunProfile(currentScriptPath);
         scriptEdit->setPlainText(CONTENT);
         placeCaretAtEndOfFirstLine();
@@ -1881,6 +3088,10 @@ private:
         if (scriptEdit && scriptEdit->document()->isModified())
             title.prepend(QLatin1Char('*'));
         setWindowTitle(title);
+        if (folderMenuAction)
+            folderMenuAction->setEnabled(!currentScriptPath.isEmpty());
+        if (folderMode && !activeFolderFilePath.isEmpty())
+            updateFolderTabLabel(activeFolderFilePath);
     }
 
     bool confirmReplaceDocument(bool openingAnotherScript = false)
@@ -2209,18 +3420,60 @@ df -ih
             latestDraftSnapshot = QString::fromUtf8(CONTENT);
     }
 
+    void applyDiagnosticDecorations()
+    {
+        QVector<ShellScratchpad::CodeEditor::TextDecoration> decorations = diagnosticDecorations;
+        decorations += runtimeDiagnosticDecorations;
+        scriptEdit->setTextDecorations(decorations);
+    }
+
+    void removeNonRuntimeDiagnostics()
+    {
+        for (int row = diagnosticsList->count() - 1; row >= 0; --row) {
+            QListWidgetItem *item = diagnosticsList->item(row);
+            if (item->data(Qt::UserRole + 5).toString() != QLatin1String("runtime"))
+                delete diagnosticsList->takeItem(row);
+        }
+    }
+
+    void clearRuntimeDiagnostics()
+    {
+        for (int row = diagnosticsList->count() - 1; row >= 0; --row) {
+            QListWidgetItem *item = diagnosticsList->item(row);
+            if (item->data(Qt::UserRole + 5).toString() == QLatin1String("runtime"))
+                delete diagnosticsList->takeItem(row);
+        }
+        runtimeDiagnosticDecorations.clear();
+        applyDiagnosticDecorations();
+    }
+
+    void acknowledgeRuntimeErrors()
+    {
+        clearRuntimeDiagnostics();
+        if (diagnosticsList->count() > 0) {
+            outputDock->hide();
+            diagnosticsDock->show();
+            diagnosticsDock->raise();
+        } else {
+            diagnosticsDock->hide();
+        }
+    }
+
     void startShellCheck()
     {
         const QString EXECUTABLE = QStandardPaths::findExecutable(QStringLiteral("shellcheck"));
         if (EXECUTABLE.isEmpty()) {
-            diagnosticsList->clear();
+            removeNonRuntimeDiagnostics();
             auto *item = new QListWidgetItem(
                 QStringLiteral("ShellCheck is not installed; script checks are unavailable."), diagnosticsList);
             item->setForeground(QColor(QStringLiteral("#d6a84f")));
             QVector<ShellScratchpad::CodeEditor::TextDecoration> decorations;
             appendFuzzyVariableDiagnostics(decorations);
-            scriptEdit->setTextDecorations(decorations);
+            diagnosticDecorations = decorations;
+            applyDiagnosticDecorations();
+            outputDock->hide();
             diagnosticsDock->show();
+            diagnosticsDock->raise();
             shellCheckCurrent = true;
             if (runAfterShellCheck) {
                 runAfterShellCheck = false;
@@ -2236,8 +3489,11 @@ df -ih
         shellCheckPending = false;
         activeShellCheckScript = scriptEdit->toPlainText();
         activeShellCheckGeneration = shellCheckGeneration;
+        const QFileInfo SHELLCHECK_DIRECTORY(expandedWorkingDirectory());
+        shellCheckProcess.setWorkingDirectory(SHELLCHECK_DIRECTORY.exists() && SHELLCHECK_DIRECTORY.isDir()
+            ? SHELLCHECK_DIRECTORY.absoluteFilePath() : QDir::currentPath());
         shellCheckProcess.start(EXECUTABLE,
-            {QStringLiteral("-f"), QStringLiteral("json"), QStringLiteral("-s"),
+            {QStringLiteral("-x"), QStringLiteral("-f"), QStringLiteral("json"), QStringLiteral("-s"),
              QStringLiteral("bash"), QStringLiteral("-")});
     }
 
@@ -2247,7 +3503,7 @@ df -ih
             return;
         shellCheckCurrent = true;
         const QJsonDocument DOCUMENT = QJsonDocument::fromJson(shellCheckProcess.readAllStandardOutput());
-        diagnosticsList->clear();
+        removeNonRuntimeDiagnostics();
         QVector<ShellScratchpad::CodeEditor::TextDecoration> decorations;
         if (DOCUMENT.isArray()) {
             for (const QJsonValue &value : DOCUMENT.array()) {
@@ -2302,13 +3558,22 @@ df -ih
             }
         }
         appendFuzzyVariableDiagnostics(decorations);
-        scriptEdit->setTextDecorations(decorations);
+        diagnosticDecorations = decorations;
+        applyDiagnosticDecorations();
         if (diagnosticsList->count() == 0) {
+            outputDock->hide();
             diagnosticsDock->hide();
             statusBar()->showMessage(QStringLiteral("ShellCheck: no issues found"), 3000);
         } else {
+            outputDock->hide();
             diagnosticsDock->show();
-            statusBar()->showMessage(QStringLiteral("ShellCheck found %1 issue(s)").arg(diagnosticsList->count()), 4000);
+            diagnosticsDock->raise();
+            int shellCheckIssueCount = 0;
+            for (int row = 0; row < diagnosticsList->count(); ++row)
+                if (diagnosticsList->item(row)->data(Qt::UserRole + 5).toString() != QLatin1String("runtime"))
+                    ++shellCheckIssueCount;
+            statusBar()->showMessage(QStringLiteral("Diagnostics: %1 ShellCheck issue(s), %2 runtime error(s)")
+                .arg(shellCheckIssueCount).arg(diagnosticsList->count() - shellCheckIssueCount), 4000);
         }
         if (runAfterShellCheck) {
             runPendingScriptAfterShellCheck();
@@ -2345,7 +3610,7 @@ df -ih
                  QStringLiteral("OPTARG"), QStringLiteral("OPTIND"), QStringLiteral("OSTYPE"),
                  QStringLiteral("PPID"), QStringLiteral("PWD"), QStringLiteral("RANDOM"),
                  QStringLiteral("SECONDS"), QStringLiteral("SHELLOPTS"), QStringLiteral("SHLVL"),
-                 QStringLiteral("UID")})
+                 QStringLiteral("UID"), QStringLiteral("ID")})
             addCandidate(name);
 
         const QVector<ShellScratchpad::Syntax::SyntaxToken> tokens =
@@ -2419,10 +3684,12 @@ df -ih
             }
             if (activeShellCheckGeneration != shellCheckGeneration)
                 return;
-            diagnosticsList->clear();
+            removeNonRuntimeDiagnostics();
             auto *item = new QListWidgetItem(QStringLiteral("ShellCheck could not be started."), diagnosticsList);
             item->setForeground(QColor(QStringLiteral("#d6a84f")));
+            outputDock->hide();
             diagnosticsDock->show();
+            diagnosticsDock->raise();
             shellCheckCurrent = true;
             if (runAfterShellCheck) {
                 runAfterShellCheck = false;
@@ -2715,6 +3982,23 @@ df -ih
 
         statusBar()->showMessage(QStringLiteral("Saved executable script: %1").arg(path), 5000);
         currentScriptPath = QFileInfo(path).absoluteFilePath();
+        if (folderMode && isInsideFolderRoot(currentScriptPath)) {
+            if (!folderFileStates.contains(currentScriptPath)) {
+                FolderFileState state;
+                state.contents = scriptEdit->toPlainText();
+                folderFileStates.insert(currentScriptPath, state);
+                const int TAB = editorTabBar->addTab(QFileInfo(currentScriptPath).fileName());
+                editorTabBar->setTabData(TAB, currentScriptPath);
+                editorTabBar->setTabToolTip(TAB, currentScriptPath);
+                editorTabBar->setCurrentIndex(TAB);
+                activeFolderFilePath = currentScriptPath;
+            }
+            FolderFileState &state = folderFileStates[currentScriptPath];
+            state.contents = scriptEdit->toPlainText();
+            state.modified = false;
+        }
+        if (folderMode)
+            refreshFolderBrowser();
         saveScriptRunProfile(runProfileCombo->currentIndex() > 0 ? runProfileCombo->currentText() : QString());
         scriptEdit->document()->setModified(false);
         recoveryTimer.stop();
@@ -2863,6 +4147,8 @@ df -ih
         for (auto it = OVERRIDES.begin(); it != OVERRIDES.end(); ++it)
             names.append(it.key());
         completionController->setProfileEnvironmentVariables(names);
+        if (immediateCompletionController)
+            immediateCompletionController->setProfileEnvironmentVariables(names);
         refreshNavigationSymbols();
     }
 
@@ -2870,6 +4156,11 @@ df -ih
     {
         if (!scriptEdit || !completionController)
             return;
+        const QString workingDirectory = QFileInfo(expandedWorkingDirectory()).absoluteFilePath();
+        completionController->setSourcedScriptSymbols(findSourcedScriptSymbols(
+            currentScriptPath, scriptEdit->toPlainText(), workingDirectory));
+        if (immediateCompletionController)
+            immediateCompletionController->setAdditionalScriptSymbols(completionController->scriptSymbols());
         QVector<ShellScratchpad::CodeEditor::NavigationSymbol> symbols;
         const QJsonObject PROFILE = selectedRunProfile();
         const QJsonObject OVERRIDES = PROFILE.value(QStringLiteral("environment")).toObject();
@@ -2881,7 +4172,7 @@ df -ih
                 return entry.name == symbol.name;
             });
             if (!PROFILE_SHADOWS_SYMBOL && !ALREADY_ADDED)
-                symbols.append({symbol.name, symbol.declarationOffset, false});
+                symbols.append({symbol.name, symbol.sourcePath.isEmpty() ? symbol.declarationOffset : -1, false});
         }
         scriptEdit->setNavigationSymbols(symbols);
     }
@@ -3192,9 +4483,13 @@ df -ih
     {
         if (!debuggerEnabled || !debuggerPaused || debuggerSocketDescriptor < 0 || !immediateInputEdit)
             return;
-        const QString EXPRESSION = immediateInputEdit->text();
+        QString EXPRESSION = immediateInputEdit->toPlainText().trimmed();
         if (EXPRESSION.trimmed().isEmpty())
             return;
+        static const QRegularExpression VARIABLE_EXPRESSION(
+            QStringLiteral(R"(^\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})$)"));
+        if (VARIABLE_EXPRESSION.match(EXPRESSION).hasMatch())
+            EXPRESSION.prepend(QStringLiteral("echo "));
         const QByteArray ENCODED = EXPRESSION.toUtf8().toBase64(QByteArray::Base64Encoding);
         const QByteArray MESSAGE = QByteArray("e:") + ENCODED + '\n';
         const ssize_t WRITTEN = ::send(debuggerSocketDescriptor, MESSAGE.constData(),
@@ -3204,10 +4499,27 @@ df -ih
             return;
         }
         pendingImmediateExpression = EXPRESSION;
+        immediateCommandHistory.append(EXPRESSION);
+        if (immediateHistoryList) {
+            immediateHistoryList->addItem(EXPRESSION);
+            immediateHistoryList->scrollToBottom();
+        }
+        immediateHistoryIndex = -1;
+        immediateHistoryDraft.clear();
         immediateOutputEdit->appendPlainText(QStringLiteral("> %1").arg(EXPRESSION));
         immediateInputEdit->clear();
         immediateInputEdit->setEnabled(false);
         immediateRunButton->setEnabled(false);
+    }
+
+    void loadImmediateHistoryEntry(const QString &entry)
+    {
+        if (!immediateInputEdit)
+            return;
+        loadingImmediateHistory = true;
+        immediateInputEdit->setPlainText(entry);
+        immediateInputEdit->moveCursor(QTextCursor::End);
+        loadingImmediateHistory = false;
     }
 
     void refreshDebuggerVariableTree()
@@ -3282,6 +4594,13 @@ df -ih
     void updateDebuggerActions()
     {
         const bool PAUSED = debuggerEnabled && debuggerPaused;
+        if (variablesDockAction) variablesDockAction->setEnabled(debuggerEnabled);
+        if (immediateDockAction) immediateDockAction->setEnabled(debuggerEnabled);
+        if (folderBrowserAction) folderBrowserAction->setEnabled(folderMode && !debuggerEnabled);
+        if (!debuggerEnabled) {
+            variablesDock->hide();
+            immediateDock->hide();
+        }
         if (debugContinueAction) debugContinueAction->setEnabled(PAUSED);
         if (debugStepOverAction) debugStepOverAction->setEnabled(PAUSED);
         if (debugStepInAction) debugStepInAction->setEnabled(PAUSED);
@@ -3325,6 +4644,8 @@ df -ih
                 refreshDebuggerVariableTree();
                 if (completionController)
                     completionController->setRuntimeVariables({});
+                if (immediateCompletionController)
+                    immediateCompletionController->setRuntimeVariables({});
                 const QTextBlock currentBlock = scriptEdit->document()->findBlockByNumber(LINE - 1);
                 if (currentBlock.isValid()) {
                     scriptEdit->revealPosition(currentBlock.position());
@@ -3353,6 +4674,8 @@ df -ih
             } else if (FIELDS[0] == "R") {
                 if (completionController)
                     completionController->setRuntimeVariables(debuggerVariables);
+                if (immediateCompletionController)
+                    immediateCompletionController->setRuntimeVariables(debuggerVariables);
                 refreshDebuggerVariableTree();
                 if (!pendingImmediateExpression.isEmpty()) {
                     pendingImmediateExpression.clear();
@@ -3365,7 +4688,8 @@ df -ih
                 if (display.isEmpty())
                     display = QStringLiteral("(no output)");
                 immediateOutputEdit->appendPlainText(display);
-                immediateOutputEdit->appendPlainText(QStringLiteral("[exit status: %1]").arg(EXIT_CODE));
+                if (EXIT_CODE != 0)
+                    immediateOutputEdit->appendPlainText(QStringLiteral("[exit status: %1]").arg(EXIT_CODE));
             }
         }
     }
@@ -3535,6 +4859,7 @@ df -ih
         }
 
         QString sourceText = scriptEdit->toPlainText();
+        currentRunSourceText = sourceText;
         int selectedStartLine = 1;
         if (selectionOnly) {
             const QTextCursor CURSOR = scriptEdit->textCursor();
@@ -3561,9 +4886,13 @@ df -ih
         debuggerVariables.clear();
         pendingImmediateExpression.clear();
         debuggerBanner->setVisible(DEBUGGING_ENABLED);
+        folderBrowserDock->setVisible(folderMode && !DEBUGGING_ENABLED);
+        variablesDock->setVisible(DEBUGGING_ENABLED);
+        immediateDock->setVisible(DEBUGGING_ENABLED);
         variablesPanel->setVisible(DEBUGGING_ENABLED);
         immediatePanel->setVisible(DEBUGGING_ENABLED);
         if (DEBUGGING_ENABLED) {
+            resizeDocks({immediateDock, variablesDock}, {340, 480}, Qt::Horizontal);
             debuggerBanner->setText(QStringLiteral("DEBUG MODE — running until the next breakpoint"));
             debuggerBanner->setStyleSheet(QStringLiteral("QLabel { background: #805c12; color: white; font-weight: bold; padding: 6px; border-radius: 3px; }"));
             immediateOutputEdit->clear();
@@ -3571,6 +4900,8 @@ df -ih
         refreshDebuggerVariableTree();
         if (completionController)
             completionController->setRuntimeVariables({});
+        if (immediateCompletionController)
+            immediateCompletionController->setRuntimeVariables({});
         updateDebuggerActions();
         scriptEdit->setReadOnly(DEBUGGING_ENABLED);
         if (toggleBreakpointAction)
@@ -3578,7 +4909,7 @@ df -ih
         const QByteArray RUNTIME_SCRIPT = buildRuntimeScript(
             sourceText.toUtf8(), guiSudoPromptsAction->isChecked(),
             reuseSudoPasswordAction->isChecked(), CAPTURE_HISTORY, DEBUGGING_ENABLED,
-            BREAKPOINTS, selectedStartLine - 1, forceDebug);
+            BREAKPOINTS, selectedStartLine - 1, forceDebug, &currentRunUserScriptStartLine);
         currentHistoryLineOffset = selectionOnly ? selectedStartLine - 1 : 0;
         scriptFileDescriptor = createAnonymousScriptFile(RUNTIME_SCRIPT);
         if (scriptFileDescriptor < 0) {
@@ -3598,7 +4929,12 @@ df -ih
         if (clearOutputEachRunAction->isChecked()) {
             clearOutput();
         }
+        clearRuntimeDiagnostics();
+        outputDock->show();
+        outputDock->raise();
+        resizeDocks({outputDock}, {150}, Qt::Vertical);
         pendingOutput.clear();
+        runDiagnosticOutput.clear();
 
         process.setWorkingDirectory(DIRECTORY_INFO.absoluteFilePath());
         QProcessEnvironment runEnvironment = QProcessEnvironment::systemEnvironment();
@@ -3606,6 +4942,7 @@ df -ih
         const QJsonObject OVERRIDES = PROFILE.value(QStringLiteral("environment")).toObject();
         for (auto it = OVERRIDES.begin(); it != OVERRIDES.end(); ++it)
             runEnvironment.insert(it.key(), it.value().toString());
+        runEnvironment.insert(QStringLiteral("PWD"), DIRECTORY_INFO.absoluteFilePath());
         process.setProcessEnvironment(runEnvironment);
         process.setProgram(QStringLiteral("/bin/bash"));
         process.setArguments({QStringLiteral("--noprofile"), QStringLiteral("--norc"),
@@ -3838,7 +5175,12 @@ df -ih
 
     void processOutputAvailable()
     {
-        pendingOutput.append(process.readAllStandardOutput());
+        const QByteArray OUTPUT = process.readAllStandardOutput();
+        constexpr qsizetype MAX_CAPTURE_SIZE = 1024 * 1024;
+        runDiagnosticOutput.append(OUTPUT);
+        if (runDiagnosticOutput.size() > MAX_CAPTURE_SIZE)
+            runDiagnosticOutput.remove(0, runDiagnosticOutput.size() - MAX_CAPTURE_SIZE);
+        pendingOutput.append(OUTPUT);
 
         while (true) {
             const qsizetype MARKER_START = pendingOutput.indexOf(INPUT_MARKER_PREFIX);
@@ -3889,6 +5231,86 @@ df -ih
                 handleInputRequest(QString::fromLatin1(REQUEST_TYPE), PROMPT_TEXT, false);
             }
         }
+    }
+
+    void appendPostRunDiagnostics(int exitCode)
+    {
+        if (currentRunSourceText != scriptEdit->toPlainText())
+            return;
+        const QString output = QString::fromLocal8Bit(runDiagnosticOutput);
+        static const QRegularExpression BASH_LINE_ERROR(
+            QStringLiteral(R"((?:/dev/fd/\d+|bash): line (\d+): (.+))"));
+        QSet<QString> reported;
+        for (const QString &outputLine : output.split(QLatin1Char('\n'))) {
+            const auto match = BASH_LINE_ERROR.match(outputLine.trimmed());
+            if (!match.hasMatch())
+                continue;
+            bool validLine = false;
+            const int runtimeLine = match.captured(1).toInt(&validLine);
+            if (!validLine)
+                continue;
+            const int sourceLine = runtimeLine - currentRunUserScriptStartLine + 1 + currentHistoryLineOffset;
+            const QTextBlock block = scriptEdit->document()->findBlockByNumber(sourceLine - 1);
+            if (sourceLine < 1 || !block.isValid())
+                continue;
+            const QString message = QStringLiteral("%1 (run exited with code %2)")
+                .arg(match.captured(2).trimmed()).arg(exitCode);
+            const QString uniqueKey = QStringLiteral("%1:%2").arg(sourceLine).arg(message);
+            if (reported.contains(uniqueKey))
+                continue;
+            reported.insert(uniqueKey);
+
+            auto *item = new QListWidgetItem(
+                QStringLiteral("ERROR  Runtime  Line %1:1 — %2").arg(sourceLine).arg(message), diagnosticsList);
+            item->setData(Qt::UserRole, sourceLine);
+            item->setData(Qt::UserRole + 1, 0);
+            item->setData(Qt::UserRole + 2, 1);
+            item->setData(Qt::UserRole + 3, QStringLiteral("error"));
+            item->setData(Qt::UserRole + 4, message);
+            item->setData(Qt::UserRole + 5, QStringLiteral("runtime"));
+            item->setForeground(QColor(QStringLiteral("#e06c75")));
+
+            const qsizetype start = block.position();
+            const qsizetype length = qMax(1, block.text().size());
+            QTextCharFormat format;
+            format.setUnderlineStyle(QTextCharFormat::WaveUnderline);
+            format.setUnderlineColor(QColor(QStringLiteral("#ef5350")));
+            runtimeDiagnosticDecorations.append({start, length, format});
+        }
+        if (reported.isEmpty() && !runHistorySourceLines.isEmpty()) {
+            const int sourceLine = runHistorySourceLines.constLast();
+            const QTextBlock block = scriptEdit->document()->findBlockByNumber(sourceLine - 1);
+            if (sourceLine > 0 && block.isValid()) {
+                const QString command = runHistoryEntries.isEmpty()
+                    ? QStringLiteral("(command unavailable)") : runHistoryEntries.constLast();
+                const QString message = QStringLiteral(
+                    "Bash exited with code %1 without reporting a line; last traced command: %2")
+                    .arg(exitCode).arg(command);
+                auto *item = new QListWidgetItem(
+                    QStringLiteral("ERROR  Runtime  Line %1:1 — %2").arg(sourceLine).arg(message), diagnosticsList);
+                item->setData(Qt::UserRole, sourceLine);
+                item->setData(Qt::UserRole + 1, 0);
+                item->setData(Qt::UserRole + 2, 1);
+                item->setData(Qt::UserRole + 3, QStringLiteral("error"));
+                item->setData(Qt::UserRole + 4, message);
+                item->setData(Qt::UserRole + 5, QStringLiteral("runtime"));
+                item->setForeground(QColor(QStringLiteral("#e06c75")));
+                QTextCharFormat format;
+                format.setUnderlineStyle(QTextCharFormat::WaveUnderline);
+                format.setUnderlineColor(QColor(QStringLiteral("#ef5350")));
+                runtimeDiagnosticDecorations.append({block.position(), qMax(1, block.text().size()), format});
+                reported.insert(QStringLiteral("inferred"));
+            }
+        }
+        if (reported.isEmpty())
+            return;
+        applyDiagnosticDecorations();
+        outputDock->show();
+        resizeDocks({outputDock}, {150}, Qt::Vertical);
+        diagnosticsDock->show();
+        diagnosticsDock->raise();
+        diagnosticsList->scrollToBottom();
+        statusBar()->showMessage(QStringLiteral("Runtime error locations: %1").arg(reported.size()), 5000);
     }
 
     QString latestOutputLine() const
@@ -4056,6 +5478,10 @@ int main(int argc, char *argv[])
         QStringLiteral("Set the initial working directory for scripts."),
         QStringLiteral("directory"));
     parser.addOption(workingDirectoryOption);
+    QCommandLineOption openFolderOption(
+        QStringLiteral("open-folder"), QStringLiteral("Open the selected directory in folder mode."),
+        QStringLiteral("directory"));
+    parser.addOption(openFolderOption);
     parser.addPositionalArgument(QStringLiteral("script"),
                                  QStringLiteral("Open a Bash script file."));
     parser.process(application);
@@ -4066,8 +5492,9 @@ int main(int argc, char *argv[])
 
     QString initialWorkingDirectory = parser.value(workingDirectoryOption).trimmed();
     if (initialWorkingDirectory.isEmpty()) {
-        initialWorkingDirectory = INITIAL_SCRIPT_PATH.isEmpty()
-            ? QDir::homePath() : QFileInfo(INITIAL_SCRIPT_PATH).absolutePath();
+        initialWorkingDirectory = parser.isSet(openFolderOption)
+            ? parser.value(openFolderOption).trimmed()
+            : (INITIAL_SCRIPT_PATH.isEmpty() ? QDir::homePath() : QFileInfo(INITIAL_SCRIPT_PATH).absolutePath());
     } else {
         if (initialWorkingDirectory == QStringLiteral("~")) {
             initialWorkingDirectory = QDir::homePath();
@@ -4080,6 +5507,8 @@ int main(int argc, char *argv[])
     }
 
     auto *window = new ShellScratchpadWindow(initialWorkingDirectory, INITIAL_SCRIPT_PATH, true);
+    if (parser.isSet(openFolderOption))
+        window->openFolderOnStartup(parser.value(openFolderOption));
     window->show();
     return application.exec();
 }
