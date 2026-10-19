@@ -7,6 +7,7 @@ BUILD_DIR="${PROJECT_DIR}/build"
 INSTALL_PREFIX="${HOME}/.local"
 INSTALL_APP=1
 IN_DISTROBOX=0
+UNINSTALL_APP=0
 QT_MIN_VERSION=6.12.0
 QT_PREFIX=""
 
@@ -14,8 +15,9 @@ for argument in "$@"; do
     case "${argument}" in
         --build-only) INSTALL_APP=0 ;;
         --in-distrobox) IN_DISTROBOX=1 ;;
+        --uninstall) UNINSTALL_APP=1 ;;
         *)
-            printf 'Usage: %s [--build-only] [--in-distrobox]\n' "$0" >&2
+            printf 'Usage: %s [--build-only] [--in-distrobox] [--uninstall]\n' "$0" >&2
             exit 2
             ;;
     esac
@@ -30,8 +32,54 @@ fail() {
     exit 1
 }
 
+uninstall_app() {
+    say "Uninstalling ${APP_NAME} from ${INSTALL_PREFIX}"
+    rm -f -- \
+        "${INSTALL_PREFIX}/bin/shell-scratchpad" \
+        "${INSTALL_PREFIX}/bin/shell-scratchpad-launcher" \
+        "${INSTALL_PREFIX}/bin/shell-scratchpad-steamos" \
+        "${INSTALL_PREFIX}/share/applications/org.winterrose.shellscratchpad.desktop" \
+        "${INSTALL_PREFIX}/share/kio/servicemenus/org.winterrose.shellscratchpad-servicemenu.desktop" \
+        "${INSTALL_PREFIX}/share/kio/servicemenus/org.winterrose.shellscratchpad-script-servicemenu.desktop" \
+        "${INSTALL_PREFIX}/share/icons/hicolor/scalable/apps/shell-scratchpad.svg"
+    if command -v update-desktop-database >/dev/null 2>&1 \
+        && [[ -d "${INSTALL_PREFIX}/share/applications" ]]; then
+        update-desktop-database "${INSTALL_PREFIX}/share/applications" >/dev/null 2>&1 || true
+    fi
+    rmdir --ignore-fail-on-non-empty \
+        "${INSTALL_PREFIX}/share/applications" \
+        "${INSTALL_PREFIX}/share/kio/servicemenus" \
+        "${INSTALL_PREFIX}/share/kio" \
+        "${INSTALL_PREFIX}/share/icons/hicolor/scalable/apps" \
+        "${INSTALL_PREFIX}/share/icons/hicolor/scalable" \
+        "${INSTALL_PREFIX}/share/icons/hicolor" \
+        "${INSTALL_PREFIX}/bin" 2>/dev/null || true
+    if command -v kbuildsycoca6 >/dev/null 2>&1; then
+        kbuildsycoca6 --noincremental >/dev/null 2>&1 || true
+    fi
+    say "Uninstall complete"
+    printf 'Removed the application, launcher, icon, and Dolphin menu entries.\n'
+    printf 'Build files, downloaded Qt tools, and any Distrobox container were left intact.\n'
+}
+
 if [[ ! -f "${PROJECT_DIR}/CMakeLists.txt" || ! -f "${PROJECT_DIR}/src/main.cpp" ]]; then
     fail "Run setup.sh from the extracted Shell Scratchpad project directory."
+fi
+
+if (( UNINSTALL_APP )); then
+    # SteamOS stores the executable in the Distrobox runtime, while the desktop
+    # launcher and service menus live in the shared home directory.
+    if [[ "${IN_DISTROBOX}" -eq 0 && -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        source /etc/os-release
+        if [[ "${ID:-}" == steamos ]] && command -v distrobox >/dev/null 2>&1 \
+            && distrobox list 2>/dev/null | grep -q 'shell-scratchpad'; then
+            distrobox enter --name shell-scratchpad -- bash -lc \
+                "'${PROJECT_DIR}/setup.sh' --in-distrobox --uninstall" || true
+        fi
+    fi
+    uninstall_app
+    exit 0
 fi
 
 # SteamOS keeps its root filesystem read-only. Build in a user-owned Distrobox

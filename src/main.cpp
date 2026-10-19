@@ -74,6 +74,7 @@
 #include <QTextBlock>
 #include <QTextCharFormat>
 #include <QTextDocument>
+#include <QTemporaryFile>
 #include <QTimer>
 #include <QToolButton>
 #include <QToolTip>
@@ -306,13 +307,13 @@ shell_scratchpad_record_sudo() {
 __sspad_trace_command() {
     local previous_status=$?
     if [[ -z ${SSPAD_USER_SCRIPT_START_LINE+x} ]]; then
-        return "$previous_status"
+        return 0
     fi
     local traced_command="${1-}"
     local source_line=${BASH_LINENO[0]:-0}
     local user_line=$((source_line - SSPAD_USER_SCRIPT_START_LINE + 1))
     builtin printf 'C%s\t%s\0' "$user_line" "$traced_command" >&197
-    return "$previous_status"
+    return 0
 }
 trap '__sspad_trace_command "$BASH_COMMAND"' DEBUG
 )SSPAD");
@@ -334,11 +335,11 @@ set -T
 __sspad_debug() {
     local __sspad_previous_status=$?
     if [[ -z ${SSPAD_USER_SCRIPT_START_LINE+x} ]]; then
-        return "$__sspad_previous_status"
+        return 0
     fi
     local __sspad_source_line=${BASH_LINENO[0]:-${LINENO}}
     if ((__sspad_source_line < SSPAD_USER_SCRIPT_START_LINE)); then
-        return "$__sspad_previous_status"
+        return 0
     fi
     local __sspad_user_line=$((__sspad_source_line - SSPAD_USER_SCRIPT_START_LINE + 1 + __SSPAD_DEBUG_LINE_OFFSET))
     local __sspad_depth=${#FUNCNAME[@]}
@@ -356,6 +357,14 @@ __sspad_debug() {
                 [[ "$__SSPAD_DEBUG_BREAKPOINTS" == *"|${__sspad_user_line}|"* ]] && __sspad_pause=1
             fi
             ;;
+        exitdebug)
+            if ((__SSPAD_DEBUG_SKIP_LINE == __sspad_user_line)); then
+                __SSPAD_DEBUG_SKIP_LINE=0
+            elif [[ "$__SSPAD_DEBUG_BREAKPOINTS" == *"|${__sspad_user_line}|"* ]]; then
+                __SSPAD_DEBUG_MODE=run
+                __sspad_pause=1
+            fi
+            ;;
         step)
             ((__sspad_depth <= __SSPAD_DEBUG_TARGET_DEPTH)) && __sspad_pause=1
             ;;
@@ -366,7 +375,7 @@ __sspad_debug() {
             ((__sspad_depth < __SSPAD_DEBUG_TARGET_DEPTH)) && __sspad_pause=1
             ;;
     esac
-    ((__sspad_pause)) || return "$__sspad_previous_status"
+    ((__sspad_pause)) || return 0
 
     local __sspad_encoded_command
     __sspad_encoded_command="$(builtin printf '%s' "$__sspad_command" | command base64 -w0 2>/dev/null)"
@@ -408,6 +417,11 @@ __sspad_debug() {
                 __SSPAD_DEBUG_SKIP_LINE=$__sspad_user_line
                 break
                 ;;
+            x)
+                __SSPAD_DEBUG_MODE=exitdebug
+                __SSPAD_DEBUG_SKIP_LINE=$__sspad_user_line
+                break
+                ;;
             s)
                 __SSPAD_DEBUG_MODE=step
                 __SSPAD_DEBUG_TARGET_DEPTH=$__sspad_depth
@@ -427,7 +441,7 @@ __sspad_debug() {
                 ;;
         esac
     done
-    return "$__sspad_previous_status"
+    return 0
 }
 trap '__sspad_debug "$BASH_COMMAND"' DEBUG
 )SSPAD");
@@ -477,6 +491,34 @@ int createAnonymousScriptFile(const QByteArray &scriptContents)
     }
 
     return FILE_DESCRIPTOR;
+}
+
+QString createRuntimeScriptFile(const QByteArray &scriptContents, const QString &workingDirectory,
+                                bool *createdInWorkingDirectory)
+{
+    if (createdInWorkingDirectory)
+        *createdInWorkingDirectory = false;
+    QStringList directories{workingDirectory, QDir::tempPath()};
+    directories.removeDuplicates();
+    for (const QString &directory : directories) {
+        QTemporaryFile file(QDir(directory).filePath(QStringLiteral(".shell-scratchpad-XXXXXX.sh")));
+        file.setAutoRemove(false);
+        if (!file.open())
+            continue;
+        if (file.write(scriptContents) != scriptContents.size()) {
+            const QString failedPath = file.fileName();
+            file.close();
+            QFile::remove(failedPath);
+            continue;
+        }
+        file.flush();
+        const QString path = QFileInfo(file.fileName()).absoluteFilePath();
+        file.close();
+        if (createdInWorkingDirectory)
+            *createdInWorkingDirectory = directory == workingDirectory;
+        return path;
+    }
+    return {};
 }
 }
 
@@ -866,6 +908,23 @@ public:
         });
         refreshCompletionProfileVariables();
         scriptLayout->addWidget(debuggerBanner);
+        debuggerControlsPanel = new QWidget(scriptPanel);
+        QWidget *debuggerControls = debuggerControlsPanel;
+        auto *debuggerControlsLayout = new QHBoxLayout(debuggerControls);
+        debuggerControlsLayout->setContentsMargins(0, 0, 0, 0);
+        debuggerContinueButton = new QPushButton(QStringLiteral("Continue"), debuggerControls);
+        debuggerContinueButton->setToolTip(QStringLiteral("Continue until the next breakpoint"));
+        debuggerContinueExitButton = new QPushButton(QStringLiteral("Continue and Exit Debug"), debuggerControls);
+        debuggerContinueExitButton->setToolTip(QStringLiteral("Run freely until the next breakpoint, then resume debugging"));
+        connect(debuggerContinueButton, &QPushButton::clicked, this,
+                [this]() { sendDebuggerCommand('c'); });
+        connect(debuggerContinueExitButton, &QPushButton::clicked, this,
+                [this]() { continueAndExitDebug(); });
+        debuggerControlsLayout->addWidget(debuggerContinueButton);
+        debuggerControlsLayout->addWidget(debuggerContinueExitButton);
+        debuggerControlsLayout->addStretch(1);
+        debuggerControls->hide();
+        scriptLayout->addWidget(debuggerControls);
         scriptSearchRow = new QWidget(scriptPanel);
         auto *scriptSearchLayout = new QHBoxLayout(scriptSearchRow);
         scriptSearchLayout->setContentsMargins(0, 0, 0, 0);
@@ -1184,9 +1243,7 @@ public:
             diagnosticDecorations.clear();
             applyDiagnosticDecorations();
             if (diagnosticsList && diagnosticsList->count() > 0) {
-                outputDock->hide();
-                diagnosticsDock->show();
-                diagnosticsDock->raise();
+                showDiagnosticsDock();
             } else {
                 diagnosticsDock->hide();
                 outputDock->hide();
@@ -1212,10 +1269,17 @@ public:
         diagnosticsDock->setObjectName(QStringLiteral("scriptDiagnosticsDock"));
         diagnosticsDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable |
                                      QDockWidget::DockWidgetClosable);
+        diagnosticsDock->setMinimumSize(0, 0);
+        diagnosticsDock->setMinimumHeight(48);
+        diagnosticsDock->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Ignored);
         auto *diagnosticsContents = new QWidget(diagnosticsDock);
+        diagnosticsContents->setMinimumSize(0, 0);
         auto *diagnosticsLayout = new QVBoxLayout(diagnosticsContents);
         diagnosticsLayout->setContentsMargins(6, 4, 6, 6);
         auto *diagnosticsToolbar = new QHBoxLayout();
+        diagnosticsSummaryLabel = new QLabel(diagnosticsContents);
+        diagnosticsSummaryLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        diagnosticsToolbar->addWidget(diagnosticsSummaryLabel);
         diagnosticsToolbar->addStretch(1);
         auto *acknowledgeRuntimeErrorsButton = new QPushButton(QStringLiteral("Acknowledge"), diagnosticsContents);
         acknowledgeRuntimeErrorsButton->setToolTip(QStringLiteral("Dismiss runtime errors from the previous run."));
@@ -1224,15 +1288,22 @@ public:
         });
         diagnosticsToolbar->addWidget(acknowledgeRuntimeErrorsButton);
         diagnosticsList = new QListWidget(diagnosticsContents);
+        diagnosticsList->setMinimumSize(0, 0);
+        diagnosticsList->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Ignored);
         diagnosticsList->setAlternatingRowColors(true);
         diagnosticsLayout->addLayout(diagnosticsToolbar);
         diagnosticsLayout->addWidget(diagnosticsList, 1);
+        connect(diagnosticsList->model(), &QAbstractItemModel::rowsInserted, this,
+                [this]() { updateDiagnosticsSummary(); });
+        connect(diagnosticsList->model(), &QAbstractItemModel::rowsRemoved, this,
+                [this]() { updateDiagnosticsSummary(); });
+        updateDiagnosticsSummary();
         diagnosticsDock->setWidget(diagnosticsContents);
         addDockWidget(Qt::BottomDockWidgetArea, diagnosticsDock);
         tabifyDockWidget(outputDock, diagnosticsDock);
         outputDock->hide();
         diagnosticsDock->hide();
-        resizeDocks({outputDock}, {150}, Qt::Vertical);
+        resizeOutputDock(false);
         resizeDocks({immediateDock, variablesDock}, {340, 480}, Qt::Horizontal);
         connect(diagnosticsList, &QListWidget::itemActivated, this, [this](QListWidgetItem *item) {
             const int FIX_START = item->data(Qt::UserRole + 5).toInt();
@@ -1472,6 +1543,7 @@ public:
         connect(&process, &QProcess::started, this, [this]() { closeDebuggerChildSocket(); });
         connect(&process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
                 [this](int exitCode, QProcess::ExitStatus exitStatus) {
+            const bool WAS_DEBUGGING = debuggerEnabled;
             processOutputAvailable();
             readDebuggerSocket();
             readRunHistoryPipe();
@@ -1507,6 +1579,7 @@ public:
             if (toggleBreakpointAction)
                 toggleBreakpointAction->setEnabled(true);
             closeScriptFileDescriptor();
+            cleanupRuntimeScriptFile();
 
             const QString DURATION = QStringLiteral("%1 s").arg(runElapsed.elapsed() / 1000.0, 0, 'f', 1);
             runDurationLabel->setText(DURATION);
@@ -1524,6 +1597,8 @@ public:
             }
             if (!stopRequested && exitStatus == QProcess::NormalExit && exitCode != 0)
                 appendPostRunDiagnostics(exitCode);
+            if (WAS_DEBUGGING && outputDock->isVisible())
+                resizeOutputDock(false);
             stopRequested = false;
         });
         connect(&process, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
@@ -1534,6 +1609,7 @@ public:
                 stopButton->setEnabled(false);
                 directoryEdit->setEnabled(true);
                 closeScriptFileDescriptor();
+                cleanupRuntimeScriptFile();
                 closeRunHistoryPipe();
                 closeDebuggerSocket();
                 debuggerEnabled = false;
@@ -1636,9 +1712,24 @@ public:
         outputFilterGeneration->fetch_add(1, std::memory_order_relaxed);
         shellCheckTimer.stop();
         latestDraftTimer.stop();
-        shellCheckProcess.kill();
+        recoveryTimer.stop();
+        promptTimer.stop();
+        killTimer.stop();
+        QObject::disconnect(&process, nullptr, this, nullptr);
+        QObject::disconnect(&shellCheckProcess, nullptr, this, nullptr);
+        if (process.state() != QProcess::NotRunning) {
+            terminateProcessGroup();
+            process.kill();
+            process.waitForFinished(1500);
+        }
+        if (shellCheckProcess.state() != QProcess::NotRunning) {
+            shellCheckProcess.kill();
+            shellCheckProcess.waitForFinished(1500);
+        }
+        outputFilterPool.waitForDone();
         closeRunHistoryPipe();
         closeDebuggerSocket();
+        cleanupRuntimeScriptFile();
         openScratchpadWindows().removeAll(this);
     }
 
@@ -1785,6 +1876,7 @@ protected:
         writeLatestDraft();
         clearRecoveryDraft();
         closeScriptFileDescriptor();
+        cleanupRuntimeScriptFile();
         event->accept();
     }
 
@@ -1827,6 +1919,7 @@ private:
     QHash<QString, FolderFileState> folderFileStates;
     QWidget *variablesPanel = nullptr;
     QLabel *debuggerBanner = nullptr;
+    QWidget *debuggerControlsPanel = nullptr;
     QLineEdit *variablesFilter = nullptr;
     QTreeWidget *variablesTree = nullptr;
     QWidget *immediatePanel = nullptr;
@@ -1839,6 +1932,8 @@ private:
     bool loadingImmediateHistory = false;
     QPointer<ShellScratchpad::Completion::CompletionController> immediateCompletionController;
     QPushButton *immediateRunButton = nullptr;
+    QPushButton *debuggerContinueButton = nullptr;
+    QPushButton *debuggerContinueExitButton = nullptr;
     QLineEdit *directoryEdit = nullptr;
     QWidget *executionControlsWidget = nullptr;
     QString defaultWorkingDirectory;
@@ -1847,6 +1942,7 @@ private:
     QAction *guiSudoPromptsAction = nullptr;
     QAction *reuseSudoPasswordAction = nullptr;
     QAction *debugContinueAction = nullptr;
+    QAction *debugContinueExitAction = nullptr;
     QAction *debugStepOverAction = nullptr;
     QAction *debugStepInAction = nullptr;
     QAction *debugStepOutAction = nullptr;
@@ -1873,6 +1969,7 @@ private:
     std::shared_ptr<std::atomic<quint64>> outputFilterGeneration =
         std::make_shared<std::atomic<quint64>>(0);
     int scriptFileDescriptor = -1;
+    QString runtimeScriptPath;
     bool promptDialogOpen = false;
     bool stopRequested = false;
     QString currentScriptPath;
@@ -1899,6 +1996,7 @@ private:
     int runHistoryWriteDescriptor = -1;
     bool runHistoryTruncated = false;
     QDockWidget *diagnosticsDock = nullptr;
+    QLabel *diagnosticsSummaryLabel = nullptr;
     QListWidget *diagnosticsList = nullptr;
     QString activeShellCheckScript;
     QString currentRunSourceText;
@@ -2090,6 +2188,9 @@ private:
         debugContinueAction = scriptMenu->addAction(QStringLiteral("Continue Debugging"));
         debugContinueAction->setShortcut(QKeySequence(Qt::Key_F5));
         connect(debugContinueAction, &QAction::triggered, this, [this]() { sendDebuggerCommand('c'); });
+        debugContinueExitAction = scriptMenu->addAction(QStringLiteral("Continue and Exit Debug"));
+        connect(debugContinueExitAction, &QAction::triggered, this,
+                [this]() { continueAndExitDebug(); });
         debugStepOverAction = scriptMenu->addAction(QStringLiteral("Step Over"));
         debugStepOverAction->setShortcut(QKeySequence(Qt::Key_F10));
         connect(debugStepOverAction, &QAction::triggered, this, [this]() { sendDebuggerCommand('s'); });
@@ -2227,7 +2328,7 @@ private:
                 splitDockWidget(scriptDock, folderBrowserDock, Qt::Horizontal);
                 folderBrowserDock->show();
             }
-            resizeDocks({outputDock}, {150}, Qt::Vertical);
+            resizeOutputDock(false);
             resizeDocks({immediateDock, variablesDock}, {340, 480}, Qt::Horizontal);
         });
         viewMenu->addSeparator();
@@ -3427,6 +3528,30 @@ df -ih
         scriptEdit->setTextDecorations(decorations);
     }
 
+    void updateDiagnosticsSummary()
+    {
+        int errors = 0;
+        int warnings = 0;
+        int info = 0;
+        int runtime = 0;
+        for (int row = 0; row < diagnosticsList->count(); ++row) {
+            const QListWidgetItem *item = diagnosticsList->item(row);
+            if (item->data(Qt::UserRole + 5).toString() == QLatin1String("runtime")) {
+                ++runtime;
+                continue;
+            }
+            const QString severity = item->data(Qt::UserRole + 3).toString().toLower();
+            if (severity == QLatin1String("error"))
+                ++errors;
+            else if (severity == QLatin1String("warning") || severity.isEmpty())
+                ++warnings;
+            else
+                ++info;
+        }
+        diagnosticsSummaryLabel->setText(QStringLiteral("Errors: %1   Warnings: %2   Info: %3   Runtime: %4")
+            .arg(errors).arg(warnings).arg(info).arg(runtime));
+    }
+
     void removeNonRuntimeDiagnostics()
     {
         for (int row = diagnosticsList->count() - 1; row >= 0; --row) {
@@ -3451,12 +3576,41 @@ df -ih
     {
         clearRuntimeDiagnostics();
         if (diagnosticsList->count() > 0) {
-            outputDock->hide();
-            diagnosticsDock->show();
-            diagnosticsDock->raise();
+            showDiagnosticsDock();
         } else {
             diagnosticsDock->hide();
         }
+    }
+
+    void showDiagnosticsDock()
+    {
+        const bool WAS_VISIBLE = diagnosticsDock->isVisible();
+        outputDock->hide();
+        diagnosticsDock->show();
+        diagnosticsDock->raise();
+        if (WAS_VISIBLE)
+            return;
+        if (diagnosticsDock->isFloating()) {
+            diagnosticsDock->resize(diagnosticsDock->width(), 240);
+        } else {
+            QTimer::singleShot(0, this, [this]() {
+                if (diagnosticsDock->isVisible() && !diagnosticsDock->isFloating())
+                    resizeDocks({diagnosticsDock}, {240}, Qt::Vertical);
+            });
+        }
+    }
+
+    void resizeOutputDock(bool debugging)
+    {
+        const int EDITOR_HEIGHT = scriptDock ? scriptDock->height() : 0;
+        const int REFERENCE_HEIGHT = EDITOR_HEIGHT > 0 ? EDITOR_HEIGHT : height() * 2 / 3;
+        const int TARGET_HEIGHT = qMax(120, REFERENCE_HEIGHT / (debugging ? 4 : 2));
+        QTimer::singleShot(0, this, [this, TARGET_HEIGHT]() {
+            if (outputDock->isFloating())
+                outputDock->resize(outputDock->width(), TARGET_HEIGHT);
+            else if (outputDock->isVisible())
+                resizeDocks({outputDock}, {TARGET_HEIGHT}, Qt::Vertical);
+        });
     }
 
     void startShellCheck()
@@ -3471,9 +3625,7 @@ df -ih
             appendFuzzyVariableDiagnostics(decorations);
             diagnosticDecorations = decorations;
             applyDiagnosticDecorations();
-            outputDock->hide();
-            diagnosticsDock->show();
-            diagnosticsDock->raise();
+            showDiagnosticsDock();
             shellCheckCurrent = true;
             if (runAfterShellCheck) {
                 runAfterShellCheck = false;
@@ -3565,9 +3717,7 @@ df -ih
             diagnosticsDock->hide();
             statusBar()->showMessage(QStringLiteral("ShellCheck: no issues found"), 3000);
         } else {
-            outputDock->hide();
-            diagnosticsDock->show();
-            diagnosticsDock->raise();
+            showDiagnosticsDock();
             int shellCheckIssueCount = 0;
             for (int row = 0; row < diagnosticsList->count(); ++row)
                 if (diagnosticsList->item(row)->data(Qt::UserRole + 5).toString() != QLatin1String("runtime"))
@@ -3615,6 +3765,20 @@ df -ih
 
         const QVector<ShellScratchpad::Syntax::SyntaxToken> tokens =
             ShellScratchpad::Syntax::SyntaxTokenizer::tokenize(SOURCE);
+        QStringList loopVariables;
+        QHash<int, QSet<QString>> loopVariablesByLine;
+        const QStringList SOURCE_LINES = SOURCE.split(QLatin1Char('\n'));
+        static const QRegularExpression FOR_VARIABLE(QStringLiteral(R"((?:^|[;\s])for\s+([A-Za-z_][A-Za-z0-9_]*)\s+(?:in\b|;))"));
+        static const QRegularExpression LOOP_DONE(QStringLiteral(R"((?:^|[;\s])done\b)"));
+        for (int lineIndex = 0; lineIndex < SOURCE_LINES.size(); ++lineIndex) {
+            const QString &line = SOURCE_LINES.at(lineIndex);
+            const auto forMatch = FOR_VARIABLE.match(line);
+            if (forMatch.hasMatch())
+                loopVariables.append(forMatch.captured(1));
+            loopVariablesByLine.insert(lineIndex + 1, QSet<QString>(loopVariables.cbegin(), loopVariables.cend()));
+            if (LOOP_DONE.match(line).hasMatch() && !loopVariables.isEmpty())
+                loopVariables.removeLast();
+        }
         static const QRegularExpression VARIABLE_NAME(QStringLiteral(R"(^\$\{?([A-Za-z_][A-Za-z0-9_]*))"));
         for (const auto &token : tokens) {
             if (token.kind != ShellScratchpad::Syntax::TokenKind::Variable)
@@ -3626,8 +3790,23 @@ df -ih
             const QString name = match.captured(1);
             if (knownVariables.contains(name))
                 continue;
+            const QSet<QString> ACTIVE_LOOP_VARIABLES = loopVariablesByLine.value(token.line);
+            if (std::any_of(ACTIVE_LOOP_VARIABLES.cbegin(), ACTIVE_LOOP_VARIABLES.cend(),
+                    [&name](const QString &localName) {
+                        return QString::compare(name, localName, Qt::CaseInsensitive) == 0;
+                    }))
+                continue;
+            QStringList scopedCandidates;
+            for (const QString &candidate : candidates) {
+                const bool shadowedByLoopVariable = std::any_of(ACTIVE_LOOP_VARIABLES.cbegin(),
+                    ACTIVE_LOOP_VARIABLES.cend(), [&candidate](const QString &localName) {
+                        return QString::compare(candidate, localName, Qt::CaseInsensitive) == 0;
+                    });
+                if (!shadowedByLoopVariable)
+                    scopedCandidates.append(candidate);
+            }
             const int maximumDistance = qMin(3, qMax(1, name.size() / 4));
-            const auto matches = ShellScratchpad::Util::fuzzyMatches(name, candidates, maximumDistance, 3);
+            const auto matches = ShellScratchpad::Util::fuzzyMatches(name, scopedCandidates, maximumDistance, 3);
             if (matches.isEmpty() || (matches.size() > 1 && matches.at(0).distance == matches.at(1).distance))
                 continue;
             const QString suggestion = matches.first().candidate;
@@ -3687,9 +3866,7 @@ df -ih
             removeNonRuntimeDiagnostics();
             auto *item = new QListWidgetItem(QStringLiteral("ShellCheck could not be started."), diagnosticsList);
             item->setForeground(QColor(QStringLiteral("#d6a84f")));
-            outputDock->hide();
-            diagnosticsDock->show();
-            diagnosticsDock->raise();
+            showDiagnosticsDock();
             shellCheckCurrent = true;
             if (runAfterShellCheck) {
                 runAfterShellCheck = false;
@@ -4479,6 +4656,22 @@ df -ih
         updateDebuggerActions();
     }
 
+    void continueAndExitDebug()
+    {
+        if (!debuggerEnabled || !debuggerPaused || debuggerSocketDescriptor < 0)
+            return;
+        sendDebuggerCommand('x');
+        debuggerEnabled = false;
+        scriptEdit->setReadOnly(false);
+        debuggerBanner->hide();
+        folderBrowserDock->setVisible(folderMode);
+        variablesDock->hide();
+        immediateDock->hide();
+        resizeOutputDock(false);
+        updateDebuggerActions();
+        statusBar()->showMessage(QStringLiteral("Running without debugging until the next breakpoint"));
+    }
+
     void evaluateImmediate()
     {
         if (!debuggerEnabled || !debuggerPaused || debuggerSocketDescriptor < 0 || !immediateInputEdit)
@@ -4602,9 +4795,13 @@ df -ih
             immediateDock->hide();
         }
         if (debugContinueAction) debugContinueAction->setEnabled(PAUSED);
+        if (debugContinueExitAction) debugContinueExitAction->setEnabled(PAUSED);
         if (debugStepOverAction) debugStepOverAction->setEnabled(PAUSED);
         if (debugStepInAction) debugStepInAction->setEnabled(PAUSED);
         if (debugStepOutAction) debugStepOutAction->setEnabled(PAUSED && debuggerCurrentDepth > 1);
+        if (debuggerControlsPanel) debuggerControlsPanel->setVisible(debuggerEnabled);
+        if (debuggerContinueButton) debuggerContinueButton->setEnabled(PAUSED);
+        if (debuggerContinueExitButton) debuggerContinueExitButton->setEnabled(PAUSED);
         if (immediateInputEdit) immediateInputEdit->setEnabled(PAUSED && pendingImmediateExpression.isEmpty());
         if (immediateRunButton) immediateRunButton->setEnabled(PAUSED && pendingImmediateExpression.isEmpty());
     }
@@ -4636,6 +4833,17 @@ df -ih
             if (FIELDS.isEmpty())
                 continue;
             if (FIELDS[0] == "P" && FIELDS.size() >= 4) {
+                if (!debuggerEnabled) {
+                    debuggerEnabled = true;
+                    scriptEdit->setReadOnly(true);
+                    debuggerBanner->show();
+                    folderBrowserDock->hide();
+                    variablesDock->show();
+                    immediateDock->show();
+                    variablesPanel->show();
+                    immediatePanel->show();
+                    resizeOutputDock(true);
+                }
                 debuggerPaused = true;
                 debuggerCurrentDepth = FIELDS[2].toInt();
                 const int LINE = FIELDS[1].toInt();
@@ -4911,8 +5119,26 @@ df -ih
             reuseSudoPasswordAction->isChecked(), CAPTURE_HISTORY, DEBUGGING_ENABLED,
             BREAKPOINTS, selectedStartLine - 1, forceDebug, &currentRunUserScriptStartLine);
         currentHistoryLineOffset = selectionOnly ? selectedStartLine - 1 : 0;
+        bool runtimeFileInWorkingDirectory = false;
+        runtimeScriptPath = createRuntimeScriptFile(
+            RUNTIME_SCRIPT, DIRECTORY_INFO.absoluteFilePath(), &runtimeFileInWorkingDirectory);
+        if (runtimeScriptPath.isEmpty()) {
+            closeRunHistoryPipe();
+            closeDebuggerSocket();
+            debuggerEnabled = false;
+            scriptEdit->setReadOnly(false);
+            updateDebuggerActions();
+            if (toggleBreakpointAction)
+                toggleBreakpointAction->setEnabled(true);
+            QMessageBox::critical(this, QStringLiteral("Could not prepare script"),
+                                  QStringLiteral("Could not create a temporary script in the working directory or system temporary directory."));
+            return;
+        }
+        if (!runtimeFileInWorkingDirectory)
+            statusBar()->showMessage(QStringLiteral("Working directory is read-only; BASH_SOURCE[0] points to the temporary script file."), 5000);
         scriptFileDescriptor = createAnonymousScriptFile(RUNTIME_SCRIPT);
         if (scriptFileDescriptor < 0) {
+            cleanupRuntimeScriptFile();
             closeRunHistoryPipe();
             closeDebuggerSocket();
             debuggerEnabled = false;
@@ -4932,7 +5158,7 @@ df -ih
         clearRuntimeDiagnostics();
         outputDock->show();
         outputDock->raise();
-        resizeDocks({outputDock}, {150}, Qt::Vertical);
+        resizeOutputDock(DEBUGGING_ENABLED);
         pendingOutput.clear();
         runDiagnosticOutput.clear();
 
@@ -4946,7 +5172,7 @@ df -ih
         process.setProcessEnvironment(runEnvironment);
         process.setProgram(QStringLiteral("/bin/bash"));
         process.setArguments({QStringLiteral("--noprofile"), QStringLiteral("--norc"),
-                              QStringLiteral("/dev/fd/%1").arg(SCRIPT_DESCRIPTOR)});
+                              runtimeScriptPath});
         const int CHILD_SCRIPT_DESCRIPTOR = scriptFileDescriptor;
         const int CHILD_HISTORY_READ_DESCRIPTOR = runHistoryReadDescriptor;
         const int CHILD_HISTORY_WRITE_DESCRIPTOR = runHistoryWriteDescriptor;
@@ -5031,6 +5257,14 @@ df -ih
             ::close(scriptFileDescriptor);
             scriptFileDescriptor = -1;
         }
+    }
+
+    void cleanupRuntimeScriptFile()
+    {
+        if (runtimeScriptPath.isEmpty())
+            return;
+        QFile::remove(runtimeScriptPath);
+        runtimeScriptPath.clear();
     }
 
     void appendOutput(const QString &text)
@@ -5239,7 +5473,7 @@ df -ih
             return;
         const QString output = QString::fromLocal8Bit(runDiagnosticOutput);
         static const QRegularExpression BASH_LINE_ERROR(
-            QStringLiteral(R"((?:/dev/fd/\d+|bash): line (\d+): (.+))"));
+            QStringLiteral(R"(.+: line (\d+): (.+))"));
         QSet<QString> reported;
         for (const QString &outputLine : output.split(QLatin1Char('\n'))) {
             const auto match = BASH_LINE_ERROR.match(outputLine.trimmed());
@@ -5305,10 +5539,7 @@ df -ih
         if (reported.isEmpty())
             return;
         applyDiagnosticDecorations();
-        outputDock->show();
-        resizeDocks({outputDock}, {150}, Qt::Vertical);
-        diagnosticsDock->show();
-        diagnosticsDock->raise();
+        showDiagnosticsDock();
         diagnosticsList->scrollToBottom();
         statusBar()->showMessage(QStringLiteral("Runtime error locations: %1").arg(reported.size()), 5000);
     }
