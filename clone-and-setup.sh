@@ -142,17 +142,25 @@ ensure_git() {
 
 ensure_git
 
-if [[ -e "${DESTINATION}" ]]; then
-    printf 'Error: destination already exists: %s\n' "${DESTINATION}" >&2
-    exit 1
-fi
-
 say() {
     printf '\n==> %s\n' "$*"
 }
 
-say "Cloning Shell Scratchpad from ${REPO_URL}"
-git clone --depth 1 "${REPO_URL}" "${DESTINATION}"
+if [[ -d "${DESTINATION}/.git" ]]; then
+    EXISTING_REMOTE="$(git -C "${DESTINATION}" remote get-url origin)"
+    [[ "${EXISTING_REMOTE}" == "${REPO_URL}" ]] || {
+        printf 'Error: destination uses a different Git remote: %s\n' "${DESTINATION}" >&2
+        exit 1
+    }
+    say "Updating the existing Shell Scratchpad checkout"
+    git -C "${DESTINATION}" pull --ff-only
+elif [[ -e "${DESTINATION}" ]]; then
+    printf 'Error: destination already exists and is not a Shell Scratchpad Git checkout: %s\n' "${DESTINATION}" >&2
+    exit 1
+else
+    say "Cloning Shell Scratchpad from ${REPO_URL}"
+    git clone --depth 1 "${REPO_URL}" "${DESTINATION}"
+fi
 
 say "Running the project setup script"
 bash "${DESTINATION}/setup.sh" "${SETUP_ARGS[@]}"

@@ -42,6 +42,12 @@ chmod +x setup.sh
 
 The script installs supported system build prerequisites, including Qt 6.12 or newer, builds the app, installs it into `~/.local`, and refreshes the KDE application cache when available. It supports Fedora, Debian/Ubuntu and derivatives, openSUSE, and Arch-based distributions. On SteamOS, it uses a Fedora Distrobox container for build dependencies and keeps the app and launcher in your home directory, so it does not need to make the host filesystem writable. SteamOS must have `distrobox` and its container engine (`podman` or `docker`) available. It also installs the Dolphin/KIO service menu under `~/.local/share/kio/servicemenus/`.
 
+### Windows Subsystem for Linux 2
+
+For an existing WSL 2 distribution with WSLg enabled, run `./setup-wsl2.sh` from a folder containing `clone-and-setup.sh`. It clones, builds, and installs the app, installs the Qt XCB runtime dependency, and creates a Windows Desktop shortcut, Start menu entry, and command launcher under `%LOCALAPPDATA%\Programs\Shell Scratchpad`. The app and Bash scripts continue to run inside WSL; Windows file paths passed to the launcher are translated to WSL paths. The Windows launcher is a `.cmd` entry point rather than a native Windows executable. Remove the integration and Linux installation with `./setup-wsl2.sh --uninstall`.
+
+For a new WSL setup, keep `setup-from-scratch-wsl2.ps1`, `setup-wsl2.sh`, and `clone-and-setup.sh` together and run the PowerShell script as Administrator. It installs or updates WSL2, then lets you choose an installed WSL distribution or create a clean Ubuntu 24.04 instance named `shell-scratchpad-host`. It copies both Bash scripts into the chosen distribution and runs `setup-wsl2.sh`. That script calls its adjacent `clone-and-setup.sh`, which installs Git if needed, clones the app repository, installs build prerequisites, builds and installs the app, and then configures its Windows Desktop and Start menu shortcuts. If Windows requires a restart to enable WSL, restart and rerun the PowerShell script.
+
 ## Manual build
 
 Install a C++ compiler, CMake, and Qt 6.12 or newer Core and Widgets development files from your distribution's package manager. Then run:
