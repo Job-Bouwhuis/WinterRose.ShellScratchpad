@@ -25,6 +25,7 @@
 #include <QDirIterator>
 #include <QFormLayout>
 #include <QFontDatabase>
+#include <QFontMetrics>
 #include <QHash>
 #include <QHeaderView>
 #include <QHBoxLayout>
@@ -60,6 +61,7 @@
 #include <QPlainTextDocumentLayout>
 #include <QProcess>
 #include <QProcessEnvironment>
+#include <QResizeEvent>
 #include <QPointer>
 #include <QPushButton>
 #include <QSaveFile>
@@ -102,7 +104,9 @@
 #include "snippets/SnippetCreateDialog.h"
 #include "snippets/SnippetStore.h"
 #include "util/FuzzyMatcher.h"
+#include "git/GitWorkspaceWindow.h"
 #include "output/TerminalOutput.h"
+#include "language/BashExecutionHandler.h"
 
 #include <cerrno>
 #include <csignal>
@@ -115,401 +119,9 @@
 
 namespace
 {
-constexpr int SCRIPT_DESCRIPTOR = 198;
-constexpr int HISTORY_DESCRIPTOR = 197;
-constexpr int DEBUG_DESCRIPTOR = 196;
 const QByteArray INPUT_MARKER_PREFIX = QByteArray(1, '\x1e') + "SSPAD_INPUT:";
 constexpr char INPUT_MARKER_END = '\x1f';
 const QByteArray SUDO_AUTH_MARKER = QByteArray(1, '\x1e') + "SSPAD_SUDO_AUTHENTICATED" + QByteArray(1, '\x1f');
-
-QByteArray buildRuntimeScript(const QByteArray &userScript, bool handleSudoWithDialog,
-                              bool reuseSudoPassword, bool captureHistory,
-                              bool debuggingEnabled, const QSet<int> &breakpoints,
-                              int sourceLineOffset, bool debugStartPaused,
-                              int *userScriptStartLine)
-{
-    static const QByteArray RUNTIME_PRELUDE = R"SSPAD(
-# Keep a separate duplicate of the app's input stream for prompts and sudo.
-exec 199<&0
-SSPAD_GUI_SUDO="__SSPAD_GUI_SUDO__"
-SSPAD_REUSE_SUDO_PASSWORD="__SSPAD_REUSE_SUDO_PASSWORD__"
-SSPAD_ORIGINAL_STDIN="$(readlink "/proc/${BASHPID}/fd/0" 2>/dev/null || true)"
-if [[ "${SSPAD_BASH_ENV_CHILD-0}" == "1" ]]; then
-    SSPAD_CHILD_SCRIPT_PATH="$(command readlink -f -- "$0" 2>/dev/null || builtin printf '%s' "$0")"
-fi
-
-shell_scratchpad_record_sudo() { :; }
-
-shell_scratchpad_emit_request() {
-    local request_type="$1"
-    local request_prompt="${2-}"
-    local encoded_prompt
-    encoded_prompt="$(builtin printf '%s' "$request_prompt" | command base64 -w0 2>/dev/null)"
-    builtin printf '\036SSPAD_INPUT:%s:%s\037\n' "$request_type" "$encoded_prompt" >&2
-}
-
-read() {
-    local prompt=""
-    local hidden=0
-    local can_use_dialog=1
-    local current_stdin=""
-    local option_body=""
-    local option_flags=""
-    local option_prompt=""
-    local -a original_args=() parsed_args=()
-    original_args=("$@")
-
-    while (($#)); do
-        case "$1" in
-            -p)
-                prompt="${2-}"
-                if (($# > 1)); then shift 2; else shift; fi
-                ;;
-            -p*)
-                prompt="${1#-p}"
-                shift
-                ;;
-            -s)
-                hidden=1
-                shift
-                ;;
-            -d|-i|-n|-N|-t)
-                # Dialogs return a complete line, not a character count or custom delimiter.
-                if (($# > 1)); then shift 2; else shift; fi
-                ;;
-            -e)
-                shift
-                ;;
-            -u)
-                if (($# > 1)); then
-                    if [[ "${2}" != "0" ]]; then can_use_dialog=0; fi
-                    parsed_args+=("$1" "$2")
-                    shift 2
-                else
-                    can_use_dialog=0
-                    parsed_args+=("$1")
-                    shift
-                fi
-                ;;
-            -*)
-                option_body="${1#-}"
-                if [[ "$option_body" == *p* ]]; then
-                    option_flags="${option_body%%p*}"
-                    option_prompt="${option_body#*p}"
-                    if [[ "$option_flags" == *s* ]]; then hidden=1; option_flags="${option_flags//s/}"; fi
-                    if [[ -n "$option_flags" ]]; then parsed_args+=("-${option_flags}"); fi
-                    if [[ -n "$option_prompt" ]]; then
-                        prompt="$option_prompt"
-                        shift
-                    elif (($# > 1)); then
-                        prompt="${2-}"
-                        shift 2
-                    else
-                        prompt=""
-                        shift
-                    fi
-                else
-                    parsed_args+=("$1")
-                    shift
-                fi
-                ;;
-            *)
-                parsed_args+=("$1")
-                shift
-                ;;
-        esac
-    done
-
-    current_stdin="$(readlink "/proc/${BASHPID}/fd/0" 2>/dev/null || true)"
-    if ((can_use_dialog)) && [[ -n "$SSPAD_ORIGINAL_STDIN" && "$current_stdin" == "$SSPAD_ORIGINAL_STDIN" ]]; then
-        local request_type="read"
-        if ((hidden)); then request_type="password"; fi
-        shell_scratchpad_emit_request "$request_type" "$prompt"
-        builtin read "${parsed_args[@]}"
-    else
-        builtin read "${original_args[@]}"
-    fi
-}
-
-sudo() {
-    shell_scratchpad_record_sudo "sudo $*"
-    if [[ -z "${SSPAD_REAL_SUDO-}" || ! -x "$SSPAD_REAL_SUDO" ]]; then
-        builtin printf 'Shell Scratchpad: sudo is not installed.\n' >&2
-        return 127
-    fi
-
-    local argument=""
-    for argument in "$@"; do
-        if [[ "$argument" == "-n" || "$argument" == "--non-interactive" ]]; then
-            "$SSPAD_REAL_SUDO" "$@"
-            return $?
-        fi
-    done
-
-    if [[ "$SSPAD_GUI_SUDO" != "1" ]]; then
-        "$SSPAD_REAL_SUDO" "$@"
-        return $?
-    fi
-
-    # Use the system credential timestamp whenever possible.
-    if "$SSPAD_REAL_SUDO" -n -v >/dev/null 2>&1; then
-        "$SSPAD_REAL_SUDO" "$@"
-        return $?
-    fi
-
-    local password=""
-    local password_is_cached=0
-    local sudo_prompt="Authentication required for: sudo $*"
-    local xtrace_enabled=0
-    case "$-" in *x*) xtrace_enabled=1; set +x ;; esac
-
-    if [[ "$SSPAD_REUSE_SUDO_PASSWORD" == "1" && -n "${SSPAD_SUDO_PASSWORD+x}" ]]; then
-        password="$SSPAD_SUDO_PASSWORD"
-        password_is_cached=1
-    else
-        shell_scratchpad_emit_request "sudo" "$sudo_prompt"
-        local IFS=""
-        if ! builtin read -r -s -u 199 password; then
-            unset password
-            if ((xtrace_enabled)); then set -x; fi
-            return 1
-        fi
-    fi
-
-    # Validate once, then retain it only in this Bash process so later calls
-    # can refresh sudo's timestamp silently if necessary.
-    if ! builtin printf '%s\n' "$password" | "$SSPAD_REAL_SUDO" -S -p '' -v >/dev/null 2>&1; then
-        unset password
-        if ((password_is_cached)); then unset SSPAD_SUDO_PASSWORD; fi
-        if ((xtrace_enabled)); then set -x; fi
-        return 1
-    fi
-    builtin printf '\036SSPAD_SUDO_AUTHENTICATED\037\n' >&2
-
-    if [[ "$SSPAD_REUSE_SUDO_PASSWORD" == "1" ]]; then
-        SSPAD_SUDO_PASSWORD="$password"
-    fi
-    local command_status=0
-    if "$SSPAD_REAL_SUDO" "$@"; then
-        command_status=0
-    else
-        command_status=$?
-    fi
-    if [[ "$SSPAD_REUSE_SUDO_PASSWORD" != "1" ]]; then
-        "$SSPAD_REAL_SUDO" -k >/dev/null 2>&1 || true
-    fi
-    unset password
-    if ((xtrace_enabled)); then set -x; fi
-    return "$command_status"
-}
-)SSPAD";
-
-    QByteArray runtimeScript = RUNTIME_PRELUDE;
-    runtimeScript.replace("__SSPAD_GUI_SUDO__", handleSudoWithDialog ? "1" : "0");
-    runtimeScript.replace("__SSPAD_REUSE_SUDO_PASSWORD__", reuseSudoPassword ? "1" : "0");
-    runtimeScript.append('\n');
-    if (captureHistory && !debuggingEnabled) {
-        runtimeScript.append(R"SSPAD(
-shell_scratchpad_record_sudo() {
-    builtin printf 'S%s\0' "$1" >&197
-}
-__sspad_trace_command() {
-    local previous_status=$?
-    if [[ -z ${SSPAD_USER_SCRIPT_START_LINE+x} && "${SSPAD_BASH_ENV_CHILD-0}" != "1" ]]; then
-        return 0
-    fi
-    if [[ "${SSPAD_BASH_ENV_CHILD-0}" == "1" && "${BASH_SOURCE[1]-}" == "${SSPAD_RUNTIME_FILE-}" ]]; then
-        return 0
-    fi
-    local traced_command="${1-}"
-    local source_line=${BASH_LINENO[0]:-0}
-    local user_line=$source_line
-    if [[ "${SSPAD_BASH_ENV_CHILD-0}" != "1" ]]; then
-        user_line=$((source_line - SSPAD_USER_SCRIPT_START_LINE + 1))
-    fi
-    builtin printf 'C%s\t%s\0' "$user_line" "$traced_command" >&197
-    return 0
-}
-trap '__sspad_trace_command "$BASH_COMMAND"' DEBUG
-)SSPAD");
-    }
-    if (debuggingEnabled) {
-        QString breakpointSet = QStringLiteral("|");
-        QList<int> sortedBreakpoints = breakpoints.values();
-        std::sort(sortedBreakpoints.begin(), sortedBreakpoints.end());
-        for (int line : sortedBreakpoints)
-            breakpointSet += QString::number(line) + QLatin1Char('|');
-        runtimeScript += QStringLiteral("__SSPAD_DEBUG_BREAKPOINTS='%1'\n")
-            .arg(breakpointSet).toUtf8();
-        runtimeScript += QStringLiteral("__SSPAD_DEBUG_LINE_OFFSET=%1\n").arg(sourceLineOffset).toUtf8();
-        runtimeScript.append(R"SSPAD(
-__SSPAD_DEBUG_MODE=__SSPAD_DEBUG_MODE_VALUE__
-__SSPAD_DEBUG_TARGET_DEPTH=0
-__SSPAD_DEBUG_SKIP_LINE=0
-__SSPAD_DEBUG_PAUSE_REQUESTED=0
-trap '__SSPAD_DEBUG_PAUSE_REQUESTED=1' USR1
-set -T
-__sspad_debug() {
-    local __sspad_previous_status=$?
-    if [[ -z ${SSPAD_USER_SCRIPT_START_LINE+x} && "${SSPAD_BASH_ENV_CHILD-0}" != "1" ]]; then
-        return 0
-    fi
-    if [[ "${SSPAD_BASH_ENV_CHILD-0}" == "1" && "${BASH_SOURCE[1]-}" == "${SSPAD_RUNTIME_FILE-}" ]]; then
-        return 0
-    fi
-    local __sspad_source_line=${BASH_LINENO[0]:-${LINENO}}
-    if [[ "${SSPAD_BASH_ENV_CHILD-0}" != "1" ]] && ((__sspad_source_line < SSPAD_USER_SCRIPT_START_LINE)); then
-        return 0
-    fi
-    local __sspad_source_file="${SSPAD_CHILD_SCRIPT_PATH-}"
-    local __sspad_user_line
-    if [[ "${SSPAD_BASH_ENV_CHILD-0}" == "1" ]]; then
-        __sspad_user_line=$__sspad_source_line
-    else
-        __sspad_user_line=$((__sspad_source_line - SSPAD_USER_SCRIPT_START_LINE + 1 + __SSPAD_DEBUG_LINE_OFFSET))
-        __sspad_source_file=""
-    fi
-    local __sspad_depth=${#FUNCNAME[@]}
-    local __sspad_command="${1-}"
-    local __sspad_pause=0
-    if [[ "${SSPAD_CAPTURE_HISTORY-0}" == "1" ]]; then
-        local __sspad_history_line=$__sspad_user_line
-        [[ "${SSPAD_BASH_ENV_CHILD-0}" == "1" ]] || __sspad_history_line=$((__sspad_user_line - __SSPAD_DEBUG_LINE_OFFSET))
-        builtin printf 'C%s\t%s\0' "$__sspad_history_line" "$__sspad_command" >&197
-    fi
-    case "$__SSPAD_DEBUG_MODE" in
-        start)
-            __sspad_pause=1
-            ;;
-        run)
-            if ((__SSPAD_DEBUG_SKIP_LINE == __sspad_user_line)); then
-                :
-            else
-                __SSPAD_DEBUG_SKIP_LINE=0
-                [[ "$__SSPAD_DEBUG_BREAKPOINTS" == *"|${__sspad_user_line}|"* ]] && __sspad_pause=1
-            fi
-            ;;
-        exitdebug)
-            if ((__SSPAD_DEBUG_SKIP_LINE == __sspad_user_line)); then
-                __SSPAD_DEBUG_SKIP_LINE=0
-            elif [[ "$__SSPAD_DEBUG_BREAKPOINTS" == *"|${__sspad_user_line}|"* ]]; then
-                __SSPAD_DEBUG_MODE=run
-                __sspad_pause=1
-            fi
-            ;;
-        step)
-            ((__sspad_depth <= __SSPAD_DEBUG_TARGET_DEPTH)) && __sspad_pause=1
-            ;;
-        stepin)
-            __sspad_pause=1
-            ;;
-        stepout)
-            ((__sspad_depth < __SSPAD_DEBUG_TARGET_DEPTH)) && __sspad_pause=1
-            ;;
-    esac
-    if ((__SSPAD_DEBUG_PAUSE_REQUESTED)); then
-        __SSPAD_DEBUG_PAUSE_REQUESTED=0
-        __sspad_pause=1
-    fi
-    ((__sspad_pause)) || return 0
-
-    local __sspad_encoded_command
-    __sspad_encoded_command="$(builtin printf '%s' "$__sspad_command" | command base64 -w0 2>/dev/null)"
-    local __sspad_encoded_source_file=""
-    if [[ -n "$__sspad_source_file" ]]; then
-        __sspad_encoded_source_file="$(builtin printf '%s' "$__sspad_source_file" | command base64 -w0 2>/dev/null)"
-    fi
-    builtin printf 'P\t%s\t%s\t%s\t%s\n' "$__sspad_user_line" "$__sspad_depth" \
-        "$__sspad_encoded_command" "$__sspad_encoded_source_file" >&196
-
-    local __sspad_encoded_variables
-    __sspad_encoded_variables="$(builtin declare -p 2>/dev/null | command base64 -w0 2>/dev/null)"
-    builtin printf 'V\t%s\n' "$__sspad_encoded_variables" >&196
-    builtin printf 'R\n' >&196
-
-    local __sspad_action
-    while IFS= read -r -u 196 __sspad_action; do
-        case "$__sspad_action" in
-            e:*)
-                local __sspad_expression __sspad_result_file __sspad_result_status __sspad_encoded_result
-                __sspad_expression="$(builtin printf '%s' "${__sspad_action#e:}" | command base64 -d 2>/dev/null)"
-                __sspad_result_file="$(command mktemp 2>/dev/null)"
-                if [[ -z "$__sspad_result_file" ]]; then
-                    __sspad_result_status=125
-                    __sspad_encoded_result="$(builtin printf '%s' 'Could not create a temporary result file' | command base64 -w0)"
-                else
-                    trap - DEBUG
-                    if builtin eval "$__sspad_expression" >"$__sspad_result_file" 2>&1; then
-                        __sspad_result_status=0
-                    else
-                        __sspad_result_status=$?
-                    fi
-                    trap '__sspad_debug "$BASH_COMMAND"' DEBUG
-                    __sspad_encoded_result="$(command base64 -w0 <"$__sspad_result_file" 2>/dev/null)"
-                    command rm -f -- "$__sspad_result_file"
-                fi
-                builtin printf 'E\t%s\t%s\n' "$__sspad_result_status" "$__sspad_encoded_result" >&196
-                __sspad_encoded_variables="$(builtin declare -p 2>/dev/null | command base64 -w0 2>/dev/null)"
-                builtin printf 'V\t%s\n' "$__sspad_encoded_variables" >&196
-                builtin printf 'R\n' >&196
-                ;;
-            c)
-                __SSPAD_DEBUG_MODE=run
-                __SSPAD_DEBUG_SKIP_LINE=$__sspad_user_line
-                break
-                ;;
-            x)
-                __SSPAD_DEBUG_MODE=exitdebug
-                __SSPAD_DEBUG_SKIP_LINE=$__sspad_user_line
-                break
-                ;;
-            s)
-                __SSPAD_DEBUG_MODE=step
-                __SSPAD_DEBUG_TARGET_DEPTH=$__sspad_depth
-                break
-                ;;
-            i)
-                __SSPAD_DEBUG_MODE=stepin
-                __SSPAD_DEBUG_TARGET_DEPTH=$__sspad_depth
-                break
-                ;;
-            o)
-                if ((__sspad_depth > 1)); then
-                    __SSPAD_DEBUG_MODE=stepout
-                    __SSPAD_DEBUG_TARGET_DEPTH=$__sspad_depth
-                    break
-                fi
-                ;;
-        esac
-    done
-    return 0
-}
-trap '__sspad_debug "$BASH_COMMAND"' DEBUG
-)SSPAD");
-        runtimeScript.replace("__SSPAD_DEBUG_MODE_VALUE__", debugStartPaused ? "start" : "run");
-        runtimeScript += captureHistory
-            ? QByteArray("SSPAD_CAPTURE_HISTORY=1\n") : QByteArray("SSPAD_CAPTURE_HISTORY=0\n");
-    }
-    runtimeScript.append(R"SSPAD(
-bash() {
-    if (($# > 0)) && [[ "$1" != -* && -f "$1" && -n "${SSPAD_RUNTIME_FILE-}" ]]; then
-        BASH_ENV="$SSPAD_RUNTIME_FILE" SSPAD_BASH_ENV_CHILD=1 command bash "$@"
-    else
-        command bash "$@"
-    fi
-}
-if [[ "${SSPAD_BASH_ENV_CHILD-0}" == "1" ]]; then
-    return 0
-fi
-)SSPAD");
-    runtimeScript.append("SSPAD_USER_SCRIPT_START_LINE=$((LINENO + 1))\n");
-    if (userScriptStartLine)
-        *userScriptStartLine = runtimeScript.count('\n') + 1;
-    runtimeScript.append(userScript);
-    if (!runtimeScript.endsWith('\n'))
-        runtimeScript.append('\n');
-    return runtimeScript;
-}
 
 int createAnonymousScriptFile(const QByteArray &scriptContents)
 {
@@ -1105,6 +717,26 @@ public:
         folderControls->addWidget(newFileButton);
         folderControls->addWidget(newScriptButton);
         folderLayout->addLayout(folderControls);
+        auto *folderSearchRow = new QHBoxLayout;
+        folderSearchEdit = new QLineEdit(folderPanel);
+        folderSearchEdit->setPlaceholderText(QStringLiteral("Filter files and folders"));
+        folderSearchEdit->setClearButtonEnabled(true);
+        folderSearchEdit->setToolTip(QStringLiteral("Filter the project tree by file or folder name"));
+        folderSearchRow->addWidget(folderSearchEdit, 1);
+        folderShowHiddenCheck = new QCheckBox(QStringLiteral("Hidden"), folderPanel);
+        folderShowHiddenCheck->setToolTip(QStringLiteral("Show hidden files and folders"));
+        folderSearchRow->addWidget(folderShowHiddenCheck);
+        folderLayout->addLayout(folderSearchRow);
+        auto *folderNavigationRow = new QHBoxLayout;
+        auto *refreshFolderButton = new QToolButton(folderPanel);
+        refreshFolderButton->setText(QStringLiteral("Refresh"));
+        refreshFolderButton->setToolTip(QStringLiteral("Refresh the project tree"));
+        auto *collapseFoldersButton = new QToolButton(folderPanel);
+        collapseFoldersButton->setText(QStringLiteral("Collapse All"));
+        collapseFoldersButton->setToolTip(QStringLiteral("Collapse all project folders"));
+        folderNavigationRow->addWidget(refreshFolderButton);
+        folderNavigationRow->addWidget(collapseFoldersButton);
+        folderLayout->addLayout(folderNavigationRow);
         folderFileBrowser = new QTreeWidget(folderPanel);
         folderFileBrowser->setColumnCount(1);
         folderFileBrowser->setHeaderHidden(true);
@@ -1115,11 +747,14 @@ public:
         folderBrowserDock->setMaximumWidth(350);
         addDockWidget(Qt::RightDockWidgetArea, folderBrowserDock);
         splitDockWidget(scriptDock, folderBrowserDock, Qt::Horizontal);
-        resizeDocks({scriptDock, folderBrowserDock}, {880, 100}, Qt::Horizontal);
         folderBrowserDock->hide();
         connect(newFolderButton, &QPushButton::clicked, this, [this]() { createFolderBrowserEntry(true); });
         connect(newFileButton, &QPushButton::clicked, this, [this]() { createFolderBrowserEntry(false); });
         connect(newScriptButton, &QPushButton::clicked, this, [this]() { createNewScript(); });
+        connect(refreshFolderButton, &QToolButton::clicked, this, [this]() { refreshFolderBrowser(); });
+        connect(collapseFoldersButton, &QToolButton::clicked, folderFileBrowser, &QTreeWidget::collapseAll);
+        connect(folderSearchEdit, &QLineEdit::textChanged, this, [this]() { applyFolderBrowserFilter(); });
+        connect(folderShowHiddenCheck, &QCheckBox::toggled, this, [this]() { refreshFolderBrowser(); });
         connect(folderFileBrowser, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem *item, int) {
             if (!item || item->data(0, Qt::UserRole).toString().isEmpty()
                 || item->data(0, Qt::UserRole + 1).toString() == QLatin1String("folder"))
@@ -1129,8 +764,6 @@ public:
         folderFileBrowser->setContextMenuPolicy(Qt::CustomContextMenu);
         connect(folderFileBrowser, &QTreeWidget::customContextMenuRequested, this, [this](const QPoint &position) {
             QTreeWidgetItem *item = folderFileBrowser->itemAt(position);
-            if (!item)
-                return;
             showFolderBrowserContextMenu(item, folderFileBrowser->viewport()->mapToGlobal(position));
         });
 
@@ -1366,7 +999,7 @@ public:
         diagnosticsDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable |
                                      QDockWidget::DockWidgetClosable);
         diagnosticsDock->setMinimumSize(0, 0);
-        diagnosticsDock->setMinimumHeight(48);
+        diagnosticsDock->setMinimumHeight(24);
         diagnosticsDock->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Ignored);
         auto *diagnosticsContents = new QWidget(diagnosticsDock);
         diagnosticsContents->setMinimumSize(0, 0);
@@ -1396,11 +1029,9 @@ public:
         updateDiagnosticsSummary();
         diagnosticsDock->setWidget(diagnosticsContents);
         addDockWidget(Qt::BottomDockWidgetArea, diagnosticsDock);
-        tabifyDockWidget(outputDock, diagnosticsDock);
+        splitDockWidget(outputDock, diagnosticsDock, Qt::Vertical);
         outputDock->hide();
         diagnosticsDock->hide();
-        resizeOutputDock(false);
-        resizeDocks({immediateDock, variablesDock}, {340, 480}, Qt::Horizontal);
         connect(diagnosticsList, &QListWidget::itemActivated, this, [this](QListWidgetItem *item) {
             const int FIX_START = item->data(Qt::UserRole + 5).toInt();
             const int FIX_LENGTH = item->data(Qt::UserRole + 6).toInt();
@@ -1430,13 +1061,19 @@ public:
 
         if (!initialScriptPath.isEmpty()) {
             openScriptPath(initialScriptPath, false);
-        } else if (offerRecovery) {
-            restoreRecoveryDraft();
+        } else if (!folderMode) {
+            QTimer::singleShot(0, this, [this]() {
+                if (scriptEdit && scriptEdit->toPlainText() == QStringLiteral("echo \"Hello, World!\"\n"))
+                    scriptEdit->selectAll();
+            });
         }
 
         keyChordDispatcher = new KeyChordDispatcher(this);
         qApp->installEventFilter(keyChordDispatcher);
         createMenus();
+        connect(scriptEdit, &ShellScratchpad::CodeEditor::markdownCodeBlockUnwrapped, this, [this]() {
+            statusBar()->showMessage(QStringLiteral("Removed Markdown code fences. Undo to restore them."), 5000);
+        });
         statusBar()->showMessage(QStringLiteral("Ready  •  Alt+Enter to run"));
         statusBar()->addPermanentWidget(runStatusLabel);
         statusBar()->addPermanentWidget(runDurationLabel);
@@ -1644,7 +1281,6 @@ public:
         });
         connect(&process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
                 [this](int exitCode, QProcess::ExitStatus exitStatus) {
-            const bool WAS_DEBUGGING = debuggerEnabled;
             processOutputAvailable();
             readDebuggerSocket();
             readRunHistoryPipe();
@@ -1707,10 +1343,8 @@ public:
                 runStatusLabel->setText(QStringLiteral("Terminated"));
                 statusBar()->showMessage(QStringLiteral("Script process terminated"));
             }
-            if (!stopRequested && exitStatus == QProcess::NormalExit && exitCode != 0)
+            if (!stopRequested && (exitStatus != QProcess::NormalExit || exitCode != 0))
                 appendPostRunDiagnostics(exitCode);
-            if (WAS_DEBUGGING && outputDock->isVisible())
-                resizeOutputDock(false);
             stopRequested = false;
         });
         connect(&process, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
@@ -1766,6 +1400,7 @@ public:
             "border: 1px solid palette(mid); border-radius: 6px; padding: 6px; "
             "background: palette(base); }"));
         placeCaretAtEndOfFirstLine();
+        initializeWindowLayoutPersistence();
     }
 
     void navigateToSourcedIdentifier(const QString &path, const QString &name, int preferredLine)
@@ -1953,8 +1588,23 @@ public:
     }
 
 protected:
+    void resizeEvent(QResizeEvent *event) override
+    {
+        QMainWindow::resizeEvent(event);
+        windowResizePending = true;
+        if (windowLayoutPersistenceReady)
+            windowLayoutSaveTimer.start();
+    }
+
     bool eventFilter(QObject *watched, QEvent *event) override
     {
+        if (isLayoutDock(watched) &&
+            (event->type() == QEvent::Resize || event->type() == QEvent::Move)) {
+            if (event->type() == QEvent::Resize && !windowResizePending &&
+                !dockVisibilityChangePending && !applyingResponsiveDockLayout)
+                manualDockResizePending = true;
+            scheduleWindowLayoutSave();
+        }
         if (watched == immediateInputEdit && event->type() == QEvent::KeyPress) {
             auto *keyEvent = static_cast<QKeyEvent *>(event);
             if ((keyEvent->key() == Qt::Key_Up || keyEvent->key() == Qt::Key_Down)
@@ -2091,6 +1741,9 @@ protected:
         clearRecoveryDraft();
         closeScriptFileDescriptor();
         cleanupRuntimeScriptFile();
+        if (manualDockResizePending && !windowResizePending && !dockVisibilityChangePending)
+            captureDockSizeRatios();
+        saveWindowLayout();
         event->accept();
     }
 
@@ -2116,6 +1769,9 @@ private:
     QWidget *runControlsPanel = nullptr;
     QTabBar *editorTabBar = nullptr;
     QTreeWidget *folderFileBrowser = nullptr;
+    QLineEdit *folderSearchEdit = nullptr;
+    QCheckBox *folderShowHiddenCheck = nullptr;
+    bool folderTreeInitialized = false;
     QFileIconProvider folderIconProvider;
     QAction *folderBrowserAction = nullptr;
     QAction *folderMenuAction = nullptr;
@@ -2200,6 +1856,14 @@ private:
     QString debuggerRootScriptPath;
     QTimer recoveryTimer;
     QTimer latestDraftTimer;
+    QTimer windowLayoutSaveTimer;
+    QHash<QString, qreal> horizontalDockSizeRatios;
+    QHash<QString, qreal> verticalDockSizeRatios;
+    bool windowLayoutPersistenceReady = false;
+    bool windowResizePending = false;
+    bool dockVisibilityChangePending = false;
+    bool manualDockResizePending = false;
+    bool applyingResponsiveDockLayout = false;
     QTimer shellCheckTimer;
     QProcess shellCheckProcess;
     QPointer<QDialog> runHistoryDialog;
@@ -2242,6 +1906,330 @@ private:
     bool recoveryEnabled = false;
     bool recoveryDraftOwned = false;
     int zoomLevel = 0;
+
+    QList<QDockWidget *> layoutDocks() const
+    {
+        return {scriptDock, outputDock, diagnosticsDock, variablesDock, immediateDock, folderBrowserDock};
+    }
+
+    bool isLayoutDock(QObject *object) const
+    {
+        for (QDockWidget *dock : layoutDocks()) {
+            if (dock == object)
+                return true;
+        }
+        return false;
+    }
+
+    qreal defaultDockSizeRatio(const QDockWidget *dock, bool vertical) const
+    {
+        const QString name = dock ? dock->objectName() : QString();
+        if (vertical) {
+            if (name == QLatin1String("outputDock")) return 0.34;
+            if (name == QLatin1String("scriptDiagnosticsDock")) return 0.20;
+            return 0.28;
+        }
+        if (name == QLatin1String("scriptEditorDock")) return 0.88;
+        if (name == QLatin1String("folderBrowserDock")) return 0.12;
+        if (name == QLatin1String("variablesDock")) return 0.34;
+        if (name == QLatin1String("immediateDock")) return 0.34;
+        return 0.30;
+    }
+
+    int dockLayoutExtent(bool vertical) const
+    {
+        if (vertical) {
+            const int topChrome = (menuBar() ? menuBar()->height() : 0) +
+                (statusBar() ? statusBar()->height() : 0);
+            return qMax(1, height() - topChrome);
+        }
+        return qMax(1, width());
+    }
+
+    qreal dockSizeRatio(const QDockWidget *dock, bool vertical) const
+    {
+        if (!dock)
+            return 0.25;
+        const QHash<QString, qreal> &ratios = vertical ? verticalDockSizeRatios : horizontalDockSizeRatios;
+        return ratios.value(dock->objectName(), defaultDockSizeRatio(dock, vertical));
+    }
+
+    int baseDockMinimum(const QDockWidget *dock, bool vertical) const
+    {
+        if (!dock)
+            return 0;
+        if (vertical)
+            return dock == diagnosticsDock ? 24 : 0;
+        if (dock == variablesDock)
+            return 320;
+        if (dock == folderBrowserDock)
+            return 90;
+        return 0;
+    }
+
+    int baseDockMaximum(const QDockWidget *dock, bool vertical) const
+    {
+        if (!dock)
+            return QWIDGETSIZE_MAX;
+        if (vertical)
+            return QWIDGETSIZE_MAX;
+        if (dock == folderBrowserDock)
+            return 350;
+        return QWIDGETSIZE_MAX;
+    }
+
+    QList<QDockWidget *> visibleDockStacks(bool vertical) const
+    {
+        QList<QDockWidget *> representatives;
+        const Qt::DockWidgetArea areas[] = {
+            Qt::LeftDockWidgetArea, Qt::RightDockWidgetArea,
+            Qt::TopDockWidgetArea, Qt::BottomDockWidgetArea
+        };
+        for (Qt::DockWidgetArea area : areas) {
+            const bool areaIsVertical = area == Qt::TopDockWidgetArea || area == Qt::BottomDockWidgetArea;
+            if (areaIsVertical != vertical)
+                continue;
+            for (QDockWidget *dock : layoutDocks()) {
+                if (!dock || dock->isHidden() || dock->isFloating() || dockWidgetArea(dock) != area)
+                    continue;
+                bool represented = false;
+                for (QDockWidget *existing : representatives) {
+                    if (dockWidgetArea(existing) == area && tabifiedDockWidgets(existing).contains(dock)) {
+                        represented = true;
+                        break;
+                    }
+                }
+                if (!represented)
+                    representatives.append(dock);
+            }
+        }
+        return representatives;
+    }
+
+    void updateResponsiveDockConstraints()
+    {
+        const int verticalExtent = dockLayoutExtent(true);
+        const int horizontalExtent = dockLayoutExtent(false);
+        const int verticalStackCount = qMax(1, visibleDockStacks(true).size());
+        const int verticalMaximum = qMax(80, qMin(verticalExtent * 65 / 100,
+            (verticalExtent - 300) / verticalStackCount));
+        const int secondaryDockMaximum = qMax(100, horizontalExtent * 55 / 100);
+
+        for (QDockWidget *dock : layoutDocks()) {
+            if (!dock)
+                continue;
+            if (dock->isFloating()) {
+                dock->setMinimumWidth(baseDockMinimum(dock, false));
+                dock->setMaximumWidth(baseDockMaximum(dock, false));
+                dock->setMinimumHeight(baseDockMinimum(dock, true));
+                dock->setMaximumHeight(baseDockMaximum(dock, true));
+                continue;
+            }
+            const Qt::DockWidgetArea area = dockWidgetArea(dock);
+            const bool vertical = area == Qt::TopDockWidgetArea || area == Qt::BottomDockWidgetArea;
+            if (vertical) {
+                const int maximum = qMin(verticalMaximum, verticalExtent);
+                dock->setMaximumHeight(maximum);
+                dock->setMinimumHeight(qMin(baseDockMinimum(dock, true), maximum));
+            } else if (area == Qt::LeftDockWidgetArea || area == Qt::RightDockWidgetArea) {
+                const int panelMaximum = dock == scriptDock
+                    ? qMax(160, horizontalExtent - 40) : secondaryDockMaximum;
+                const int maximum = qMin(baseDockMaximum(dock, false), panelMaximum);
+                dock->setMaximumWidth(maximum);
+                dock->setMinimumWidth(qMin(baseDockMinimum(dock, false), maximum));
+            }
+        }
+    }
+
+    void captureDockSizeRatios()
+    {
+        const int verticalExtent = dockLayoutExtent(true);
+        const int horizontalExtent = dockLayoutExtent(false);
+        for (QDockWidget *dock : layoutDocks()) {
+            if (!dock || dock->isHidden() || dock->isFloating())
+                continue;
+            const Qt::DockWidgetArea area = dockWidgetArea(dock);
+            if (area == Qt::TopDockWidgetArea || area == Qt::BottomDockWidgetArea) {
+                if (dock->height() > 0)
+                    verticalDockSizeRatios.insert(dock->objectName(),
+                        qBound<qreal>(0.04, qreal(dock->height()) / verticalExtent, 0.90));
+            } else if (area == Qt::LeftDockWidgetArea || area == Qt::RightDockWidgetArea) {
+                if (dock->width() > 0)
+                    horizontalDockSizeRatios.insert(dock->objectName(),
+                        qBound<qreal>(0.04, qreal(dock->width()) / horizontalExtent, 0.90));
+            }
+        }
+    }
+
+    void applyResponsiveDockSizes()
+    {
+        if (width() <= 0 || height() <= 0)
+            return;
+        applyingResponsiveDockLayout = true;
+        updateResponsiveDockConstraints();
+
+        struct DockSize
+        {
+            Qt::DockWidgetArea area;
+            QDockWidget *dock;
+            int size;
+        };
+        QList<DockSize> verticalSizes;
+        QList<DockSize> horizontalSizes;
+        for (bool vertical : {true, false}) {
+            const int extent = dockLayoutExtent(vertical);
+            for (QDockWidget *dock : visibleDockStacks(vertical)) {
+                const Qt::DockWidgetArea area = dockWidgetArea(dock);
+                const int maximum = vertical ? dock->maximumHeight() : dock->maximumWidth();
+                const int minimum = vertical ? dock->minimumHeight() : dock->minimumWidth();
+                const int requested = qBound(minimum,
+                    qRound(dockSizeRatio(dock, vertical) * extent), maximum);
+                if (vertical) {
+                    verticalSizes.append({area, dock, requested});
+                } else {
+                    horizontalSizes.append({area, dock, requested});
+                }
+            }
+        }
+
+        const auto fitToBudget = [](QList<DockSize> &sizes, int extent, int reservedSpace) {
+            int total = 0;
+            for (const DockSize &entry : sizes)
+                total += entry.size;
+            const int budget = qMax(1, extent - reservedSpace);
+            if (total <= budget)
+                return;
+            const qreal scale = qreal(budget) / total;
+            for (DockSize &entry : sizes)
+                entry.size = qMax(1, qFloor(entry.size * scale));
+        };
+        fitToBudget(verticalSizes, dockLayoutExtent(true), 300);
+        fitToBudget(horizontalSizes, dockLayoutExtent(false), 40);
+
+        const auto applyByArea = [this](const QList<DockSize> &sizes, Qt::Orientation orientation) {
+            const Qt::DockWidgetArea areas[] = {
+                Qt::LeftDockWidgetArea, Qt::RightDockWidgetArea,
+                Qt::TopDockWidgetArea, Qt::BottomDockWidgetArea
+            };
+            for (Qt::DockWidgetArea area : areas) {
+                QList<QDockWidget *> docks;
+                QList<int> dimensions;
+                for (const DockSize &entry : sizes) {
+                    if (entry.area == area) {
+                        docks.append(entry.dock);
+                        dimensions.append(entry.size);
+                    }
+                }
+                if (!docks.isEmpty())
+                    resizeDocks(docks, dimensions, orientation);
+            }
+        };
+        applyByArea(verticalSizes, Qt::Vertical);
+        applyByArea(horizontalSizes, Qt::Horizontal);
+        QTimer::singleShot(0, this, [this]() { applyingResponsiveDockLayout = false; });
+    }
+
+    void resetDockSizeRatios()
+    {
+        horizontalDockSizeRatios.clear();
+        verticalDockSizeRatios.clear();
+        for (QDockWidget *dock : layoutDocks()) {
+            if (!dock)
+                continue;
+            horizontalDockSizeRatios.insert(dock->objectName(), defaultDockSizeRatio(dock, false));
+            verticalDockSizeRatios.insert(dock->objectName(), defaultDockSizeRatio(dock, true));
+        }
+        applyResponsiveDockSizes();
+        if (windowLayoutPersistenceReady)
+            windowLayoutSaveTimer.start();
+    }
+
+    void initializeWindowLayoutPersistence()
+    {
+        windowLayoutSaveTimer.setSingleShot(true);
+        windowLayoutSaveTimer.setInterval(220);
+        connect(&windowLayoutSaveTimer, &QTimer::timeout, this, [this]() {
+            if (manualDockResizePending && !windowResizePending && !dockVisibilityChangePending)
+                captureDockSizeRatios();
+            applyResponsiveDockSizes();
+            saveWindowLayout();
+            manualDockResizePending = false;
+            windowResizePending = false;
+            dockVisibilityChangePending = false;
+        });
+        for (QDockWidget *dock : layoutDocks()) {
+            if (!dock)
+                continue;
+            dock->installEventFilter(this);
+            connect(dock, &QDockWidget::dockLocationChanged, this,
+                    [this](Qt::DockWidgetArea) {
+                manualDockResizePending = true;
+                scheduleWindowLayoutSave();
+            });
+            connect(dock, &QDockWidget::topLevelChanged, this,
+                    [this](bool) {
+                manualDockResizePending = true;
+                scheduleWindowLayoutSave();
+            });
+            connect(dock, &QDockWidget::visibilityChanged, this,
+                    [this](bool) {
+                dockVisibilityChangePending = true;
+                scheduleWindowLayoutSave();
+            });
+        }
+
+        QSettings settings;
+        const QByteArray geometry = settings.value(QStringLiteral("windowLayout/geometry")).toByteArray();
+        const QByteArray state = settings.value(QStringLiteral("windowLayout/state")).toByteArray();
+        if (!geometry.isEmpty())
+            restoreGeometry(geometry);
+        if (!state.isEmpty())
+            restoreState(state, 1);
+        for (QDockWidget *dock : layoutDocks()) {
+            if (!dock)
+                continue;
+            const QString name = dock->objectName();
+            const QString prefix = QStringLiteral("windowLayout/dockRatios/") + name + QLatin1Char('/');
+            horizontalDockSizeRatios.insert(name, settings.value(prefix + QStringLiteral("horizontal"),
+                defaultDockSizeRatio(dock, false)).toDouble());
+            verticalDockSizeRatios.insert(name, settings.value(prefix + QStringLiteral("vertical"),
+                defaultDockSizeRatio(dock, true)).toDouble());
+        }
+
+        if (!folderMode)
+            folderBrowserDock->hide();
+        if (!debuggerEnabled) {
+            variablesDock->hide();
+            immediateDock->hide();
+        }
+        windowLayoutPersistenceReady = true;
+        applyResponsiveDockSizes();
+        windowLayoutSaveTimer.stop();
+    }
+
+    void scheduleWindowLayoutSave()
+    {
+        if (windowLayoutPersistenceReady && !applyingResponsiveDockLayout)
+            windowLayoutSaveTimer.start();
+    }
+
+    void saveWindowLayout()
+    {
+        if (!windowLayoutPersistenceReady)
+            return;
+        QSettings settings;
+        settings.setValue(QStringLiteral("windowLayout/geometry"), saveGeometry());
+        settings.setValue(QStringLiteral("windowLayout/state"), saveState(1));
+        for (QDockWidget *dock : layoutDocks()) {
+            if (!dock)
+                continue;
+            const QString prefix = QStringLiteral("windowLayout/dockRatios/") + dock->objectName() + QLatin1Char('/');
+            settings.setValue(prefix + QStringLiteral("horizontal"),
+                horizontalDockSizeRatios.value(dock->objectName(), defaultDockSizeRatio(dock, false)));
+            settings.setValue(prefix + QStringLiteral("vertical"),
+                verticalDockSizeRatios.value(dock->objectName(), defaultDockSizeRatio(dock, true)));
+        }
+    }
 
     void openManPage(const QString &command, bool isShellBuiltin, const QString &searchTerm)
     {
@@ -2401,29 +2389,30 @@ private:
         runSelectionAction->setEnabled(scriptEdit->textCursor().hasSelection());
         connect(scriptEdit, &QPlainTextEdit::copyAvailable, runSelectionAction, &QAction::setEnabled);
         connect(runSelectionAction, &QAction::triggered, this, [this]() { runScript(true); });
-        scriptMenu->addSeparator();
-        QAction *debugStartAction = scriptMenu->addAction(QStringLiteral("Start Debugging"));
+        QMenu *debugMenu = menuBar()->addMenu(QStringLiteral("&Debug"));
+        QAction *debugStartAction = debugMenu->addAction(QStringLiteral("Start Debugging"));
+        debugStartAction->setShortcut(QKeySequence(Qt::Key_F8));
         connect(debugStartAction, &QAction::triggered, this, [this]() { runScript(false, true); });
-        toggleBreakpointAction = scriptMenu->addAction(QStringLiteral("Toggle Breakpoint"));
+        toggleBreakpointAction = debugMenu->addAction(QStringLiteral("Toggle Breakpoint"));
         toggleBreakpointAction->setShortcut(QKeySequence(Qt::Key_F9));
         connect(toggleBreakpointAction, &QAction::triggered, this, [this]() {
             if (process.state() != QProcess::NotRunning)
                 return;
             scriptEdit->toggleBreakpoint(scriptEdit->textCursor().blockNumber() + 1);
         });
-        debugContinueAction = scriptMenu->addAction(QStringLiteral("Continue Debugging"));
+        debugContinueAction = debugMenu->addAction(QStringLiteral("Continue Debugging"));
         debugContinueAction->setShortcut(QKeySequence(Qt::Key_F5));
         connect(debugContinueAction, &QAction::triggered, this, [this]() { sendDebuggerCommand('c'); });
-        debugContinueExitAction = scriptMenu->addAction(QStringLiteral("Continue and Exit Debug"));
+        debugContinueExitAction = debugMenu->addAction(QStringLiteral("Continue and Exit Debug"));
         connect(debugContinueExitAction, &QAction::triggered, this,
                 [this]() { continueAndExitDebug(); });
-        debugStepOverAction = scriptMenu->addAction(QStringLiteral("Step Over"));
+        debugStepOverAction = debugMenu->addAction(QStringLiteral("Step Over"));
         debugStepOverAction->setShortcut(QKeySequence(Qt::Key_F10));
         connect(debugStepOverAction, &QAction::triggered, this, [this]() { sendDebuggerCommand('s'); });
-        debugStepInAction = scriptMenu->addAction(QStringLiteral("Step Into"));
+        debugStepInAction = debugMenu->addAction(QStringLiteral("Step Into"));
         debugStepInAction->setShortcut(QKeySequence(Qt::Key_F11));
         connect(debugStepInAction, &QAction::triggered, this, [this]() { sendDebuggerCommand('i'); });
-        debugStepOutAction = scriptMenu->addAction(QStringLiteral("Step Out"));
+        debugStepOutAction = debugMenu->addAction(QStringLiteral("Step Out"));
         debugStepOutAction->setShortcut(QKeySequence(QStringLiteral("Shift+F11")));
         connect(debugStepOutAction, &QAction::triggered, this, [this]() { sendDebuggerCommand('o'); });
         updateDebuggerActions();
@@ -2537,6 +2526,12 @@ private:
                 variablesDock->hide();
                 immediateDock->hide();
             }
+            if (!geometry.isEmpty() && !state.isEmpty()) {
+                captureDockSizeRatios();
+                applyResponsiveDockSizes();
+                if (windowLayoutPersistenceReady)
+                    windowLayoutSaveTimer.start();
+            }
         });
         viewMenu->addSeparator();
         QAction *resetLayoutAction = viewMenu->addAction(QStringLiteral("Reset Layout"));
@@ -2552,14 +2547,15 @@ private:
             addDockWidget(Qt::RightDockWidgetArea, variablesDock);
             addDockWidget(Qt::RightDockWidgetArea, folderBrowserDock);
             addDockWidget(Qt::BottomDockWidgetArea, outputDock);
+            addDockWidget(Qt::BottomDockWidgetArea, diagnosticsDock);
+            splitDockWidget(outputDock, diagnosticsDock, Qt::Vertical);
             addDockWidget(Qt::RightDockWidgetArea, immediateDock);
             splitDockWidget(immediateDock, variablesDock, Qt::Horizontal);
+            resetDockSizeRatios();
             if (folderMode) {
                 splitDockWidget(scriptDock, folderBrowserDock, Qt::Horizontal);
                 folderBrowserDock->show();
             }
-            resizeOutputDock(false);
-            resizeDocks({immediateDock, variablesDock}, {340, 480}, Qt::Horizontal);
         });
         viewMenu->addSeparator();
         const QKeySequence COLLAPSE_ALL_SEQUENCE = QKeySequence::fromString(
@@ -2590,6 +2586,20 @@ private:
         viewMenu->addAction(diagnosticsDock->toggleViewAction());
 
         QMenu *toolsMenu = menuBar()->addMenu(QStringLiteral("&Tools"));
+        QAction *gitWorkspaceAction = toolsMenu->addAction(QStringLiteral("Git Workspace…"));
+        gitWorkspaceAction->setToolTip(QStringLiteral("Open the built-in Git workspace for this folder"));
+        connect(gitWorkspaceAction, &QAction::triggered, this, [this]() {
+            QString path = folderMode && !folderRootPath.isEmpty() ? folderRootPath : expandedWorkingDirectory();
+            if (!ShellScratchpad::Git::GitWorkspaceWindow::isGitRepository(path)) {
+                QMessageBox::information(this, QStringLiteral("No Git repository"),
+                    QStringLiteral("Choose or open a folder inside a Git repository first."));
+                return;
+            }
+            auto *gitWindow = new ShellScratchpad::Git::GitWorkspaceWindow(path);
+            gitWindow->show();
+            gitWindow->raise();
+            gitWindow->activateWindow();
+        });
         QAction *snippetsAction = toolsMenu->addAction(QStringLiteral("Snippets…"));
         connect(snippetsAction, &QAction::triggered, this, [this]() {
             ShellScratchpad::Snippets::SnippetManagerDialog dialog(this);
@@ -2690,6 +2700,22 @@ private:
     {
         if (!folderFileBrowser || folderRootPath.isEmpty())
             return;
+        QSet<QString> expandedItems;
+        QString selectedPath;
+        std::function<void(QTreeWidgetItem *)> rememberTreeState = [&](QTreeWidgetItem *item) {
+            if (!item)
+                return;
+            const QString key = item->data(0, Qt::UserRole + 1).toString() + QLatin1Char('|')
+                + item->data(0, Qt::UserRole).toString();
+            if (item->isExpanded())
+                expandedItems.insert(key);
+            if (item->isSelected())
+                selectedPath = item->data(0, Qt::UserRole).toString();
+            for (int index = 0; index < item->childCount(); ++index)
+                rememberTreeState(item->child(index));
+        };
+        for (int index = 0; index < folderFileBrowser->topLevelItemCount(); ++index)
+            rememberTreeState(folderFileBrowser->topLevelItem(index));
         folderFileBrowser->clear();
         auto *scripts = new QTreeWidgetItem(folderFileBrowser, {QStringLiteral("Script Files")});
         auto *resources = new QTreeWidgetItem(folderFileBrowser, {QStringLiteral("Resource Files")});
@@ -2723,12 +2749,16 @@ private:
             }
             return parent;
         };
-        QDirIterator directories(folderRootPath, QDir::Dirs | QDir::NoDotAndDotDot, QDirIterator::Subdirectories);
+        QDirIterator directories(folderRootPath, QDir::Dirs | QDir::NoDotAndDotDot |
+            (folderShowHiddenCheck && folderShowHiddenCheck->isChecked() ? QDir::Hidden : QDir::NoFilter),
+            QDirIterator::Subdirectories);
         while (directories.hasNext()) {
             const QString directory = directories.next();
             ensureDirectoryNode(resources, directory);
         }
-        QDirIterator iterator(folderRootPath, QDir::Files | QDir::NoDotAndDotDot, QDirIterator::Subdirectories);
+        QDirIterator iterator(folderRootPath, QDir::Files | QDir::NoDotAndDotDot |
+            (folderShowHiddenCheck && folderShowHiddenCheck->isChecked() ? QDir::Hidden : QDir::NoFilter),
+            QDirIterator::Subdirectories);
         while (iterator.hasNext()) {
             const QString path = iterator.next();
             const QFileInfo info(path);
@@ -2748,14 +2778,128 @@ private:
         folderFileBrowser->invisibleRootItem()->removeChild(resources);
         folderFileBrowser->insertTopLevelItem(0, scripts);
         folderFileBrowser->insertTopLevelItem(1, resources);
-        scripts->setExpanded(true);
-        resources->setExpanded(false);
+        std::function<void(QTreeWidgetItem *)> restoreTreeState = [&](QTreeWidgetItem *item) {
+            const QString key = item->data(0, Qt::UserRole + 1).toString() + QLatin1Char('|')
+                + item->data(0, Qt::UserRole).toString();
+            if (expandedItems.contains(key))
+                item->setExpanded(true);
+            for (int index = 0; index < item->childCount(); ++index)
+                restoreTreeState(item->child(index));
+        };
+        restoreTreeState(scripts);
+        restoreTreeState(resources);
+        if (!folderTreeInitialized) {
+            scripts->setExpanded(true);
+            resources->setExpanded(false);
+        }
+        folderTreeInitialized = true;
+        if (!selectedPath.isEmpty()) {
+            std::function<bool(QTreeWidgetItem *)> restoreSelection = [&](QTreeWidgetItem *item) {
+                if (item->data(0, Qt::UserRole).toString() == selectedPath) {
+                    item->setSelected(true);
+                    folderFileBrowser->setCurrentItem(item);
+                    return true;
+                }
+                for (int index = 0; index < item->childCount(); ++index) {
+                    if (restoreSelection(item->child(index)))
+                        return true;
+                }
+                return false;
+            };
+            restoreSelection(scripts);
+            restoreSelection(resources);
+        }
+        applyFolderBrowserFilter();
+    }
+
+    void applyFolderBrowserFilter()
+    {
+        if (!folderFileBrowser)
+            return;
+        const QString query = folderSearchEdit ? folderSearchEdit->text().trimmed() : QString();
+        std::function<bool(QTreeWidgetItem *)> filterItem = [&](QTreeWidgetItem *item) {
+            bool childMatches = false;
+            for (int index = 0; index < item->childCount(); ++index)
+                childMatches = filterItem(item->child(index)) || childMatches;
+            const bool isCategory = item->data(0, Qt::UserRole + 1).toString() == QLatin1String("category");
+            const bool ownMatch = !query.isEmpty() && !isCategory
+                && (item->text(0).contains(query, Qt::CaseInsensitive)
+                    || item->data(0, Qt::UserRole).toString().contains(query, Qt::CaseInsensitive));
+            const bool visible = query.isEmpty() || ownMatch || childMatches;
+            item->setHidden(!visible);
+            if (!query.isEmpty() && childMatches)
+                item->setExpanded(true);
+            return visible;
+        };
+        for (int index = 0; index < folderFileBrowser->topLevelItemCount(); ++index)
+            filterItem(folderFileBrowser->topLevelItem(index));
+    }
+
+    void toggleFolderEntryGitIgnore(const QString &path, bool isDirectory)
+    {
+        if (folderRootPath.isEmpty())
+            return;
+        QProcess rootProcess;
+        rootProcess.setProgram(QStringLiteral("git"));
+        rootProcess.setArguments({QStringLiteral("-C"), folderRootPath,
+                                  QStringLiteral("rev-parse"), QStringLiteral("--show-toplevel")});
+        rootProcess.start();
+        if (!rootProcess.waitForFinished(3000) || rootProcess.exitCode() != 0) {
+            QMessageBox::information(this, QStringLiteral("Git repository required"),
+                                     QStringLiteral("This folder is not inside a Git working tree."));
+            return;
+        }
+        const QString repositoryRoot = QString::fromLocal8Bit(rootProcess.readAllStandardOutput()).trimmed();
+        const QString relativePath = QDir(repositoryRoot).relativeFilePath(QFileInfo(path).absoluteFilePath());
+        if (relativePath == QLatin1String("..") || relativePath.startsWith(QStringLiteral("../"))) {
+            QMessageBox::warning(this, QStringLiteral("Path outside repository"),
+                                 QStringLiteral("The selected entry is outside the Git repository."));
+            return;
+        }
+        QString escapedPath = relativePath;
+        for (const QChar special : {QLatin1Char('\\'), QLatin1Char('*'), QLatin1Char('?'),
+                                    QLatin1Char('['), QLatin1Char(']')})
+            escapedPath.replace(special, QLatin1Char('\\') + special);
+        const QString rule = QStringLiteral("/") + escapedPath + (isDirectory ? QStringLiteral("/") : QString());
+        const QString ignorePath = QDir(repositoryRoot).filePath(QStringLiteral(".gitignore"));
+        QFile ignoreFile(ignorePath);
+        QStringList lines;
+        if (ignoreFile.exists()) {
+            if (!ignoreFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                QMessageBox::warning(this, QStringLiteral("Cannot read .gitignore"), ignoreFile.errorString());
+                return;
+            }
+            lines = QString::fromUtf8(ignoreFile.readAll()).split(QLatin1Char('\n'));
+            ignoreFile.close();
+        }
+        const int matchingLine = lines.indexOf(rule);
+        if (matchingLine >= 0) {
+            lines.removeAt(matchingLine);
+            while (!lines.isEmpty() && lines.constLast().isEmpty())
+                lines.removeLast();
+        } else {
+            if (!lines.isEmpty() && !lines.constLast().isEmpty())
+                lines.append(QString());
+            lines.append(rule);
+        }
+        QSaveFile output(ignorePath);
+        if (!output.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            QMessageBox::warning(this, QStringLiteral("Cannot update .gitignore"), output.errorString());
+            return;
+        }
+        const QByteArray contents = lines.join(QLatin1Char('\n')).toUtf8() + '\n';
+        if (output.write(contents) != contents.size() || !output.commit()) {
+            QMessageBox::warning(this, QStringLiteral("Cannot update .gitignore"), output.errorString());
+            return;
+        }
+        statusBar()->showMessage(matchingLine >= 0 ? QStringLiteral("Removed %1 from .gitignore").arg(relativePath)
+                                                   : QStringLiteral("Added %1 to .gitignore").arg(relativePath), 4000);
     }
 
     void showFolderBrowserContextMenu(QTreeWidgetItem *item, const QPoint &globalPosition)
     {
-        const QString path = item->data(0, Qt::UserRole).toString();
-        const QString kind = item->data(0, Qt::UserRole + 1).toString();
+        const QString path = item ? item->data(0, Qt::UserRole).toString() : folderRootPath;
+        const QString kind = item ? item->data(0, Qt::UserRole + 1).toString() : QStringLiteral("category");
         const bool isCategory = kind == QLatin1String("category");
         if (path.isEmpty() || (kind != QLatin1String("folder") && kind != QLatin1String("file") && !isCategory))
             return;
@@ -2765,6 +2909,29 @@ private:
         QAction *openAction = menu.addAction(isDirectory ? QStringLiteral("Open in File Manager")
                                                         : QStringLiteral("Open in Editor"));
         QAction *copyPathAction = menu.addAction(QStringLiteral("Copy Path"));
+        QAction *copyRelativePathAction = menu.addAction(QStringLiteral("Copy Relative Path"));
+        QAction *gitIgnoreAction = nullptr;
+        if (!isCategory && !folderRootPath.isEmpty()) {
+            QProcess rootProcess;
+            rootProcess.setProgram(QStringLiteral("git"));
+            rootProcess.setArguments({QStringLiteral("-C"), folderRootPath,
+                                      QStringLiteral("rev-parse"), QStringLiteral("--show-toplevel")});
+            rootProcess.start();
+            if (rootProcess.waitForFinished(1000) && rootProcess.exitCode() == 0) {
+                const QString rootPath = QString::fromLocal8Bit(rootProcess.readAllStandardOutput()).trimmed();
+                QString relative = QDir(rootPath).relativeFilePath(QFileInfo(path).absoluteFilePath());
+                QString escaped = relative;
+                for (const QChar special : {QLatin1Char('\\'), QLatin1Char('*'), QLatin1Char('?'),
+                                            QLatin1Char('['), QLatin1Char(']')})
+                    escaped.replace(special, QLatin1Char('\\') + special);
+                const QString rule = QStringLiteral("/") + escaped + (isDirectory ? QStringLiteral("/") : QString());
+                QFile ignoreFile(QDir(rootPath).filePath(QStringLiteral(".gitignore")));
+                const bool alreadyListed = ignoreFile.open(QIODevice::ReadOnly | QIODevice::Text)
+                    && QString::fromUtf8(ignoreFile.readAll()).split(QLatin1Char('\n')).contains(rule);
+                gitIgnoreAction = menu.addAction(alreadyListed ? QStringLiteral("Remove from .gitignore")
+                                                               : QStringLiteral("Add to .gitignore"));
+            }
+        }
         menu.addSeparator();
         QAction *newFolderAction = nullptr;
         QAction *newScriptAction = nullptr;
@@ -2777,25 +2944,47 @@ private:
         }
         QAction *renameAction = menu.addAction(QStringLiteral("Rename…"));
         QAction *deleteAction = isCategory ? nullptr : menu.addAction(QStringLiteral("Delete…"));
-        const QAction *selected = menu.exec(globalPosition);
-        if (selected == openAction) {
+        renameAction->setEnabled(!isCategory);
+        // Dispatch only from QAction::triggered. QMenu::exec() can return an
+        // active action when a popup is dismissed by clicking outside it on
+        // some window systems; treating that return value as a selection can
+        // make an unrelated click in the tree run a context action.
+        connect(openAction, &QAction::triggered, this, [this, path, isDirectory] {
             if (isDirectory)
                 QDesktopServices::openUrl(QUrl::fromLocalFile(path));
             else
                 openFolderFile(path);
-        } else if (selected == copyPathAction) {
+        });
+        connect(copyPathAction, &QAction::triggered, this, [path] {
             QApplication::clipboard()->setText(path);
-        } else if (selected == newFolderAction) {
-            createFolderInDirectory(path);
-        } else if (selected == newScriptAction) {
-            createNewScriptInFolder(path);
-        } else if (selected == newResourceAction) {
-            createResourceFileInFolder(path);
-        } else if (selected == renameAction) {
+        });
+        connect(copyRelativePathAction, &QAction::triggered, this, [this, path] {
+            QApplication::clipboard()->setText(QDir(folderRootPath).relativeFilePath(path));
+        });
+        if (gitIgnoreAction)
+            connect(gitIgnoreAction, &QAction::triggered, this, [this, path, isDirectory] {
+                toggleFolderEntryGitIgnore(path, isDirectory);
+            });
+        if (newFolderAction)
+            connect(newFolderAction, &QAction::triggered, this, [this, path] {
+                createFolderInDirectory(path);
+            });
+        if (newScriptAction)
+            connect(newScriptAction, &QAction::triggered, this, [this, path] {
+                createNewScriptInFolder(path);
+            });
+        if (newResourceAction)
+            connect(newResourceAction, &QAction::triggered, this, [this, path] {
+                createResourceFileInFolder(path);
+            });
+        connect(renameAction, &QAction::triggered, this, [this, path, isDirectory] {
             renameFolderBrowserEntry(path, isDirectory);
-        } else if (selected == deleteAction) {
-            deleteFolderBrowserEntry(path, isDirectory);
-        }
+        });
+        if (deleteAction)
+            connect(deleteAction, &QAction::triggered, this, [this, path, isDirectory] {
+                deleteFolderBrowserEntry(path, isDirectory);
+            });
+        menu.exec(globalPosition);
     }
 
     void renameFolderBrowserEntry(const QString &path, bool isDirectory)
@@ -3008,6 +3197,8 @@ private:
         }
         if (folderMode && ROOT != folderRootPath && !closeFolderMode())
             return false;
+        if (folderRootPath != ROOT)
+            folderTreeInitialized = false;
         if (!folderMode) {
             quickModeScriptPath = currentScriptPath;
             quickModeContents = PREVIOUS_CONTENTS;
@@ -3026,10 +3217,8 @@ private:
         folderRootPath = ROOT;
         refreshFolderBrowser();
         folderBrowserDock->setVisible(!debuggerEnabled);
-        if (!debuggerEnabled) {
-            resizeDocks({scriptDock, folderBrowserDock}, {880, 100}, Qt::Horizontal);
+        if (!debuggerEnabled)
             folderBrowserDock->raise();
-        }
         if (folderBrowserAction)
             folderBrowserAction->setEnabled(!debuggerEnabled);
         if (folderMenuAction)
@@ -3815,33 +4004,25 @@ df -ih
 
     void showDiagnosticsDock()
     {
-        const bool WAS_VISIBLE = diagnosticsDock->isVisible();
         outputDock->hide();
         diagnosticsDock->show();
         diagnosticsDock->raise();
-        if (WAS_VISIBLE)
-            return;
-        if (diagnosticsDock->isFloating()) {
-            diagnosticsDock->resize(diagnosticsDock->width(), 240);
-        } else {
-            QTimer::singleShot(0, this, [this]() {
-                if (diagnosticsDock->isVisible() && !diagnosticsDock->isFloating())
-                    resizeDocks({diagnosticsDock}, {240}, Qt::Vertical);
-            });
-        }
     }
 
-    void resizeOutputDock(bool debugging)
+    void showRuntimeFailurePanels()
     {
-        const int EDITOR_HEIGHT = scriptDock ? scriptDock->height() : 0;
-        const int REFERENCE_HEIGHT = EDITOR_HEIGHT > 0 ? EDITOR_HEIGHT : height() * 2 / 3;
-        const int TARGET_HEIGHT = qMax(120, REFERENCE_HEIGHT / (debugging ? 4 : 2));
-        QTimer::singleShot(0, this, [this, TARGET_HEIGHT]() {
-            if (outputDock->isFloating())
-                outputDock->resize(outputDock->width(), TARGET_HEIGHT);
-            else if (outputDock->isVisible())
-                resizeDocks({outputDock}, {TARGET_HEIGHT}, Qt::Vertical);
-        });
+        const QList<QDockWidget *> OUTPUT_TABS = tabifiedDockWidgets(outputDock);
+        if (OUTPUT_TABS.contains(diagnosticsDock)) {
+            removeDockWidget(diagnosticsDock);
+            addDockWidget(dockWidgetArea(outputDock), diagnosticsDock);
+            splitDockWidget(outputDock, diagnosticsDock, Qt::Vertical);
+        }
+        outputDock->show();
+        diagnosticsDock->show();
+        diagnosticsDock->raise();
+        applyResponsiveDockSizes();
+        if (windowLayoutPersistenceReady)
+            windowLayoutSaveTimer.start();
     }
 
     void startShellCheck()
@@ -4132,34 +4313,6 @@ df -ih
         }
     }
 
-    void restoreRecoveryDraft()
-    {
-        QFile file(recoveryDraftPath());
-        if (!file.open(QIODevice::ReadOnly))
-            return;
-        recoveryDraftOwned = true;
-        const QJsonObject draft = QJsonDocument::fromJson(file.readAll()).object();
-        if (!draft.contains(QStringLiteral("script"))) {
-            clearRecoveryDraft();
-            return;
-        }
-        const QString CONTENT = draft.value(QStringLiteral("script")).toString();
-        const auto ANSWER = QMessageBox::question(
-            this, QStringLiteral("Recover previous script?"),
-            QStringLiteral("A draft from an interrupted session is available. Restore it?"),
-            QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
-        clearRecoveryDraft();
-        if (ANSWER != QMessageBox::Yes)
-            return;
-        currentScriptPath = draft.value(QStringLiteral("path")).toString();
-        if (!currentScriptPath.isEmpty())
-            applyScriptRunProfile(currentScriptPath);
-        scriptEdit->setPlainText(CONTENT);
-        scriptEdit->document()->setModified(true);
-        updateWindowTitle();
-        statusBar()->showMessage(QStringLiteral("Recovered draft"), 5000);
-    }
-
     void showScriptFind()
     {
         scriptSearchRow->show();
@@ -4245,7 +4398,7 @@ df -ih
                            "Ctrl+O — Open Script<br>Ctrl+W — Close Window<br><br>"
                            "<b>Edit</b><br>Ctrl+Z — Undo<br>Ctrl+Shift+Z — Redo<br>"
                            "Ctrl+X/C/V — Cut/Copy/Paste<br>Ctrl+A — Select All<br>Ctrl+F — Find<br><br>"
-                           "<b>Script</b><br>Alt+Enter — Run Script<br>"
+                           "<b>Script</b><br>Alt+Enter — Run Script<br>F8 — Start Debugging<br>"
                            "Shift+Alt+Enter — Stop Script<br><br>"
                            "<b>View</b><br>Ctrl++ — Zoom In<br>Ctrl+- — Zoom Out<br>Ctrl+0 — Reset Zoom<br><br>"
                            "Ctrl+M, Ctrl+O — Collapse All Sections<br>"
@@ -4903,7 +5056,6 @@ df -ih
         folderBrowserDock->setVisible(folderMode);
         variablesDock->hide();
         immediateDock->hide();
-        resizeOutputDock(false);
         updateDebuggerActions();
         statusBar()->showMessage(QStringLiteral("Running without debugging until the next breakpoint"));
     }
@@ -5078,7 +5230,6 @@ df -ih
                     immediateDock->show();
                     variablesPanel->show();
                     immediatePanel->show();
-                    resizeOutputDock(true);
                 }
                 debuggerPaused = true;
                 pauseRequestPending = false;
@@ -5361,7 +5512,6 @@ df -ih
         variablesPanel->setVisible(DEBUGGING_ENABLED);
         immediatePanel->setVisible(DEBUGGING_ENABLED);
         if (DEBUGGING_ENABLED) {
-            resizeDocks({immediateDock, variablesDock}, {340, 480}, Qt::Horizontal);
             debuggerBanner->setText(QStringLiteral("DEBUG MODE — running until the next breakpoint"));
             debuggerBanner->setStyleSheet(QStringLiteral("QLabel { background: #805c12; color: white; font-weight: bold; padding: 6px; border-radius: 3px; }"));
             immediateOutputEdit->clear();
@@ -5375,10 +5525,17 @@ df -ih
         scriptEdit->setReadOnly(DEBUGGING_ENABLED);
         if (toggleBreakpointAction)
             toggleBreakpointAction->setEnabled(false);
-        const QByteArray RUNTIME_SCRIPT = buildRuntimeScript(
-            sourceText.toUtf8(), guiSudoPromptsAction->isChecked(),
-            reuseSudoPasswordAction->isChecked(), CAPTURE_HISTORY, true,
-            BREAKPOINTS, selectedStartLine - 1, forceDebug, &currentRunUserScriptStartLine);
+        ShellScratchpad::Language::BashExecutionRequest executionRequest;
+        executionRequest.source = sourceText.toUtf8();
+        executionRequest.guiSudoPrompts = guiSudoPromptsAction->isChecked();
+        executionRequest.reuseSudoPassword = reuseSudoPasswordAction->isChecked();
+        executionRequest.captureHistory = CAPTURE_HISTORY;
+        executionRequest.debuggingEnabled = true;
+        executionRequest.breakpoints = BREAKPOINTS;
+        executionRequest.sourceLineOffset = selectedStartLine - 1;
+        executionRequest.startPaused = forceDebug;
+        const QByteArray RUNTIME_SCRIPT = ShellScratchpad::Language::BashExecutionHandler::buildRuntimeScript(
+            executionRequest, &currentRunUserScriptStartLine);
         currentHistoryLineOffset = selectionOnly ? selectedStartLine - 1 : 0;
         bool runtimeFileInWorkingDirectory = false;
         runtimeScriptPath = createRuntimeScriptFile(
@@ -5419,7 +5576,6 @@ df -ih
         clearRuntimeDiagnostics();
         outputDock->show();
         outputDock->raise();
-        resizeOutputDock(DEBUGGING_ENABLED);
         pendingOutput.clear();
         runDiagnosticOutput.clear();
         clearSudoPasswordCache();
@@ -5472,50 +5628,9 @@ df -ih
             runEnvironment.insert(QStringLiteral("SSPAD_SUDO_SHIM_PATH"), sudoShimDirectory->path());
         }
         process.setProcessEnvironment(runEnvironment);
-        process.setProgram(QStringLiteral("/bin/bash"));
-        process.setArguments({QStringLiteral("--noprofile"), QStringLiteral("--norc"),
-                              runtimeScriptPath});
-        const int CHILD_SCRIPT_DESCRIPTOR = scriptFileDescriptor;
-        const int CHILD_HISTORY_READ_DESCRIPTOR = runHistoryReadDescriptor;
-        const int CHILD_HISTORY_WRITE_DESCRIPTOR = runHistoryWriteDescriptor;
-        const int CHILD_DEBUG_DESCRIPTOR = debuggerChildSocketDescriptor;
-        const int PARENT_DEBUG_DESCRIPTOR = debuggerSocketDescriptor;
-        process.setChildProcessModifier([CHILD_SCRIPT_DESCRIPTOR, CHILD_HISTORY_READ_DESCRIPTOR,
-                                         CHILD_HISTORY_WRITE_DESCRIPTOR, CHILD_DEBUG_DESCRIPTOR,
-                                         PARENT_DEBUG_DESCRIPTOR]() {
-            if (::setsid() < 0)
-                ::_exit(126);
-            if (::dup2(CHILD_SCRIPT_DESCRIPTOR, SCRIPT_DESCRIPTOR) < 0)
-                ::_exit(126);
-            const int DESCRIPTOR_FLAGS = ::fcntl(SCRIPT_DESCRIPTOR, F_GETFD);
-            if (DESCRIPTOR_FLAGS < 0 ||
-                ::fcntl(SCRIPT_DESCRIPTOR, F_SETFD, DESCRIPTOR_FLAGS & ~FD_CLOEXEC) < 0)
-                ::_exit(126);
-            if (CHILD_HISTORY_WRITE_DESCRIPTOR >= 0) {
-                if (::dup2(CHILD_HISTORY_WRITE_DESCRIPTOR, HISTORY_DESCRIPTOR) < 0)
-                    ::_exit(126);
-                const int HISTORY_FLAGS = ::fcntl(HISTORY_DESCRIPTOR, F_GETFD);
-                if (HISTORY_FLAGS < 0 ||
-                    ::fcntl(HISTORY_DESCRIPTOR, F_SETFD, HISTORY_FLAGS & ~FD_CLOEXEC) < 0)
-                    ::_exit(126);
-                if (CHILD_HISTORY_READ_DESCRIPTOR >= 0)
-                    ::close(CHILD_HISTORY_READ_DESCRIPTOR);
-                if (CHILD_HISTORY_WRITE_DESCRIPTOR != HISTORY_DESCRIPTOR)
-                    ::close(CHILD_HISTORY_WRITE_DESCRIPTOR);
-            }
-            if (CHILD_DEBUG_DESCRIPTOR >= 0) {
-                if (::dup2(CHILD_DEBUG_DESCRIPTOR, DEBUG_DESCRIPTOR) < 0)
-                    ::_exit(126);
-                const int DEBUG_FLAGS = ::fcntl(DEBUG_DESCRIPTOR, F_GETFD);
-                if (DEBUG_FLAGS < 0 ||
-                    ::fcntl(DEBUG_DESCRIPTOR, F_SETFD, DEBUG_FLAGS & ~FD_CLOEXEC) < 0)
-                    ::_exit(126);
-                if (PARENT_DEBUG_DESCRIPTOR >= 0 && PARENT_DEBUG_DESCRIPTOR != DEBUG_DESCRIPTOR)
-                    ::close(PARENT_DEBUG_DESCRIPTOR);
-                if (CHILD_DEBUG_DESCRIPTOR != DEBUG_DESCRIPTOR)
-                    ::close(CHILD_DEBUG_DESCRIPTOR);
-            }
-        });
+        ShellScratchpad::Language::BashExecutionHandler::configureProcess(
+            process, runtimeScriptPath, scriptFileDescriptor, runHistoryReadDescriptor,
+            runHistoryWriteDescriptor, debuggerChildSocketDescriptor, debuggerSocketDescriptor);
 
         runButton->setEnabled(false);
         stopButton->setEnabled(true);
@@ -5660,6 +5775,10 @@ exit "$command_status"
     {
         if (text.isEmpty())
             return;
+        if (outputEdit && outputEdit->viewport()->height() > 0) {
+            const int lineHeight = qMax(1, outputEdit->fontMetrics().lineSpacing());
+            terminalOutputRenderer->setScreenRows(outputEdit->viewport()->height() / lineHeight);
+        }
         terminalOutputRenderer->append(text);
         outputContent = terminalOutputRenderer->plainText();
         if (outputFindEdit->text().isEmpty()) {
@@ -5903,49 +6022,50 @@ exit "$command_status"
 
     void appendPostRunDiagnostics(int exitCode)
     {
-        if (currentRunSourceText != scriptEdit->toPlainText())
-            return;
+        const bool SOURCE_UNCHANGED = currentRunSourceText == scriptEdit->toPlainText();
         const QString output = QString::fromLocal8Bit(runDiagnosticOutput);
         static const QRegularExpression BASH_LINE_ERROR(
             QStringLiteral(R"(.+: line (\d+): (.+))"));
         QSet<QString> reported;
-        for (const QString &outputLine : output.split(QLatin1Char('\n'))) {
-            const auto match = BASH_LINE_ERROR.match(outputLine.trimmed());
-            if (!match.hasMatch())
-                continue;
-            bool validLine = false;
-            const int runtimeLine = match.captured(1).toInt(&validLine);
-            if (!validLine)
-                continue;
-            const int sourceLine = runtimeLine - currentRunUserScriptStartLine + 1 + currentHistoryLineOffset;
-            const QTextBlock block = scriptEdit->document()->findBlockByNumber(sourceLine - 1);
-            if (sourceLine < 1 || !block.isValid())
-                continue;
-            const QString message = QStringLiteral("%1 (run exited with code %2)")
-                .arg(match.captured(2).trimmed()).arg(exitCode);
-            const QString uniqueKey = QStringLiteral("%1:%2").arg(sourceLine).arg(message);
-            if (reported.contains(uniqueKey))
-                continue;
-            reported.insert(uniqueKey);
+        if (SOURCE_UNCHANGED) {
+            for (const QString &outputLine : output.split(QLatin1Char('\n'))) {
+                const auto match = BASH_LINE_ERROR.match(outputLine.trimmed());
+                if (!match.hasMatch())
+                    continue;
+                bool validLine = false;
+                const int runtimeLine = match.captured(1).toInt(&validLine);
+                if (!validLine)
+                    continue;
+                const int sourceLine = runtimeLine - currentRunUserScriptStartLine + 1 + currentHistoryLineOffset;
+                const QTextBlock block = scriptEdit->document()->findBlockByNumber(sourceLine - 1);
+                if (sourceLine < 1 || !block.isValid())
+                    continue;
+                const QString message = QStringLiteral("%1 (run exited with code %2)")
+                    .arg(match.captured(2).trimmed()).arg(exitCode);
+                const QString uniqueKey = QStringLiteral("%1:%2").arg(sourceLine).arg(message);
+                if (reported.contains(uniqueKey))
+                    continue;
+                reported.insert(uniqueKey);
 
-            auto *item = new QListWidgetItem(
-                QStringLiteral("ERROR  Runtime  Line %1:1 — %2").arg(sourceLine).arg(message), diagnosticsList);
-            item->setData(Qt::UserRole, sourceLine);
-            item->setData(Qt::UserRole + 1, 0);
-            item->setData(Qt::UserRole + 2, 1);
-            item->setData(Qt::UserRole + 3, QStringLiteral("error"));
-            item->setData(Qt::UserRole + 4, message);
-            item->setData(Qt::UserRole + 5, QStringLiteral("runtime"));
-            item->setForeground(QColor(QStringLiteral("#e06c75")));
+                auto *item = new QListWidgetItem(
+                    QStringLiteral("ERROR  Runtime  Line %1:1 — %2").arg(sourceLine).arg(message), diagnosticsList);
+                item->setData(Qt::UserRole, sourceLine);
+                item->setData(Qt::UserRole + 1, 0);
+                item->setData(Qt::UserRole + 2, 1);
+                item->setData(Qt::UserRole + 3, QStringLiteral("error"));
+                item->setData(Qt::UserRole + 4, message);
+                item->setData(Qt::UserRole + 5, QStringLiteral("runtime"));
+                item->setForeground(QColor(QStringLiteral("#e06c75")));
 
-            const qsizetype start = block.position();
-            const qsizetype length = qMax(1, block.text().size());
-            QTextCharFormat format;
-            format.setUnderlineStyle(QTextCharFormat::WaveUnderline);
-            format.setUnderlineColor(QColor(QStringLiteral("#ef5350")));
-            runtimeDiagnosticDecorations.append({start, length, format});
+                const qsizetype start = block.position();
+                const qsizetype length = qMax(1, block.text().size());
+                QTextCharFormat format;
+                format.setUnderlineStyle(QTextCharFormat::WaveUnderline);
+                format.setUnderlineColor(QColor(QStringLiteral("#ef5350")));
+                runtimeDiagnosticDecorations.append({start, length, format});
+            }
         }
-        if (reported.isEmpty() && !runHistorySourceLines.isEmpty()) {
+        if (SOURCE_UNCHANGED && reported.isEmpty() && !runHistorySourceLines.isEmpty()) {
             const int sourceLine = runHistorySourceLines.constLast();
             const QTextBlock block = scriptEdit->document()->findBlockByNumber(sourceLine - 1);
             if (sourceLine > 0 && block.isValid()) {
@@ -5970,12 +6090,23 @@ exit "$command_status"
                 reported.insert(QStringLiteral("inferred"));
             }
         }
-        if (reported.isEmpty())
-            return;
+        if (reported.isEmpty()) {
+            const QString message = QStringLiteral(
+                "Script exited with code %1. See Output for the command's error details.").arg(exitCode);
+            auto *item = new QListWidgetItem(QStringLiteral("ERROR  Runtime — %1").arg(message), diagnosticsList);
+            item->setData(Qt::UserRole, 0);
+            item->setData(Qt::UserRole + 1, 0);
+            item->setData(Qt::UserRole + 2, 0);
+            item->setData(Qt::UserRole + 3, QStringLiteral("error"));
+            item->setData(Qt::UserRole + 4, message);
+            item->setData(Qt::UserRole + 5, QStringLiteral("runtime"));
+            item->setForeground(QColor(QStringLiteral("#e06c75")));
+            reported.insert(QStringLiteral("unmapped"));
+        }
         applyDiagnosticDecorations();
-        showDiagnosticsDock();
+        showRuntimeFailurePanels();
         diagnosticsList->scrollToBottom();
-        statusBar()->showMessage(QStringLiteral("Runtime error locations: %1").arg(reported.size()), 5000);
+        statusBar()->showMessage(QStringLiteral("Runtime failure; see Output and Script Diagnostics"), 5000);
     }
 
     QString latestOutputLine() const
@@ -6163,18 +6294,26 @@ int main(int argc, char *argv[])
         QStringLiteral("open-folder"), QStringLiteral("Open the selected directory in folder mode."),
         QStringLiteral("directory"));
     parser.addOption(openFolderOption);
+    QCommandLineOption gitWorkspaceOption(
+        QStringLiteral("git-workspace"), QStringLiteral("Open the built-in Git workspace."));
+    parser.addOption(gitWorkspaceOption);
     parser.addPositionalArgument(QStringLiteral("script"),
                                  QStringLiteral("Open a Bash script file."));
     parser.process(application);
 
     const QStringList POSITIONAL_ARGUMENTS = parser.positionalArguments();
-    const QString INITIAL_SCRIPT_PATH = POSITIONAL_ARGUMENTS.isEmpty()
+    const QString POSITIONAL_PATH = POSITIONAL_ARGUMENTS.isEmpty()
         ? QString() : QFileInfo(POSITIONAL_ARGUMENTS.first()).absoluteFilePath();
+    const QString POSITIONAL_FOLDER_PATH = !POSITIONAL_PATH.isEmpty() && QFileInfo(POSITIONAL_PATH).isDir()
+        ? POSITIONAL_PATH : QString();
+    const QString INITIAL_SCRIPT_PATH = POSITIONAL_FOLDER_PATH.isEmpty() ? POSITIONAL_PATH : QString();
+    const QString INITIAL_FOLDER_PATH = parser.isSet(openFolderOption)
+        ? parser.value(openFolderOption).trimmed() : POSITIONAL_FOLDER_PATH;
 
     QString initialWorkingDirectory = parser.value(workingDirectoryOption).trimmed();
     if (initialWorkingDirectory.isEmpty()) {
-        initialWorkingDirectory = parser.isSet(openFolderOption)
-            ? parser.value(openFolderOption).trimmed()
+        initialWorkingDirectory = !INITIAL_FOLDER_PATH.isEmpty()
+            ? INITIAL_FOLDER_PATH
             : (INITIAL_SCRIPT_PATH.isEmpty() ? QDir::homePath() : QFileInfo(INITIAL_SCRIPT_PATH).absolutePath());
     } else {
         if (initialWorkingDirectory == QStringLiteral("~")) {
@@ -6187,9 +6326,26 @@ int main(int argc, char *argv[])
             : initialWorkingDirectory);
     }
 
+    if (parser.isSet(gitWorkspaceOption)) {
+        QString repositoryPath = POSITIONAL_ARGUMENTS.isEmpty()
+            ? initialWorkingDirectory : QFileInfo(POSITIONAL_ARGUMENTS.first()).absoluteFilePath();
+        if (repositoryPath == QStringLiteral("~"))
+            repositoryPath = QDir::homePath();
+        else if (repositoryPath.startsWith(QStringLiteral("~/")))
+            repositoryPath = QDir::home().filePath(repositoryPath.mid(2));
+        if (!ShellScratchpad::Git::GitWorkspaceWindow::isGitRepository(repositoryPath)) {
+            QMessageBox::critical(nullptr, QStringLiteral("Git repository required"),
+                                  QStringLiteral("The selected folder is not inside a Git working tree."));
+            return 2;
+        }
+        auto *gitWindow = new ShellScratchpad::Git::GitWorkspaceWindow(repositoryPath);
+        gitWindow->show();
+        return application.exec();
+    }
+
     auto *window = new ShellScratchpadWindow(initialWorkingDirectory, INITIAL_SCRIPT_PATH, true);
-    if (parser.isSet(openFolderOption))
-        window->openFolderOnStartup(parser.value(openFolderOption));
+    if (!INITIAL_FOLDER_PATH.isEmpty())
+        window->openFolderOnStartup(INITIAL_FOLDER_PATH);
     window->show();
     return application.exec();
 }

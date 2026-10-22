@@ -16,6 +16,8 @@
 #include <QTextDocument>
 #include <QTextBlockUserData>
 #include <QCursor>
+#include <QMimeData>
+#include <QRegularExpression>
 #include <algorithm>
 
 namespace ShellScratchpad
@@ -352,6 +354,47 @@ void CodeEditor::keyPressEvent(QKeyEvent *event)
     setCursorWidth(normalCursorWidth);
     setTextCursor(insertion);
     event->accept();
+}
+
+void CodeEditor::insertFromMimeData(const QMimeData *source)
+{
+    if (!source || !source->hasText()) {
+        QPlainTextEdit::insertFromMimeData(source);
+        return;
+    }
+
+    const QString pastedText = source->text();
+    static const QRegularExpression codeFencePattern(
+        QStringLiteral("\\A[\\t ]*(?<fence>`{3,}|~{3,})[^\\r\\n]*(?:\\r\\n|\\n|\\r)"
+                       "(?<body>[\\s\\S]*?)(?:\\r\\n|\\n|\\r)[\\t ]*\\k<fence>[\\t ]*(?:\\r\\n|\\n|\\r)?\\z"));
+    const QRegularExpressionMatch match = codeFencePattern.match(pastedText);
+    if (!match.hasMatch()) {
+        QPlainTextEdit::insertFromMimeData(source);
+        return;
+    }
+
+    const QString body = match.captured(QStringLiteral("body"));
+    const qsizetype bodyStart = match.capturedStart(QStringLiteral("body"));
+    const qsizetype bodyEnd = match.capturedEnd(QStringLiteral("body"));
+    QTextCursor cursor = textCursor();
+    const qsizetype insertionStart = cursor.selectionStart();
+    cursor.beginEditBlock();
+    cursor.insertText(pastedText);
+    cursor.endEditBlock();
+
+    // Keep paste and fence removal as separate undo steps. The first Undo
+    // restores the Markdown fences while leaving the code in the editor.
+    cursor.beginEditBlock();
+    cursor.setPosition(insertionStart + bodyEnd);
+    cursor.setPosition(insertionStart + pastedText.size(), QTextCursor::KeepAnchor);
+    cursor.removeSelectedText();
+    cursor.setPosition(insertionStart);
+    cursor.setPosition(insertionStart + bodyStart, QTextCursor::KeepAnchor);
+    cursor.removeSelectedText();
+    cursor.endEditBlock();
+    cursor.setPosition(insertionStart + body.size());
+    setTextCursor(cursor);
+    emit markdownCodeBlockUnwrapped();
 }
 
 bool CodeEditor::indentSelectedLines(bool unindent)

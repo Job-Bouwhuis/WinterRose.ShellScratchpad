@@ -39,7 +39,9 @@ uninstall_app() {
         "${INSTALL_PREFIX}/bin/shell-scratchpad-launcher" \
         "${INSTALL_PREFIX}/bin/shell-scratchpad-steamos" \
         "${INSTALL_PREFIX}/share/applications/org.winterrose.shellscratchpad.desktop" \
+        "${INSTALL_PREFIX}/share/applications/org.winterrose.shellscratchpad-git.desktop" \
         "${INSTALL_PREFIX}/share/kio/servicemenus/org.winterrose.shellscratchpad-servicemenu.desktop" \
+        "${INSTALL_PREFIX}/share/kio/servicemenus/org.winterrose.shellscratchpad-open-folder-servicemenu.desktop" \
         "${INSTALL_PREFIX}/share/kio/servicemenus/org.winterrose.shellscratchpad-script-servicemenu.desktop" \
         "${INSTALL_PREFIX}/share/icons/hicolor/scalable/apps/shell-scratchpad.svg"
     if command -v update-desktop-database >/dev/null 2>&1 \
@@ -116,6 +118,7 @@ EOF
         chmod 0755 "${RUNNER}"
         # Point desktop and Dolphin actions at the host-side Distrobox wrapper.
         for desktop_file in "${INSTALL_PREFIX}/share/applications/org.winterrose.shellscratchpad.desktop" \
+            "${INSTALL_PREFIX}/share/applications/org.winterrose.shellscratchpad-git.desktop" \
             "${INSTALL_PREFIX}/share/kio/servicemenus/org.winterrose.shellscratchpad-servicemenu.desktop" \
             "${INSTALL_PREFIX}/share/kio/servicemenus/org.winterrose.shellscratchpad-script-servicemenu.desktop"; do
             if [[ -f "${desktop_file}" ]]; then
@@ -261,10 +264,12 @@ fi
 
 say "Installing ${APP_NAME} for the current user into ${INSTALL_PREFIX}"
 cmake --install "${BUILD_DIR}" --prefix "${INSTALL_PREFIX}"
+rm -f -- "${INSTALL_PREFIX}/share/kio/servicemenus/org.winterrose.shellscratchpad-open-folder-servicemenu.desktop"
 
 APP_EXECUTABLE="${INSTALL_PREFIX}/bin/shell-scratchpad"
 APP_LAUNCHER="${INSTALL_PREFIX}/bin/shell-scratchpad-launcher"
 DESKTOP_FILE="${INSTALL_PREFIX}/share/applications/org.winterrose.shellscratchpad.desktop"
+GIT_DESKTOP_FILE="${INSTALL_PREFIX}/share/applications/org.winterrose.shellscratchpad-git.desktop"
 SERVICE_MENU_FILE="${INSTALL_PREFIX}/share/kio/servicemenus/org.winterrose.shellscratchpad-servicemenu.desktop"
 SCRIPT_SERVICE_MENU_FILE="${INSTALL_PREFIX}/share/kio/servicemenus/org.winterrose.shellscratchpad-script-servicemenu.desktop"
 
@@ -286,18 +291,25 @@ EOF
     chmod 0755 "${APP_LAUNCHER}"
     # Desktop Entry files do not expand shell variables. Store the concrete path
     # so the launcher works even when ~/.local/bin is not on the desktop session's PATH.
-    DESKTOP_TEMP="$(mktemp)"
-    awk -v exec_path="${APP_EXECUTABLE}" '
+    for desktop_file in "${DESKTOP_FILE}" "${GIT_DESKTOP_FILE}"; do
+        [[ -f "${desktop_file}" ]] || continue
+        DESKTOP_TEMP="$(mktemp)"
+        awk -v exec_path="${APP_EXECUTABLE}" '
         BEGIN {
             gsub(/\\/, "\\\\", exec_path)
             gsub(/"/, "\\\"", exec_path)
         }
-        /^Exec=/ { print "Exec=\"" exec_path "\" %f"; next }
+        /^Exec=shell-scratchpad([[:space:]]|$)/ {
+            sub(/^Exec=shell-scratchpad/, "", $0)
+            print "Exec=\"" exec_path "\"" $0
+            next
+        }
         { print }
-    ' "${DESKTOP_FILE}" > "${DESKTOP_TEMP}"
-    sed -i "s|${APP_EXECUTABLE}|${APP_LAUNCHER}|g" "${DESKTOP_TEMP}"
-    install -m 0644 "${DESKTOP_TEMP}" "${DESKTOP_FILE}"
-    rm -f -- "${DESKTOP_TEMP}"
+        ' "${desktop_file}" > "${DESKTOP_TEMP}"
+        sed -i "s|${APP_EXECUTABLE}|${APP_LAUNCHER}|g" "${DESKTOP_TEMP}"
+        install -m 0644 "${DESKTOP_TEMP}" "${desktop_file}"
+        rm -f -- "${DESKTOP_TEMP}"
+    done
 fi
 
 if [[ -x "${APP_EXECUTABLE}" && -f "${SCRIPT_SERVICE_MENU_FILE}" ]]; then
@@ -332,10 +344,6 @@ if [[ -x "${APP_EXECUTABLE}" && -f "${SERVICE_MENU_FILE}" ]]; then
             print "Exec=\"" exec_path "\" --working-directory %f"
             next
         }
-        /^Exec=shell-scratchpad --open-folder %f$/ {
-            print "Exec=\"" exec_path "\" --open-folder %f"
-            next
-        }
         { print }
     ' "${SERVICE_MENU_FILE}" > "${SERVICE_MENU_TEMP}"
     install -m 0755 "${SERVICE_MENU_TEMP}" "${SERVICE_MENU_FILE}"
@@ -353,8 +361,8 @@ say "Setup complete"
 printf '%s is built and installed.\n' "${APP_NAME}"
 printf 'Run it now with: "%s"\n' "${APP_EXECUTABLE}"
 printf 'It should also appear in the KDE application launcher as: %s\n' "${APP_NAME}"
-printf 'Dolphin context menu: right-click a directory and choose "Open Shell Scratchpad" or "Open Folder".\n'
-printf 'Open Shell Scratchpad pre-fills the working directory; Open Folder opens folder mode with the file browser.\n'
+printf 'Dolphin context menu: right-click a directory and choose "Open Shell Scratchpad" or "Open Folder With > Shell Scratchpad".\n'
+printf 'Open Shell Scratchpad pre-fills the working directory; Open Folder With opens folder mode with the file browser.\n'
 printf 'Dolphin script menu: right-click a .sh file and choose "Open in Shell Scratchpad".\n'
 printf '\nBuild directory: %s\n' "${BUILD_DIR}"
 printf 'Install prefix:  %s\n' "${INSTALL_PREFIX}"

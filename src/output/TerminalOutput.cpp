@@ -5,11 +5,27 @@
 #include <QPalette>
 #include <QTextBlock>
 #include <QTextBlockFormat>
+#include <QTextFragment>
 #include <QTextDocument>
 #include <QStringList>
 
 namespace ShellScratchpad::Output
 {
+namespace
+{
+struct FormattedRun
+{
+    QString text;
+    QTextCharFormat format;
+};
+
+struct ScreenRow
+{
+    QVector<FormattedRun> runs;
+    QTextBlockFormat format;
+};
+}
+
 TerminalOutput::TerminalOutput(QTextDocument *document)
     : document(document), textCursor(document)
 {
@@ -41,6 +57,7 @@ void TerminalOutput::append(const QString &text)
             } else if (character == QLatin1Char('\n')) {
                 textCursor.movePosition(QTextCursor::EndOfBlock);
                 textCursor.insertBlock(QTextBlockFormat(), currentFormat);
+                updateScreenTopForCursor();
             } else if (character == QLatin1Char('\b')) {
                 if (textCursor.position() > textCursor.block().position())
                     textCursor.movePosition(QTextCursor::Left);
@@ -64,6 +81,7 @@ void TerminalOutput::append(const QString &text)
             } else if (character == QLatin1Char('D')) {
                 textCursor.movePosition(QTextCursor::EndOfBlock);
                 textCursor.insertBlock(QTextBlockFormat(), currentFormat);
+                updateScreenTopForCursor();
                 escapeState = EscapeState::Normal;
             } else if (character == QLatin1Char('M')) {
                 moveVertical(-1);
@@ -98,6 +116,12 @@ void TerminalOutput::append(const QString &text)
     FLUSH_PRINTABLE();
 }
 
+void TerminalOutput::setScreenRows(int rows)
+{
+    screenRows = qBound(0, rows, 1000);
+    updateScreenTopForCursor();
+}
+
 void TerminalOutput::clear()
 {
     document->clear();
@@ -110,6 +134,10 @@ void TerminalOutput::clear()
     foreground = QColor();
     background = QColor();
     savedCursorPosition = 0;
+    scrollingRegionTop = 0;
+    scrollingRegionBottom = -1;
+    scrollingRegionSet = false;
+    screenTopRow = 0;
     updateFormat();
 }
 
@@ -177,6 +205,12 @@ void TerminalOutput::handleCsi(QChar finalCharacter)
     }
     case 'P': deleteCharacters(qMax(first, 1)); break;
     case '@': insertSpaces(qMax(first, 1)); break;
+    case 'L': insertLines(qMax(first, 1)); break;
+    case 'M': deleteLines(qMax(first, 1)); break;
+    case 'S': scrollLines(qMax(first, 1), false); break;
+    case 'T': scrollLines(qMax(first, 1), true); break;
+    case 'r': setScrollingRegion(qMax(parameter(values, 0, 1), 1) - 1,
+                                 qMax(parameter(values, 1, document->blockCount()), 1) - 1); break;
     case 's': savedCursorPosition = textCursor.position(); break;
     case 'u': textCursor.setPosition(qBound(0, savedCursorPosition, document->characterCount() - 1)); break;
     default: break;
@@ -275,6 +309,7 @@ void TerminalOutput::eraseDisplay(int mode)
     } else if (mode == 2 || mode == 3) {
         document->clear();
         textCursor = QTextCursor(document);
+        screenTopRow = 0;
     } else {
         textCursor.setPosition(textCursor.position());
         textCursor.setPosition(end, QTextCursor::KeepAnchor);
@@ -298,7 +333,7 @@ void TerminalOutput::moveToColumn(int column)
 
 void TerminalOutput::moveToPosition(int row, int column)
 {
-    row = qBound(0, row, 1000);
+    row = qBound(0, row, screenRows > 0 ? screenRows - 1 : 1000) + screenTopRow;
     while (!document->findBlockByNumber(row).isValid()) {
         textCursor.movePosition(QTextCursor::End);
         textCursor.insertBlock(QTextBlockFormat(), currentFormat);
@@ -311,8 +346,13 @@ void TerminalOutput::moveVertical(int lines)
 {
     if (lines == 0)
         return;
-    textCursor.movePosition(lines < 0 ? QTextCursor::Up : QTextCursor::Down,
-                            QTextCursor::MoveAnchor, qMin(qAbs(lines), 1000));
+    const int targetRow = qBound(screenTopRow,
+        textCursor.blockNumber() + lines,
+        screenRows > 0 ? screenTopRow + screenRows - 1 : qMax(0, document->blockCount() - 1));
+    const int column = textCursor.position() - textCursor.block().position();
+    ensureLineCount(targetRow + 1);
+    textCursor = QTextCursor(document->findBlockByNumber(targetRow));
+    moveToColumn(column);
 }
 
 void TerminalOutput::insertSpaces(int count)
@@ -331,6 +371,116 @@ void TerminalOutput::deleteCharacters(int count)
         return;
     textCursor.setPosition(selectionEnd, QTextCursor::KeepAnchor);
     textCursor.removeSelectedText();
+}
+
+void TerminalOutput::insertLines(int count)
+{
+    const int top = scrollingRegionSet ? screenTopRow + scrollingRegionTop : screenTopRow;
+    const int bottom = scrollingRegionSet ? screenTopRow + scrollingRegionBottom
+        : qMax(document->blockCount() - 1, screenTopRow + screenRows - 1);
+    if (textCursor.blockNumber() < top || textCursor.blockNumber() > bottom)
+        return;
+    mutateLineRange(textCursor.blockNumber(), bottom, count, true);
+}
+
+void TerminalOutput::deleteLines(int count)
+{
+    const int top = scrollingRegionSet ? screenTopRow + scrollingRegionTop : screenTopRow;
+    const int bottom = scrollingRegionSet ? screenTopRow + scrollingRegionBottom
+        : qMax(document->blockCount() - 1, screenTopRow + screenRows - 1);
+    if (textCursor.blockNumber() < top || textCursor.blockNumber() > bottom)
+        return;
+    mutateLineRange(textCursor.blockNumber(), bottom, count, false);
+}
+
+void TerminalOutput::scrollLines(int count, bool down)
+{
+    const int top = screenTopRow + (scrollingRegionSet ? scrollingRegionTop : 0);
+    const int bottom = scrollingRegionSet ? screenTopRow + scrollingRegionBottom
+        : qMax(document->blockCount() - 1, screenTopRow + screenRows - 1);
+    mutateLineRange(top, bottom, count, down);
+}
+
+void TerminalOutput::mutateLineRange(int startRow, int bottomRow, int count, bool down)
+{
+    if (bottomRow < startRow || startRow < 0)
+        return;
+    ensureLineCount(bottomRow + 1);
+    const int rowCount = bottomRow - startRow + 1;
+    count = qBound(1, count, rowCount);
+    const int cursorRow = textCursor.blockNumber();
+    const int cursorColumn = textCursor.position() - textCursor.block().position();
+    QVector<ScreenRow> originalRows;
+    originalRows.reserve(rowCount);
+    for (int row = startRow; row <= bottomRow; ++row) {
+        ScreenRow screenRow;
+        const QTextBlock block = document->findBlockByNumber(row);
+        screenRow.format = block.blockFormat();
+        for (auto fragment = block.begin(); !fragment.atEnd(); ++fragment) {
+            const QTextFragment textFragment = fragment.fragment();
+            if (textFragment.isValid())
+                screenRow.runs.append({textFragment.text(), textFragment.charFormat()});
+        }
+        originalRows.append(screenRow);
+    }
+
+    QVector<ScreenRow> shiftedRows(rowCount);
+    for (int destination = 0; destination < rowCount; ++destination) {
+        const int source = down ? destination - count : destination + count;
+        if (source >= 0 && source < rowCount)
+            shiftedRows[destination] = originalRows.at(source);
+        else
+            shiftedRows[destination].format = originalRows.at(destination).format;
+    }
+
+    for (int offset = 0; offset < rowCount; ++offset) {
+        QTextBlock block = document->findBlockByNumber(startRow + offset);
+        QTextCursor rowCursor(block);
+        rowCursor.movePosition(QTextCursor::StartOfBlock);
+        rowCursor.movePosition(QTextCursor::EndOfBlock, QTextCursor::KeepAnchor);
+        rowCursor.removeSelectedText();
+        rowCursor.setBlockFormat(shiftedRows.at(offset).format);
+        for (const FormattedRun &run : shiftedRows.at(offset).runs)
+            rowCursor.insertText(run.text, run.format);
+    }
+
+    const QTextBlock restoredBlock = document->findBlockByNumber(qBound(0, cursorRow, document->blockCount() - 1));
+    textCursor = QTextCursor(restoredBlock);
+    textCursor.setPosition(restoredBlock.position());
+    moveToColumn(cursorColumn);
+}
+
+void TerminalOutput::setScrollingRegion(int top, int bottom)
+{
+    if (top >= bottom || (screenRows > 0 && screenRows < 2)) {
+        scrollingRegionSet = false;
+        scrollingRegionTop = 0;
+        scrollingRegionBottom = -1;
+        return;
+    }
+    const int maximumRow = screenRows > 0 ? screenRows - 1 : 1000;
+    scrollingRegionSet = true;
+    scrollingRegionTop = qBound(0, top, qMax(0, maximumRow - 1));
+    scrollingRegionBottom = qBound(scrollingRegionTop + 1, bottom, maximumRow);
+}
+
+void TerminalOutput::ensureLineCount(int count)
+{
+    if (count <= document->blockCount())
+        return;
+    const int cursorPosition = textCursor.position();
+    QTextCursor endCursor(document);
+    endCursor.movePosition(QTextCursor::End);
+    while (document->blockCount() < count)
+        endCursor.insertBlock(QTextBlockFormat(), currentFormat);
+    textCursor.setPosition(qBound(0, cursorPosition, document->characterCount() - 1));
+}
+
+void TerminalOutput::updateScreenTopForCursor()
+{
+    if (screenRows <= 0)
+        return;
+    screenTopRow = qMax(0, textCursor.blockNumber() - screenRows + 1);
 }
 
 void TerminalOutput::updateFormat()

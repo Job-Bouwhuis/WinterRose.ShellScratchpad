@@ -8,4 +8,4 @@ Icon=shell-scratchpad
 Terminal=false
 Categories=Development;Utility;
 Keywords=bash;shell;script;terminal;scratchpad;
-MimeType=text/x-shellscript;application/x-shellscript;
+MimeType=text/x-shellscript;application/x-shellscript;inode/directory;

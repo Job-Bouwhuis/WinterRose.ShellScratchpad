@@ -19,6 +19,10 @@ target_link_libraries(shell-scratchpad-syntax PUBLIC Qt6::Core)
 target_compile_options(shell-scratchpad-syntax PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(shell-scratchpad
+    src/language/BashExecutionHandler.h
+    src/language/BashExecutionHandler.cpp
+    src/git/GitWorkspaceWindow.h
+    src/git/GitWorkspaceWindow.cpp
     src/main.cpp
     src/output/TerminalOutput.h
     src/output/TerminalOutput.cpp
@@ -54,11 +58,23 @@ if(BUILD_TESTING)
     target_link_libraries(shell-scratchpad-syntax-tests PRIVATE shell-scratchpad-syntax Qt6::Core)
     target_compile_options(shell-scratchpad-syntax-tests PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME syntax-tokenizer-tests COMMAND shell-scratchpad-syntax-tests)
+
+    add_executable(shell-scratchpad-terminal-output-tests
+        tests/terminal_output_tests.cpp
+        src/output/TerminalOutput.h
+        src/output/TerminalOutput.cpp
+    )
+    target_include_directories(shell-scratchpad-terminal-output-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(shell-scratchpad-terminal-output-tests PRIVATE Qt6::Widgets)
+    target_compile_options(shell-scratchpad-terminal-output-tests PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME terminal-output-tests COMMAND shell-scratchpad-terminal-output-tests)
+    set_tests_properties(terminal-output-tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 endif()
 
 include(GNUInstallDirs)
 install(TARGETS shell-scratchpad RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES packaging/org.winterrose.shellscratchpad.desktop
+        packaging/org.winterrose.shellscratchpad-git.desktop
         DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
 install(FILES packaging/shell-scratchpad.svg
         DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps)

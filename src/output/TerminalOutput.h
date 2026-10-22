@@ -5,6 +5,7 @@
 #include <QStringList>
 #include <QTextCharFormat>
 #include <QTextCursor>
+#include <QVector>
 
 class QTextDocument;
 
@@ -16,6 +17,7 @@ public:
     explicit TerminalOutput(QTextDocument *document);
 
     void append(const QString &text);
+    void setScreenRows(int rows);
     void clear();
     QString plainText() const;
     QTextCursor cursor() const;
@@ -33,6 +35,13 @@ private:
     void moveVertical(int lines);
     void insertSpaces(int count);
     void deleteCharacters(int count);
+    void insertLines(int count);
+    void deleteLines(int count);
+    void scrollLines(int count, bool down);
+    void mutateLineRange(int startRow, int bottomRow, int count, bool down);
+    void setScrollingRegion(int top, int bottom);
+    void ensureLineCount(int count);
+    void updateScreenTopForCursor();
     void updateFormat();
     static QColor ansiColor(int index);
     static int parameter(const QStringList &parameters, int index, int defaultValue = 0);
@@ -51,5 +60,10 @@ private:
     QColor foreground;
     QColor background;
     int savedCursorPosition = 0;
+    int scrollingRegionTop = 0;
+    int scrollingRegionBottom = -1;
+    bool scrollingRegionSet = false;
+    int screenRows = 0;
+    int screenTopRow = 0;
 };
 }

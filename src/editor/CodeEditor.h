@@ -12,6 +12,7 @@
 class QWidget;
 class QMouseEvent;
 class QKeyEvent;
+class QMimeData;
 
 namespace ShellScratchpad
 {
@@ -52,6 +53,7 @@ public:
 signals:
     void symbolNavigationRequested(const QString &name);
     void breakpointsChanged();
+    void markdownCodeBlockUnwrapped();
 
 protected:
     void resizeEvent(QResizeEvent *event) override;
@@ -62,6 +64,7 @@ protected:
     void paintEvent(QPaintEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;
     void keyReleaseEvent(QKeyEvent *event) override;
+    void insertFromMimeData(const QMimeData *source) override;
 
 private slots:
     void updateLineNumberAreaWidth();

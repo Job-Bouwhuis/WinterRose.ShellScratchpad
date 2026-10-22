@@ -56,18 +56,109 @@ QHash<QString, QStringList> argumentCatalog()
         {QStringLiteral("ls"), {QStringLiteral("-a"), QStringLiteral("-l"), QStringLiteral("-h"), QStringLiteral("-R"), QStringLiteral("--color=auto")}},
         {QStringLiteral("grep"), {QStringLiteral("-i"), QStringLiteral("-n"), QStringLiteral("-r"), QStringLiteral("-v"), QStringLiteral("-E"), QStringLiteral("-F"), QStringLiteral("--color=auto")}},
         {QStringLiteral("find"), {QStringLiteral("-name"), QStringLiteral("-iname"), QStringLiteral("-type"), QStringLiteral("-mtime"), QStringLiteral("-maxdepth"), QStringLiteral("-exec")}},
-        {QStringLiteral("git"), {QStringLiteral("status"), QStringLiteral("add"), QStringLiteral("commit"), QStringLiteral("diff"), QStringLiteral("log"), QStringLiteral("switch"), QStringLiteral("restore"), QStringLiteral("-C")}},
+        {QStringLiteral("git"), {QStringLiteral("add"), QStringLiteral("am"), QStringLiteral("archive"),
+            QStringLiteral("bisect"), QStringLiteral("blame"), QStringLiteral("branch"), QStringLiteral("bundle"),
+            QStringLiteral("checkout"), QStringLiteral("cherry-pick"), QStringLiteral("clean"),
+            QStringLiteral("clone"), QStringLiteral("commit"), QStringLiteral("config"), QStringLiteral("diff"),
+            QStringLiteral("fetch"), QStringLiteral("format-patch"), QStringLiteral("grep"),
+            QStringLiteral("init"), QStringLiteral("log"), QStringLiteral("merge"), QStringLiteral("mv"),
+            QStringLiteral("pull"), QStringLiteral("push"), QStringLiteral("rebase"), QStringLiteral("reflog"),
+            QStringLiteral("remote"), QStringLiteral("reset"), QStringLiteral("restore"),
+            QStringLiteral("revert"), QStringLiteral("rm"), QStringLiteral("show"), QStringLiteral("sparse-checkout"),
+            QStringLiteral("stash"), QStringLiteral("status"), QStringLiteral("submodule"),
+            QStringLiteral("switch"), QStringLiteral("tag"), QStringLiteral("worktree"),
+            QStringLiteral("-C"), QStringLiteral("--help"), QStringLiteral("--version")} },
         {QStringLiteral("cmake"), {QStringLiteral("-S"), QStringLiteral("-B"), QStringLiteral("--build"), QStringLiteral("--install"), QStringLiteral("-D")}},
         {QStringLiteral("systemctl"), {QStringLiteral("status"), QStringLiteral("start"), QStringLiteral("stop"), QStringLiteral("restart"), QStringLiteral("enable"), QStringLiteral("disable"), QStringLiteral("--user")}},
         {QStringLiteral("journalctl"), {QStringLiteral("-b"), QStringLiteral("-k"), QStringLiteral("-u"), QStringLiteral("-n"), QStringLiteral("--since"), QStringLiteral("--no-pager")}},
         {QStringLiteral("apt"), {QStringLiteral("update"), QStringLiteral("upgrade"), QStringLiteral("install"), QStringLiteral("remove"), QStringLiteral("purge"), QStringLiteral("--yes")}},
         {QStringLiteral("dnf"), {QStringLiteral("check-update"), QStringLiteral("upgrade"), QStringLiteral("install"), QStringLiteral("remove"), QStringLiteral("search"), QStringLiteral("--refresh")}},
-        {QStringLiteral("sudo"), {QStringLiteral("-n"), QStringLiteral("-E"), QStringLiteral("-u"), QStringLiteral("--preserve-env")}}
+        {QStringLiteral("sudo"), {QStringLiteral("-n"), QStringLiteral("-E"), QStringLiteral("-u"), QStringLiteral("--preserve-env")}},
+        {QStringLiteral("add"), {QStringLiteral("-A"), QStringLiteral("--all"), QStringLiteral("-p"), QStringLiteral("--patch"), QStringLiteral("-u"), QStringLiteral("--update"), QStringLiteral("-f"), QStringLiteral("--force"), QStringLiteral("-N"), QStringLiteral("--intent-to-add"), QStringLiteral("--renormalize"), QStringLiteral("--ignore-errors")}},
+        {QStringLiteral("am"), {QStringLiteral("--continue"), QStringLiteral("--skip"), QStringLiteral("--abort"), QStringLiteral("--quit"), QStringLiteral("--3way"), QStringLiteral("--signoff"), QStringLiteral("--committer-date-is-author-date")}},
+        {QStringLiteral("branch"), {QStringLiteral("-a"), QStringLiteral("--all"), QStringLiteral("-d"), QStringLiteral("--delete"), QStringLiteral("-D"), QStringLiteral("--force-delete"), QStringLiteral("-m"), QStringLiteral("--move"), QStringLiteral("-r"), QStringLiteral("--remotes"), QStringLiteral("--show-current"), QStringLiteral("--set-upstream-to")}},
+        {QStringLiteral("checkout"), {QStringLiteral("-b"), QStringLiteral("-B"), QStringLiteral("--detach"), QStringLiteral("--ours"), QStringLiteral("--theirs"), QStringLiteral("--force"), QStringLiteral("--track"), QStringLiteral("--orphan")}},
+        {QStringLiteral("cherry-pick"), {QStringLiteral("--continue"), QStringLiteral("--skip"), QStringLiteral("--abort"), QStringLiteral("--quit"), QStringLiteral("-n"), QStringLiteral("--no-commit"), QStringLiteral("-x"), QStringLiteral("--signoff"), QStringLiteral("-m")}},
+        {QStringLiteral("clean"), {QStringLiteral("-n"), QStringLiteral("--dry-run"), QStringLiteral("-f"), QStringLiteral("--force"), QStringLiteral("-d"), QStringLiteral("-x"), QStringLiteral("-X"), QStringLiteral("-i"), QStringLiteral("--interactive")}},
+        {QStringLiteral("clone"), {QStringLiteral("--depth"), QStringLiteral("--branch"), QStringLiteral("-b"), QStringLiteral("--single-branch"), QStringLiteral("--recurse-submodules"), QStringLiteral("--filter"), QStringLiteral("--bare"), QStringLiteral("--mirror"), QStringLiteral("--origin"), QStringLiteral("--sparse")}},
+        {QStringLiteral("commit"), {QStringLiteral("-m"), QStringLiteral("--message"), QStringLiteral("-a"), QStringLiteral("--all"), QStringLiteral("--amend"), QStringLiteral("--no-edit"), QStringLiteral("--allow-empty"), QStringLiteral("--no-verify"), QStringLiteral("-S"), QStringLiteral("--signoff"), QStringLiteral("--fixup"), QStringLiteral("--squash")}},
+        {QStringLiteral("config"), {QStringLiteral("--global"), QStringLiteral("--local"), QStringLiteral("--system"), QStringLiteral("--get"), QStringLiteral("--get-all"), QStringLiteral("--unset"), QStringLiteral("--unset-all"), QStringLiteral("--list"), QStringLiteral("--show-origin"), QStringLiteral("--edit"), QStringLiteral("--add"), QStringLiteral("--replace-all")}},
+        {QStringLiteral("diff"), {QStringLiteral("--staged"), QStringLiteral("--cached"), QStringLiteral("--stat"), QStringLiteral("--name-only"), QStringLiteral("--name-status"), QStringLiteral("--word-diff"), QStringLiteral("--color-words"), QStringLiteral("--check"), QStringLiteral("--no-index"), QStringLiteral("--merge-base"), QStringLiteral("-U"), QStringLiteral("--unified")}},
+        {QStringLiteral("fetch"), {QStringLiteral("--all"), QStringLiteral("--prune"), QStringLiteral("--tags"), QStringLiteral("--force"), QStringLiteral("--depth"), QStringLiteral("--unshallow"), QStringLiteral("--dry-run"), QStringLiteral("--recurse-submodules"), QStringLiteral("--set-upstream")}},
+        {QStringLiteral("init"), {QStringLiteral("--bare"), QStringLiteral("--initial-branch"), QStringLiteral("-b"), QStringLiteral("--shared"), QStringLiteral("--separate-git-dir")}},
+        {QStringLiteral("log"), {QStringLiteral("--oneline"), QStringLiteral("--graph"), QStringLiteral("--decorate"), QStringLiteral("--all"), QStringLiteral("--stat"), QStringLiteral("--name-only"), QStringLiteral("--name-status"), QStringLiteral("--author"), QStringLiteral("--since"), QStringLiteral("--until"), QStringLiteral("--grep"), QStringLiteral("-n"), QStringLiteral("--format"), QStringLiteral("--follow"), QStringLiteral("--first-parent"), QStringLiteral("--reflog")}},
+        {QStringLiteral("merge"), {QStringLiteral("--continue"), QStringLiteral("--abort"), QStringLiteral("--quit"), QStringLiteral("--no-commit"), QStringLiteral("--no-ff"), QStringLiteral("--ff-only"), QStringLiteral("--squash"), QStringLiteral("--strategy"), QStringLiteral("--strategy-option"), QStringLiteral("--no-edit"), QStringLiteral("--autostash")}},
+        {QStringLiteral("pull"), {QStringLiteral("--rebase"), QStringLiteral("--no-rebase"), QStringLiteral("--ff-only"), QStringLiteral("--no-ff"), QStringLiteral("--autostash"), QStringLiteral("--all"), QStringLiteral("--tags"), QStringLiteral("--prune"), QStringLiteral("--no-commit"), QStringLiteral("--strategy")}},
+        {QStringLiteral("push"), {QStringLiteral("-u"), QStringLiteral("--set-upstream"), QStringLiteral("--all"), QStringLiteral("--tags"), QStringLiteral("--force-with-lease"), QStringLiteral("--force"), QStringLiteral("--delete"), QStringLiteral("--dry-run"), QStringLiteral("--atomic"), QStringLiteral("--follow-tags"), QStringLiteral("--prune"), QStringLiteral("--mirror")}},
+        {QStringLiteral("rebase"), {QStringLiteral("--continue"), QStringLiteral("--skip"), QStringLiteral("--abort"), QStringLiteral("--quit"), QStringLiteral("--onto"), QStringLiteral("--interactive"), QStringLiteral("-i"), QStringLiteral("--autosquash"), QStringLiteral("--autostash"), QStringLiteral("--exec"), QStringLiteral("--rebase-merges"), QStringLiteral("--root")}},
+        {QStringLiteral("remote"), {QStringLiteral("-v"), QStringLiteral("--verbose"), QStringLiteral("add"), QStringLiteral("remove"), QStringLiteral("rename"), QStringLiteral("set-url"), QStringLiteral("get-url"), QStringLiteral("show"), QStringLiteral("prune"), QStringLiteral("update"), QStringLiteral("set-head")}},
+        {QStringLiteral("reset"), {QStringLiteral("--soft"), QStringLiteral("--mixed"), QStringLiteral("--hard"), QStringLiteral("--keep"), QStringLiteral("--merge"), QStringLiteral("-p"), QStringLiteral("--patch"), QStringLiteral("--recurse-submodules")}},
+        {QStringLiteral("restore"), {QStringLiteral("--staged"), QStringLiteral("--worktree"), QStringLiteral("-s"), QStringLiteral("--source"), QStringLiteral("-p"), QStringLiteral("--patch"), QStringLiteral("--ours"), QStringLiteral("--theirs"), QStringLiteral("--merge"), QStringLiteral("--conflict")}},
+        {QStringLiteral("revert"), {QStringLiteral("--continue"), QStringLiteral("--skip"), QStringLiteral("--abort"), QStringLiteral("--quit"), QStringLiteral("--no-commit"), QStringLiteral("--edit"), QStringLiteral("--no-edit"), QStringLiteral("-m"), QStringLiteral("--mainline")}},
+        {QStringLiteral("show"), {QStringLiteral("--stat"), QStringLiteral("--summary"), QStringLiteral("--name-only"), QStringLiteral("--name-status"), QStringLiteral("--format"), QStringLiteral("--pretty"), QStringLiteral("--no-patch"), QStringLiteral("--first-parent")}},
+        {QStringLiteral("stash"), {QStringLiteral("push"), QStringLiteral("pop"), QStringLiteral("apply"), QStringLiteral("list"), QStringLiteral("show"), QStringLiteral("drop"), QStringLiteral("clear"), QStringLiteral("branch"), QStringLiteral("-m"), QStringLiteral("--message"), QStringLiteral("-u"), QStringLiteral("--include-untracked"), QStringLiteral("--all"), QStringLiteral("--keep-index")}},
+        {QStringLiteral("status"), {QStringLiteral("--short"), QStringLiteral("--branch"), QStringLiteral("--porcelain"), QStringLiteral("--ignored"), QStringLiteral("--untracked-files"), QStringLiteral("--show-stash"), QStringLiteral("--ahead-behind"), QStringLiteral("--renames")}},
+        {QStringLiteral("tag"), {QStringLiteral("-a"), QStringLiteral("--annotate"), QStringLiteral("-d"), QStringLiteral("--delete"), QStringLiteral("-l"), QStringLiteral("--list"), QStringLiteral("-v"), QStringLiteral("--verify"), QStringLiteral("-s"), QStringLiteral("--sign"), QStringLiteral("-m"), QStringLiteral("--message"), QStringLiteral("--contains"), QStringLiteral("--sort")}}
     };
 }
 
 QString optionDescription(const QString &command, const QString &option)
 {
+    static const QHash<QString, QString> gitCommandDescriptions = {
+        {QStringLiteral("add"), QStringLiteral("Stage file contents for the next commit.")},
+        {QStringLiteral("bisect"), QStringLiteral("Find the commit that introduced a bug by binary search.")},
+        {QStringLiteral("blame"), QStringLiteral("Show which commit and author last changed each line.")},
+        {QStringLiteral("branch"), QStringLiteral("List, create, rename, or delete branches.")},
+        {QStringLiteral("checkout"), QStringLiteral("Switch branches or restore paths; prefer switch/restore for clarity.")},
+        {QStringLiteral("cherry-pick"), QStringLiteral("Apply changes from existing commits to the current branch.")},
+        {QStringLiteral("clean"), QStringLiteral("Remove untracked files; use -n first to preview deletions.")},
+        {QStringLiteral("clone"), QStringLiteral("Copy a remote repository into a new local directory.")},
+        {QStringLiteral("commit"), QStringLiteral("Record the staged snapshot as a new commit.")},
+        {QStringLiteral("config"), QStringLiteral("Read or change Git configuration at system, global, or repository scope.")},
+        {QStringLiteral("diff"), QStringLiteral("Compare working tree, index, commits, or paths.")},
+        {QStringLiteral("fetch"), QStringLiteral("Download remote refs and objects without integrating them.")},
+        {QStringLiteral("init"), QStringLiteral("Create an empty Git repository or reinitialize one.")},
+        {QStringLiteral("log"), QStringLiteral("Show commit history with filters and formatting options.")},
+        {QStringLiteral("merge"), QStringLiteral("Join another branch's history into the current branch.")},
+        {QStringLiteral("pull"), QStringLiteral("Fetch and integrate changes from a remote branch.")},
+        {QStringLiteral("push"), QStringLiteral("Update refs on a remote; --force can overwrite remote history.")},
+        {QStringLiteral("rebase"), QStringLiteral("Replay commits on a new base; interactive mode can rewrite local history.")},
+        {QStringLiteral("remote"), QStringLiteral("Manage named remote repositories and their URLs.")},
+        {QStringLiteral("reset"), QStringLiteral("Move HEAD and optionally reset the index or working tree; --hard discards changes.")},
+        {QStringLiteral("restore"), QStringLiteral("Restore working tree or staged paths from a source.")},
+        {QStringLiteral("revert"), QStringLiteral("Create a new commit that reverses an earlier commit.")},
+        {QStringLiteral("show"), QStringLiteral("Inspect commits, tags, trees, and blobs.")},
+        {QStringLiteral("stash"), QStringLiteral("Temporarily save and later reapply working tree changes.")},
+        {QStringLiteral("status"), QStringLiteral("Show staged, unstaged, and untracked changes.")},
+        {QStringLiteral("tag"), QStringLiteral("Create, list, verify, or delete tags.")},
+        {QStringLiteral("worktree"), QStringLiteral("Manage multiple working trees attached to one repository.")}
+    };
+    if (command == QLatin1String("git") && gitCommandDescriptions.contains(option))
+        return gitCommandDescriptions.value(option);
+    static const QHash<QString, QString> gitOptionDescriptions = {
+        {QStringLiteral("add:-p"), QStringLiteral("Interactively choose individual hunks to stage.")},
+        {QStringLiteral("add:-A"), QStringLiteral("Stage all additions, modifications, and deletions.")},
+        {QStringLiteral("commit:--amend"), QStringLiteral("Replace the latest commit; avoid amending commits already shared.")},
+        {QStringLiteral("commit:--no-verify"), QStringLiteral("Skip pre-commit and commit-msg hooks.")},
+        {QStringLiteral("diff:--cached"), QStringLiteral("Compare the staged index with HEAD.")},
+        {QStringLiteral("push:--force-with-lease"), QStringLiteral("Force update only if the remote ref still has the expected value.")},
+        {QStringLiteral("push:--force"), QStringLiteral("Overwrite the remote ref without checking; can discard others' commits.")},
+        {QStringLiteral("pull:--rebase"), QStringLiteral("Replay local commits on top of the fetched branch instead of creating a merge commit.")},
+        {QStringLiteral("rebase:--continue"), QStringLiteral("Continue after resolving conflicts in the current rebase.")},
+        {QStringLiteral("rebase:--abort"), QStringLiteral("Cancel the current rebase and restore the original branch state.")},
+        {QStringLiteral("restore:--staged"), QStringLiteral("Unstage paths while leaving working tree contents unchanged.")},
+        {QStringLiteral("restore:--source"), QStringLiteral("Choose a tree-ish or commit as the restore source.")},
+        {QStringLiteral("reset:--hard"), QStringLiteral("Reset HEAD, index, and working tree; uncommitted changes can be lost.")},
+        {QStringLiteral("clean:-n"), QStringLiteral("Dry run: list untracked files that would be removed.")},
+        {QStringLiteral("config:--global"), QStringLiteral("Read or write the current user's ~/.gitconfig.")},
+        {QStringLiteral("config:--local"), QStringLiteral("Read or write this repository's .git/config.")},
+        {QStringLiteral("clone:--depth"), QStringLiteral("Create a shallow clone limited to the requested history depth.")},
+        {QStringLiteral("fetch:--prune"), QStringLiteral("Remove remote-tracking refs that no longer exist on the remote.")},
+        {QStringLiteral("status:--porcelain"), QStringLiteral("Print stable, script-friendly status output.")}
+    };
+    const QString gitOptionKey = command + QLatin1Char(':') + option;
+    if (gitOptionDescriptions.contains(gitOptionKey))
+        return gitOptionDescriptions.value(gitOptionKey);
     static const QHash<QString, QString> descriptions = {
         {QStringLiteral("-a"), QStringLiteral("Include hidden entries.")},
         {QStringLiteral("-l"), QStringLiteral("Use the long listing format.")},
@@ -950,9 +1041,46 @@ void CompletionController::updateSuggestions()
             if (!BUILTINS.contains(word))
                 append(word, commandDescription(word), QStringLiteral("Command"));
     } else {
-        const QStringList OPTIONS = argumentCatalog().value(NORMALIZED_COMMAND);
+        const QHash<QString, QStringList> ARGUMENTS = argumentCatalog();
+        QStringList OPTIONS = ARGUMENTS.value(NORMALIZED_COMMAND);
+        QString argumentCommand = NORMALIZED_COMMAND;
+        if (NORMALIZED_COMMAND == QLatin1String("git")) {
+            const QStringList priorWords = BEFORE_WORD.split(QRegularExpression(QStringLiteral("\\s+")), Qt::SkipEmptyParts);
+            int gitIndex = -1;
+            for (int index = 0; index < priorWords.size(); ++index) {
+                if (priorWords.at(index) == QLatin1String("git")) {
+                    gitIndex = index;
+                    break;
+                }
+            }
+            int subcommandIndex = gitIndex + 1;
+            const QSet<QString> GIT_GLOBAL_OPTIONS_WITH_VALUE = {
+                QStringLiteral("-C"), QStringLiteral("-c"), QStringLiteral("--git-dir"),
+                QStringLiteral("--work-tree"), QStringLiteral("--namespace"),
+                QStringLiteral("--config-env"), QStringLiteral("--exec-path"),
+                QStringLiteral("--super-prefix"), QStringLiteral("--attr-source")
+            };
+            while (gitIndex >= 0 && subcommandIndex < priorWords.size()) {
+                const QString word = priorWords.at(subcommandIndex);
+                if (GIT_GLOBAL_OPTIONS_WITH_VALUE.contains(word)) {
+                    subcommandIndex += 2;
+                } else if (word.startsWith(QLatin1Char('-')) && word.contains(QLatin1Char('='))) {
+                    ++subcommandIndex;
+                } else if (word.startsWith(QLatin1Char('-'))) {
+                    ++subcommandIndex;
+                } else {
+                    break;
+                }
+            }
+            if (gitIndex >= 0 && subcommandIndex < priorWords.size()) {
+                argumentCommand = priorWords.at(subcommandIndex);
+                OPTIONS = ARGUMENTS.value(argumentCommand);
+            }
+        }
         for (const QString &option : OPTIONS)
-            append(option, optionDescription(NORMALIZED_COMMAND, option), QStringLiteral("Argument"));
+            append(option, optionDescription(argumentCommand, option),
+                   NORMALIZED_COMMAND == QLatin1String("git") && argumentCommand == QLatin1String("git")
+                       ? QStringLiteral("Git subcommand") : QStringLiteral("Argument"));
         for (const Snippets::Snippet &snippet : snippets)
             currentSuggestions.append(Suggestion{snippet.name, snippet.description,
                                                  QStringLiteral("Snippet"), snippet.code, snippet.highlightPoints,
