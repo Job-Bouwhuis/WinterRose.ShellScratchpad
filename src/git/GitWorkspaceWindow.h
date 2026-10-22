@@ -41,6 +41,8 @@ private:
     QToolButton *commitButton = nullptr;
     QToolButton *stageAllButton = nullptr;
     QToolButton *syncButton = nullptr;
+    QToolButton *pullButton = nullptr;
+    QToolButton *pushButton = nullptr;
     QToolButton *moreButton = nullptr;
     QToolButton *conflictsButton = nullptr;
     QLabel *branchStatusLabel = nullptr;
@@ -71,6 +73,7 @@ private:
     bool hasStashes = false;
     bool hasRemote = false;
     bool hasUpstream = false;
+    bool hasUnpushedCommits = false;
     bool hasConflicts = false;
     int stagedPathCount = 0;
     int unstagedPathCount = 0;
@@ -91,6 +94,8 @@ private:
     void addRemote();
     void changeRemoteUrl(const QString &name);
     void removeRemote(const QString &name);
+    void pullCurrentBranch();
+    void pushCurrentBranch();
     void runGit(const QStringList &arguments);
     void runRawCommand();
     QString gitOutput(const QStringList &arguments, int *exitCode = nullptr) const;

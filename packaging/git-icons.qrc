@@ -3,6 +3,8 @@
     <file alias="branch.svg">git-icons/branch.svg</file>
     <file alias="commit.svg">git-icons/commit.svg</file>
     <file alias="sync.svg">git-icons/sync.svg</file>
+    <file alias="pull.svg">git-icons/pull.svg</file>
+    <file alias="push.svg">git-icons/push.svg</file>
     <file alias="refresh.svg">git-icons/refresh.svg</file>
     <file alias="more.svg">git-icons/more.svg</file>
   </qresource>
