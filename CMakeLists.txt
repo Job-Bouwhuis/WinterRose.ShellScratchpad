@@ -23,6 +23,7 @@ add_executable(shell-scratchpad
     src/language/BashExecutionHandler.cpp
     src/git/GitWorkspaceWindow.h
     src/git/GitWorkspaceWindow.cpp
+    packaging/git-icons.qrc
     src/main.cpp
     src/output/TerminalOutput.h
     src/output/TerminalOutput.cpp

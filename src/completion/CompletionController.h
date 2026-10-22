@@ -35,6 +35,7 @@ public:
     void refreshCommandCache();
     void refreshSnippets();
     void setWorkingDirectory(const QString &path);
+    void setGitCommandMode(bool enabled);
     void setProfileEnvironmentVariables(const QStringList &names);
     void setRuntimeVariables(const QHash<QString, QString> &variables);
     void setSourcedScriptSymbols(const QVector<ScriptSymbol> &symbols);
@@ -61,6 +62,7 @@ private:
     QProcess *descriptionLookupProcess = nullptr;
     QStringList systemCommands;
     QString workingDirectory;
+    bool gitCommandMode = false;
     QStringList profileEnvironmentVariables;
     QHash<QString, QString> runtimeVariables;
     QVector<Snippets::Snippet> snippets;

@@ -19,6 +19,7 @@ A small Qt 6 desktop app for KDE/Linux that runs multiline Bash scripts from an 
 - **Ctrl+S** saves an opened script in place and does nothing for an untitled scratch script
 - Working-directory picker and `--working-directory <directory>` command-line option
 - A KDE/Dolphin context-menu action, **Open Shell Scratchpad**, installed by `setup.sh`; right-click a directory or a directory icon on the desktop to open the app with that directory selected
+- A KDE/Dolphin **Actions → Clone Git Repository Here…** action opens a clone dialog and clones the entered repository into a new subfolder of the selected directory, then opens it in Git Workspace
 - A KDE/Dolphin **Open Folder With → Shell Scratchpad** application association, installed by `setup.sh`, to open a directory in folder mode with the file browser
 - A KDE/Dolphin context-menu action, **Open in Shell Scratchpad**, for `.sh` files; script paths can also be passed on the command line
 - `Ctrl+Enter` runs the script while the editor is focused

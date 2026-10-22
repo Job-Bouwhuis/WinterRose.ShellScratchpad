@@ -333,7 +333,7 @@ if [[ -x "${APP_EXECUTABLE}" && -f "${SERVICE_MENU_FILE}" ]]; then
     # KDE Plasma 6 authorizes user-installed servicemenus when the .desktop file
     # is executable. Use an absolute executable path because the desktop session
     # may not include ~/.local/bin in PATH. %f is supplied by KIO as the selected
-    # local directory path and is forwarded to --working-directory.
+    # local directory path and is forwarded to the selected action's option.
     SERVICE_MENU_TEMP="$(mktemp)"
     awk -v exec_path="${APP_LAUNCHER}" '
         BEGIN {
@@ -342,6 +342,10 @@ if [[ -x "${APP_EXECUTABLE}" && -f "${SERVICE_MENU_FILE}" ]]; then
         }
         /^Exec=shell-scratchpad --working-directory %f$/ {
             print "Exec=\"" exec_path "\" --working-directory %f"
+            next
+        }
+        /^Exec=shell-scratchpad --clone-repository-into %f$/ {
+            print "Exec=\"" exec_path "\" --clone-repository-into %f"
             next
         }
         { print }

@@ -368,6 +368,12 @@ void CompletionController::setWorkingDirectory(const QString &path)
     updateSuggestions();
 }
 
+void CompletionController::setGitCommandMode(bool enabled)
+{
+    gitCommandMode = enabled;
+    updateSuggestions();
+}
+
 bool CompletionController::eventFilter(QObject *watched, QEvent *event)
 {
     if (watched == editor && event->type() == QEvent::FocusOut) {
@@ -920,7 +926,7 @@ void CompletionController::updateSuggestions()
     const bool SIMPLE_VARIABLE = wordStart >= 1 && SOURCE.at(wordStart - 1) == QLatin1Char('$');
     const bool SPECIAL_VARIABLE = POSITION >= 2 && SOURCE.at(POSITION - 2) == QLatin1Char('$') &&
         QStringLiteral("?#@*!$0123456789").contains(SOURCE.at(POSITION - 1));
-    const bool VARIABLE_POSITION = BRACED_VARIABLE || SIMPLE_VARIABLE || SPECIAL_VARIABLE;
+    const bool VARIABLE_POSITION = !gitCommandMode && (BRACED_VARIABLE || SIMPLE_VARIABLE || SPECIAL_VARIABLE);
     QString PREFIX = SOURCE.mid(wordStart, POSITION - wordStart);
     if (SPECIAL_VARIABLE)
         PREFIX = SOURCE.mid(POSITION - 1, 1);
@@ -1016,6 +1022,10 @@ void CompletionController::updateSuggestions()
                                                  QStringLiteral("Special parameter"), QString(), {}, {}});
         }
     } else if (commandPosition) {
+        if (gitCommandMode) {
+            for (const QString &subcommand : argumentCatalog().value(QStringLiteral("git")))
+                append(subcommand, optionDescription(QStringLiteral("git"), subcommand), QStringLiteral("Git subcommand or option"));
+        } else {
         for (const Snippets::Snippet &snippet : snippets) {
             currentSuggestions.append(Suggestion{snippet.name, snippet.description,
                                                  QStringLiteral("Snippet"), snippet.code, snippet.highlightPoints,
@@ -1040,6 +1050,7 @@ void CompletionController::updateSuggestions()
         for (const QString &word : systemCommands)
             if (!BUILTINS.contains(word))
                 append(word, commandDescription(word), QStringLiteral("Command"));
+        }
     } else {
         const QHash<QString, QStringList> ARGUMENTS = argumentCatalog();
         QStringList OPTIONS = ARGUMENTS.value(NORMALIZED_COMMAND);
@@ -1081,10 +1092,12 @@ void CompletionController::updateSuggestions()
             append(option, optionDescription(argumentCommand, option),
                    NORMALIZED_COMMAND == QLatin1String("git") && argumentCommand == QLatin1String("git")
                        ? QStringLiteral("Git subcommand") : QStringLiteral("Argument"));
-        for (const Snippets::Snippet &snippet : snippets)
-            currentSuggestions.append(Suggestion{snippet.name, snippet.description,
-                                                 QStringLiteral("Snippet"), snippet.code, snippet.highlightPoints,
-                                                 snippet.autoChangeSections});
+        if (!gitCommandMode) {
+            for (const Snippets::Snippet &snippet : snippets)
+                currentSuggestions.append(Suggestion{snippet.name, snippet.description,
+                                                     QStringLiteral("Snippet"), snippet.code, snippet.highlightPoints,
+                                                     snippet.autoChangeSections});
+        }
         if (SOURCE_PATH_POSITION && !VARIABLE_POSITION) {
             QString pathPrefix = PREFIX;
             QString relativeDirectory;

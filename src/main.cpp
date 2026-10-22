@@ -702,6 +702,9 @@ public:
         auto *folderLayout = new QVBoxLayout(folderPanel);
         folderLayout->setContentsMargins(4, 4, 4, 4);
         auto *folderControls = new QHBoxLayout;
+        folderGitButton = new QToolButton(folderPanel);
+        folderGitButton->setText(QStringLiteral("Init Git"));
+        folderGitButton->setToolTip(QStringLiteral("Initialize a Git repository in this folder"));
         auto *newFolderButton = new QToolButton(folderPanel);
         newFolderButton->setText(QStringLiteral("Dir"));
         newFolderButton->setToolTip(QStringLiteral("Create a new folder"));
@@ -716,6 +719,7 @@ public:
         folderControls->addWidget(newFolderButton);
         folderControls->addWidget(newFileButton);
         folderControls->addWidget(newScriptButton);
+        folderControls->addWidget(folderGitButton);
         folderLayout->addLayout(folderControls);
         auto *folderSearchRow = new QHBoxLayout;
         folderSearchEdit = new QLineEdit(folderPanel);
@@ -749,6 +753,7 @@ public:
         splitDockWidget(scriptDock, folderBrowserDock, Qt::Horizontal);
         folderBrowserDock->hide();
         connect(newFolderButton, &QPushButton::clicked, this, [this]() { createFolderBrowserEntry(true); });
+        connect(folderGitButton, &QToolButton::clicked, this, [this]() { manageFolderGit(); });
         connect(newFileButton, &QPushButton::clicked, this, [this]() { createFolderBrowserEntry(false); });
         connect(newScriptButton, &QPushButton::clicked, this, [this]() { createNewScript(); });
         connect(refreshFolderButton, &QToolButton::clicked, this, [this]() { refreshFolderBrowser(); });
@@ -1769,6 +1774,7 @@ private:
     QWidget *runControlsPanel = nullptr;
     QTabBar *editorTabBar = nullptr;
     QTreeWidget *folderFileBrowser = nullptr;
+    QToolButton *folderGitButton = nullptr;
     QLineEdit *folderSearchEdit = nullptr;
     QCheckBox *folderShowHiddenCheck = nullptr;
     bool folderTreeInitialized = false;
@@ -2696,10 +2702,58 @@ private:
         openFolderPath(QFileInfo(currentScriptPath).absolutePath(), currentScriptPath);
     }
 
+    void updateFolderGitButton()
+    {
+        if (!folderGitButton)
+            return;
+        const bool repository = !folderRootPath.isEmpty()
+            && ShellScratchpad::Git::GitWorkspaceWindow::isGitRepository(folderRootPath);
+        folderGitButton->setText(repository ? QStringLiteral("Git") : QStringLiteral("Init Git"));
+        folderGitButton->setToolTip(repository
+            ? QStringLiteral("Manage this repository in Git Workspace")
+            : QStringLiteral("Initialize a Git repository in this folder"));
+    }
+
+    void manageFolderGit()
+    {
+        if (folderRootPath.isEmpty())
+            return;
+        if (!ShellScratchpad::Git::GitWorkspaceWindow::isGitRepository(folderRootPath)) {
+            QProcess process;
+            process.setProgram(QStringLiteral("git"));
+            process.setArguments({QStringLiteral("-C"), folderRootPath, QStringLiteral("init")});
+            process.start();
+            if (!process.waitForFinished(10000) || process.exitCode() != 0) {
+                const QString detail = QString::fromLocal8Bit(process.readAllStandardError()).trimmed();
+                QMessageBox::warning(this, QStringLiteral("Could not initialize Git repository"),
+                    detail.isEmpty() ? process.errorString() : detail);
+                return;
+            }
+            statusBar()->showMessage(QStringLiteral("Initialized Git repository in %1").arg(folderRootPath), 5000);
+            refreshFolderBrowser();
+        }
+        QProcess rootProcess;
+        rootProcess.setProgram(QStringLiteral("git"));
+        rootProcess.setArguments({QStringLiteral("-C"), folderRootPath,
+                                  QStringLiteral("rev-parse"), QStringLiteral("--show-toplevel")});
+        rootProcess.start();
+        if (!rootProcess.waitForFinished(3000) || rootProcess.exitCode() != 0) {
+            QMessageBox::warning(this, QStringLiteral("Git repository unavailable"),
+                                 QStringLiteral("Could not locate this repository’s root folder."));
+            return;
+        }
+        const QString repositoryRoot = QString::fromLocal8Bit(rootProcess.readAllStandardOutput()).trimmed();
+        auto *gitWindow = new ShellScratchpad::Git::GitWorkspaceWindow(repositoryRoot);
+        gitWindow->show();
+        gitWindow->raise();
+        gitWindow->activateWindow();
+    }
+
     void refreshFolderBrowser()
     {
         if (!folderFileBrowser || folderRootPath.isEmpty())
             return;
+        updateFolderGitButton();
         QSet<QString> expandedItems;
         QString selectedPath;
         std::function<void(QTreeWidgetItem *)> rememberTreeState = [&](QTreeWidgetItem *item) {
@@ -6297,6 +6351,11 @@ int main(int argc, char *argv[])
     QCommandLineOption gitWorkspaceOption(
         QStringLiteral("git-workspace"), QStringLiteral("Open the built-in Git workspace."));
     parser.addOption(gitWorkspaceOption);
+    QCommandLineOption cloneRepositoryOption(
+        QStringLiteral("clone-repository-into"),
+        QStringLiteral("Clone a Git repository into a new subfolder of the selected directory."),
+        QStringLiteral("directory"));
+    parser.addOption(cloneRepositoryOption);
     parser.addPositionalArgument(QStringLiteral("script"),
                                  QStringLiteral("Open a Bash script file."));
     parser.process(application);
@@ -6324,6 +6383,17 @@ int main(int argc, char *argv[])
         initialWorkingDirectory = QDir::cleanPath(QDir::isRelativePath(initialWorkingDirectory)
             ? QDir::current().absoluteFilePath(initialWorkingDirectory)
             : initialWorkingDirectory);
+    }
+
+    if (parser.isSet(cloneRepositoryOption)) {
+        QString targetDirectory = parser.value(cloneRepositoryOption).trimmed();
+        if (targetDirectory == QStringLiteral("~"))
+            targetDirectory = QDir::homePath();
+        else if (targetDirectory.startsWith(QStringLiteral("~/")))
+            targetDirectory = QDir::home().filePath(targetDirectory.mid(2));
+        if (!ShellScratchpad::Git::GitWorkspaceWindow::showCloneDialog(targetDirectory))
+            return 0;
+        return application.exec();
     }
 
     if (parser.isSet(gitWorkspaceOption)) {

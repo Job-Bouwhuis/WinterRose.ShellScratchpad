@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Shell Scratchpad Git Workspace
+Name=Git Workspace
 GenericName=Git Repository Manager
 Comment=Manage Git repositories with Shell Scratchpad
 Exec=shell-scratchpad --git-workspace %f
