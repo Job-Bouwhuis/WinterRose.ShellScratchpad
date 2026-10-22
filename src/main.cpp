@@ -49,6 +49,7 @@
 #include <QJsonObject>
 #include <QPointer>
 #include <QStandardPaths>
+#include <QTemporaryDir>
 #include <QPainter>
 #include <QMainWindow>
 #include <QMenu>
@@ -56,6 +57,7 @@
 #include <QMessageBox>
 #include <QMimeData>
 #include <QPlainTextEdit>
+#include <QPlainTextDocumentLayout>
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QPointer>
@@ -71,6 +73,7 @@
 #include <QStringList>
 #include <QStringView>
 #include <QTextCursor>
+#include <QTextDocument>
 #include <QTextBlock>
 #include <QTextCharFormat>
 #include <QTextDocument>
@@ -99,6 +102,7 @@
 #include "snippets/SnippetCreateDialog.h"
 #include "snippets/SnippetStore.h"
 #include "util/FuzzyMatcher.h"
+#include "output/TerminalOutput.h"
 
 #include <cerrno>
 #include <csignal>
@@ -116,6 +120,7 @@ constexpr int HISTORY_DESCRIPTOR = 197;
 constexpr int DEBUG_DESCRIPTOR = 196;
 const QByteArray INPUT_MARKER_PREFIX = QByteArray(1, '\x1e') + "SSPAD_INPUT:";
 constexpr char INPUT_MARKER_END = '\x1f';
+const QByteArray SUDO_AUTH_MARKER = QByteArray(1, '\x1e') + "SSPAD_SUDO_AUTHENTICATED" + QByteArray(1, '\x1f');
 
 QByteArray buildRuntimeScript(const QByteArray &userScript, bool handleSudoWithDialog,
                               bool reuseSudoPassword, bool captureHistory,
@@ -228,7 +233,7 @@ read() {
 
 sudo() {
     shell_scratchpad_record_sudo "sudo $*"
-    if ! command -v sudo >/dev/null 2>&1; then
+    if [[ -z "${SSPAD_REAL_SUDO-}" || ! -x "$SSPAD_REAL_SUDO" ]]; then
         builtin printf 'Shell Scratchpad: sudo is not installed.\n' >&2
         return 127
     fi
@@ -236,19 +241,19 @@ sudo() {
     local argument=""
     for argument in "$@"; do
         if [[ "$argument" == "-n" || "$argument" == "--non-interactive" ]]; then
-            command sudo "$@"
+            "$SSPAD_REAL_SUDO" "$@"
             return $?
         fi
     done
 
     if [[ "$SSPAD_GUI_SUDO" != "1" ]]; then
-        command sudo "$@"
+        "$SSPAD_REAL_SUDO" "$@"
         return $?
     fi
 
     # Use the system credential timestamp whenever possible.
-    if command sudo -n -v >/dev/null 2>&1; then
-        command sudo "$@"
+    if "$SSPAD_REAL_SUDO" -n -v >/dev/null 2>&1; then
+        "$SSPAD_REAL_SUDO" "$@"
         return $?
     fi
 
@@ -273,24 +278,25 @@ sudo() {
 
     # Validate once, then retain it only in this Bash process so later calls
     # can refresh sudo's timestamp silently if necessary.
-    if ! builtin printf '%s\n' "$password" | command sudo -S -p '' -v >/dev/null 2>&1; then
+    if ! builtin printf '%s\n' "$password" | "$SSPAD_REAL_SUDO" -S -p '' -v >/dev/null 2>&1; then
         unset password
         if ((password_is_cached)); then unset SSPAD_SUDO_PASSWORD; fi
         if ((xtrace_enabled)); then set -x; fi
         return 1
     fi
+    builtin printf '\036SSPAD_SUDO_AUTHENTICATED\037\n' >&2
 
     if [[ "$SSPAD_REUSE_SUDO_PASSWORD" == "1" ]]; then
         SSPAD_SUDO_PASSWORD="$password"
     fi
     local command_status=0
-    if command sudo "$@"; then
+    if "$SSPAD_REAL_SUDO" "$@"; then
         command_status=0
     else
         command_status=$?
     fi
     if [[ "$SSPAD_REUSE_SUDO_PASSWORD" != "1" ]]; then
-        command sudo -k >/dev/null 2>&1 || true
+        "$SSPAD_REAL_SUDO" -k >/dev/null 2>&1 || true
     fi
     unset password
     if ((xtrace_enabled)); then set -x; fi
@@ -340,6 +346,8 @@ trap '__sspad_trace_command "$BASH_COMMAND"' DEBUG
 __SSPAD_DEBUG_MODE=__SSPAD_DEBUG_MODE_VALUE__
 __SSPAD_DEBUG_TARGET_DEPTH=0
 __SSPAD_DEBUG_SKIP_LINE=0
+__SSPAD_DEBUG_PAUSE_REQUESTED=0
+trap '__SSPAD_DEBUG_PAUSE_REQUESTED=1' USR1
 set -T
 __sspad_debug() {
     local __sspad_previous_status=$?
@@ -370,6 +378,9 @@ __sspad_debug() {
         builtin printf 'C%s\t%s\0' "$__sspad_history_line" "$__sspad_command" >&197
     fi
     case "$__SSPAD_DEBUG_MODE" in
+        start)
+            __sspad_pause=1
+            ;;
         run)
             if ((__SSPAD_DEBUG_SKIP_LINE == __sspad_user_line)); then
                 :
@@ -396,6 +407,10 @@ __sspad_debug() {
             ((__sspad_depth < __SSPAD_DEBUG_TARGET_DEPTH)) && __sspad_pause=1
             ;;
     esac
+    if ((__SSPAD_DEBUG_PAUSE_REQUESTED)); then
+        __SSPAD_DEBUG_PAUSE_REQUESTED=0
+        __sspad_pause=1
+    fi
     ((__sspad_pause)) || return 0
 
     local __sspad_encoded_command
@@ -1183,10 +1198,41 @@ public:
         outputEdit->setLineWrapMode(QPlainTextEdit::NoWrap);
         outputEdit->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
         outputEdit->setPlaceholderText(QStringLiteral("Script output and errors will appear here."));
-        outputMatchHighlighter = new OutputMatchHighlighter(outputEdit->document());
+        filteredOutputDocument = outputEdit->document();
+        filteredOutputDocument->setParent(outputPanel);
+        terminalOutputDocument = new QTextDocument(outputPanel);
+        terminalOutputDocument->setDocumentLayout(new QPlainTextDocumentLayout(terminalOutputDocument));
+        outputEdit->setDocument(terminalOutputDocument);
+        terminalOutputRenderer = new ShellScratchpad::Output::TerminalOutput(terminalOutputDocument);
+        outputMatchHighlighter = new OutputMatchHighlighter(filteredOutputDocument);
         outputLayout->addLayout(outputHeadingRow);
         outputLayout->addWidget(outputSearchRow);
         outputLayout->addWidget(outputEdit, 1);
+        auto *processInputRow = new QWidget(outputPanel);
+        auto *processInputLayout = new QHBoxLayout(processInputRow);
+        processInputLayout->setContentsMargins(0, 0, 0, 0);
+        processInputLayout->setSpacing(5);
+        processInputEdit = new QLineEdit(processInputRow);
+        processInputEdit->setPlaceholderText(QStringLiteral("Send a line to the running script or command…"));
+        processInputEdit->setToolTip(QStringLiteral("Send text followed by a newline to the running process's standard input."));
+        processInputEdit->setEnabled(false);
+        connect(processInputEdit, &QLineEdit::textEdited, this, [this]() { promptTimer.stop(); });
+        auto *sendInputButton = new QPushButton(QStringLiteral("Send input"), processInputRow);
+        sendInputButton->setEnabled(false);
+        connect(sendInputButton, &QPushButton::clicked, this, [this]() { sendProcessInput(); });
+        connect(processInputEdit, &QLineEdit::returnPressed, this, [this]() { sendProcessInput(); });
+        connect(&process, &QProcess::started, this, [this, sendInputButton]() {
+            processInputEdit->setEnabled(true);
+            sendInputButton->setEnabled(true);
+        });
+        connect(&process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+                [this, sendInputButton](int, QProcess::ExitStatus) {
+            processInputEdit->setEnabled(false);
+            sendInputButton->setEnabled(false);
+        });
+        processInputLayout->addWidget(processInputEdit, 1);
+        processInputLayout->addWidget(sendInputButton);
+        outputLayout->addWidget(processInputRow);
 
         immediatePanel = new QWidget(this);
         auto *immediateLayout = new QVBoxLayout(immediatePanel);
@@ -1261,6 +1307,9 @@ public:
         runButton->setDefault(true);
         stopButton = new QPushButton(QStringLiteral("■  Stop"), scriptPanel);
         stopButton->setEnabled(false);
+        pauseButton = new QPushButton(QStringLiteral("⏸  Pause script"), scriptPanel);
+        pauseButton->setToolTip(QStringLiteral("Pause at the next Bash command boundary and open the debugger"));
+        pauseButton->setEnabled(false);
         runStatusLabel = new QLabel(QStringLiteral("Ready"), scriptPanel);
         runDurationLabel = new QLabel(QStringLiteral(""), scriptPanel);
         auto *saveButton = new QPushButton(QStringLiteral("Save script"), scriptPanel);
@@ -1270,6 +1319,7 @@ public:
         connect(newButton, &QPushButton::clicked, this, [this]() { createNewScript(); });
         buttonRow->addWidget(runButton);
         buttonRow->addWidget(stopButton);
+        buttonRow->addWidget(pauseButton);
         buttonRow->addStretch(1);
         buttonRow->addWidget(saveButton);
         buttonRow->addWidget(newButton);
@@ -1579,6 +1629,7 @@ public:
             contextMenu.exec(scriptEdit->viewport()->mapToGlobal(position));
         });
         connect(stopButton, &QPushButton::clicked, this, [this]() { stopScript(); });
+        connect(pauseButton, &QPushButton::clicked, this, [this]() { pauseScript(); });
         connect(outputFindEdit, &QLineEdit::textChanged, this, [this]() { refreshOutputView(); });
         connect(outputFindCaseSensitiveAction, &QAction::toggled, this, [this]() { refreshOutputView(); });
         scriptEdit->installEventFilter(this);
@@ -1586,7 +1637,11 @@ public:
         connect(&process, &QProcess::readyReadStandardOutput, this, [this]() {
             processOutputAvailable();
         });
-        connect(&process, &QProcess::started, this, [this]() { closeDebuggerChildSocket(); });
+        connect(&process, &QProcess::started, this, [this]() {
+            closeDebuggerChildSocket();
+            if (pauseButton)
+                pauseButton->setEnabled(true);
+        });
         connect(&process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
                 [this](int exitCode, QProcess::ExitStatus exitStatus) {
             const bool WAS_DEBUGGING = debuggerEnabled;
@@ -1604,11 +1659,14 @@ public:
             killTimer.stop();
             runButton->setEnabled(true);
             stopButton->setEnabled(false);
+            pauseButton->setEnabled(false);
+            pauseRequestPending = false;
             directoryEdit->setEnabled(true);
             scriptEdit->setReadOnly(false);
             scriptEdit->setDebugLine(0);
             debuggerEnabled = false;
             debuggerPaused = false;
+            debuggerRootScriptPath.clear();
             if (externalDebuggerWindow) {
                 externalDebuggerWindow->clearNestedDebuggerPause();
                 externalDebuggerWindow.clear();
@@ -1632,6 +1690,8 @@ public:
                 toggleBreakpointAction->setEnabled(true);
             closeScriptFileDescriptor();
             cleanupRuntimeScriptFile();
+            sudoShimDirectory.reset();
+            clearSudoPasswordCache();
 
             const QString DURATION = QStringLiteral("%1 s").arg(runElapsed.elapsed() / 1000.0, 0, 'f', 1);
             runDurationLabel->setText(DURATION);
@@ -1659,9 +1719,13 @@ public:
                 killTimer.stop();
                 runButton->setEnabled(true);
                 stopButton->setEnabled(false);
+                pauseButton->setEnabled(false);
+                pauseRequestPending = false;
                 directoryEdit->setEnabled(true);
                 closeScriptFileDescriptor();
                 cleanupRuntimeScriptFile();
+                sudoShimDirectory.reset();
+                clearSudoPasswordCache();
                 closeRunHistoryPipe();
                 closeDebuggerSocket();
                 debuggerEnabled = false;
@@ -1764,7 +1828,11 @@ public:
             return;
         const QString normalizedPath = normalizedScriptPath(path);
         ShellScratchpadWindow *target = nullptr;
+        if (folderMode && isInsideFolderRoot(normalizedPath))
+            target = this;
         for (ShellScratchpadWindow *window : openScratchpadWindows()) {
+            if (target)
+                break;
             if (window && !window->currentScriptPath.isEmpty() &&
                 normalizedScriptPath(window->currentScriptPath) == normalizedPath) {
                 target = window;
@@ -1774,6 +1842,29 @@ public:
         if (!target) {
             target = new ShellScratchpadWindow(QFileInfo(normalizedPath).absolutePath(), normalizedPath, false);
             target->show();
+        }
+        // Folder mode already has a real tab model. Keep nested script pauses in
+        // that editor so the running session's debugger controls remain in place.
+        if (target->folderMode && target->isInsideFolderRoot(normalizedPath)) {
+            if (!target->openFolderFile(normalizedPath))
+                return;
+            target->showNormal();
+            target->raise();
+            target->activateWindow();
+            const QTextBlock block = target->scriptEdit->document()->findBlockByNumber(line - 1);
+            if (!block.isValid())
+                return;
+            target->scriptEdit->setReadOnly(true);
+            target->scriptEdit->revealPosition(block.position());
+            target->scriptEdit->setDebugLine(line);
+            target->scriptEdit->setTextCursor(QTextCursor(block));
+            target->scriptEdit->centerCursor();
+            target->debuggerBanner->setText(QStringLiteral("BREAK MODE — nested script paused at %1:%2")
+                .arg(QFileInfo(normalizedPath).fileName()).arg(line));
+            target->debuggerBanner->show();
+            target->statusBar()->showMessage(QStringLiteral("Paused at %1:%2")
+                .arg(QFileInfo(normalizedPath).fileName()).arg(line));
+            return;
         }
         target->showNormal();
         target->raise();
@@ -1852,6 +1943,7 @@ public:
         closeRunHistoryPipe();
         closeDebuggerSocket();
         cleanupRuntimeScriptFile();
+        clearSudoPasswordCache();
         openScratchpadWindows().removeAll(this);
     }
 
@@ -2008,6 +2100,10 @@ private:
     QLineEdit *scriptFindEdit = nullptr;
     QAction *scriptFindCaseSensitiveAction = nullptr;
     QPlainTextEdit *outputEdit = nullptr;
+    QTextDocument *terminalOutputDocument = nullptr;
+    QTextDocument *filteredOutputDocument = nullptr;
+    ShellScratchpad::Output::TerminalOutput *terminalOutputRenderer = nullptr;
+    QLineEdit *processInputEdit = nullptr;
     QLineEdit *outputFindEdit = nullptr;
     QWidget *outputSearchRow = nullptr;
     QAction *outputFindCaseSensitiveAction = nullptr;
@@ -2073,6 +2169,7 @@ private:
     QAction *toggleBreakpointAction = nullptr;
     QPushButton *runButton = nullptr;
     QPushButton *stopButton = nullptr;
+    QPushButton *pauseButton = nullptr;
     QLabel *runStatusLabel = nullptr;
     QLabel *runDurationLabel = nullptr;
     QProcess process;
@@ -2094,9 +2191,13 @@ private:
         std::make_shared<std::atomic<quint64>>(0);
     int scriptFileDescriptor = -1;
     QString runtimeScriptPath;
+    std::unique_ptr<QTemporaryDir> sudoShimDirectory;
+    QByteArray cachedSudoPassword;
+    QByteArray pendingSudoPassword;
     bool promptDialogOpen = false;
     bool stopRequested = false;
     QString currentScriptPath;
+    QString debuggerRootScriptPath;
     QTimer recoveryTimer;
     QTimer latestDraftTimer;
     QTimer shellCheckTimer;
@@ -2110,6 +2211,7 @@ private:
     QByteArray debuggerSocketBuffer;
     bool debuggerEnabled = false;
     bool debuggerPaused = false;
+    bool pauseRequestPending = false;
     int debuggerCurrentDepth = 0;
     QHash<QString, QString> debuggerVariables;
     QString pendingImmediateExpression;
@@ -2336,8 +2438,12 @@ private:
         reuseSudoPasswordAction = scriptMenu->addAction(QStringLiteral("Reuse sudo password for this run"));
         reuseSudoPasswordAction->setCheckable(true);
         reuseSudoPasswordAction->setChecked(true);
-        reuseSudoPasswordAction->setToolTip(QStringLiteral("Keep the password only in the running script process so sudo is prompted once per run."));
+        reuseSudoPasswordAction->setToolTip(QStringLiteral("Keep the password in app memory for this run so sudo calls, including nested shell commands, reuse it."));
         connect(guiSudoPromptsAction, &QAction::toggled, reuseSudoPasswordAction, &QAction::setEnabled);
+        connect(reuseSudoPasswordAction, &QAction::toggled, this, [this](bool enabled) {
+            if (!enabled)
+                clearSudoPasswordCache();
+        });
         scriptMenu->addSeparator();
         clearOutputEachRunAction = scriptMenu->addAction(QStringLiteral("Clear output each run"));
         clearOutputEachRunAction->setCheckable(true);
@@ -3018,6 +3124,7 @@ private:
         if (!folderMode || switchingFolderFile)
             return;
         storeActiveFolderFile();
+        scriptEdit->setDebugLine(0);
         const QString PATH = index >= 0 ? editorTabBar->tabData(index).toString() : QString();
         switchingFolderFile = true;
         activeFolderFilePath = PATH;
@@ -4774,8 +4881,11 @@ df -ih
         if (externalDebuggerWindow)
             externalDebuggerWindow->clearNestedDebuggerPause();
         debuggerPaused = false;
+        pauseRequestPending = false;
         scriptEdit->setDebugLine(0);
         runStatusLabel->setText(QStringLiteral("Running"));
+        if (pauseButton && process.state() != QProcess::NotRunning)
+            pauseButton->setEnabled(true);
         debuggerBanner->setText(QStringLiteral("DEBUG MODE — running until the next breakpoint"));
         debuggerBanner->setStyleSheet(QStringLiteral("QLabel { background: #805c12; color: white; font-weight: bold; padding: 6px; border-radius: 3px; }"));
         statusBar()->showMessage(QStringLiteral("Running under debugger…"));
@@ -4971,6 +5081,9 @@ df -ih
                     resizeOutputDock(true);
                 }
                 debuggerPaused = true;
+                pauseRequestPending = false;
+                if (pauseButton)
+                    pauseButton->setEnabled(false);
                 debuggerCurrentDepth = FIELDS[2].toInt();
                 const int LINE = FIELDS[1].toInt();
                 const QString COMMAND = QString::fromUtf8(QByteArray::fromBase64(FIELDS[3]));
@@ -4991,14 +5104,22 @@ df -ih
                         externalDebuggerWindow->clearNestedDebuggerPause();
                         externalDebuggerWindow.clear();
                     }
-                    const QTextBlock currentBlock = scriptEdit->document()->findBlockByNumber(LINE - 1);
-                    if (currentBlock.isValid()) {
-                        scriptEdit->revealPosition(currentBlock.position());
-                        scriptEdit->setDebugLine(LINE);
-                        scriptEdit->setTextCursor(QTextCursor(currentBlock));
-                        scriptEdit->centerCursor();
+                    if (folderMode && !debuggerRootScriptPath.isEmpty() &&
+                        isInsideFolderRoot(debuggerRootScriptPath) &&
+                        normalizedScriptPath(activeFolderFilePath) != normalizedScriptPath(debuggerRootScriptPath)) {
+                        navigateToScriptLine(debuggerRootScriptPath, LINE);
+                        statusBar()->showMessage(QStringLiteral("Paused at %1:%2: %3")
+                            .arg(QFileInfo(debuggerRootScriptPath).fileName()).arg(LINE).arg(COMMAND));
+                    } else {
+                        const QTextBlock currentBlock = scriptEdit->document()->findBlockByNumber(LINE - 1);
+                        if (currentBlock.isValid()) {
+                            scriptEdit->revealPosition(currentBlock.position());
+                            scriptEdit->setDebugLine(LINE);
+                            scriptEdit->setTextCursor(QTextCursor(currentBlock));
+                            scriptEdit->centerCursor();
+                        }
+                        statusBar()->showMessage(QStringLiteral("Paused at line %1: %2").arg(LINE).arg(COMMAND));
                     }
-                    statusBar()->showMessage(QStringLiteral("Paused at line %1: %2").arg(LINE).arg(COMMAND));
                 }
                 runStatusLabel->setText(QStringLiteral("Paused at line %1").arg(LINE));
                 debuggerBanner->setText(QStringLiteral("BREAK MODE — paused before line %1").arg(LINE));
@@ -5220,14 +5341,16 @@ df -ih
         const bool CAPTURE_HISTORY = prepareRunHistoryPipe();
         const QSet<int> BREAKPOINTS = scriptEdit->breakpoints();
         const bool DEBUGGING_ENABLED = forceDebug || !BREAKPOINTS.isEmpty();
-        if (DEBUGGING_ENABLED && !prepareDebuggerSocket()) {
+        if (!prepareDebuggerSocket()) {
             closeRunHistoryPipe();
             QMessageBox::critical(this, QStringLiteral("Could not start debugger"),
                                   QStringLiteral("Could not create the local debugger control channel."));
             return;
         }
         debuggerEnabled = DEBUGGING_ENABLED;
+        debuggerRootScriptPath = currentScriptPath;
         debuggerPaused = false;
+        pauseRequestPending = false;
         debuggerCurrentDepth = 0;
         debuggerVariables.clear();
         pendingImmediateExpression.clear();
@@ -5254,7 +5377,7 @@ df -ih
             toggleBreakpointAction->setEnabled(false);
         const QByteArray RUNTIME_SCRIPT = buildRuntimeScript(
             sourceText.toUtf8(), guiSudoPromptsAction->isChecked(),
-            reuseSudoPasswordAction->isChecked(), CAPTURE_HISTORY, DEBUGGING_ENABLED,
+            reuseSudoPasswordAction->isChecked(), CAPTURE_HISTORY, true,
             BREAKPOINTS, selectedStartLine - 1, forceDebug, &currentRunUserScriptStartLine);
         currentHistoryLineOffset = selectionOnly ? selectedStartLine - 1 : 0;
         bool runtimeFileInWorkingDirectory = false;
@@ -5299,15 +5422,55 @@ df -ih
         resizeOutputDock(DEBUGGING_ENABLED);
         pendingOutput.clear();
         runDiagnosticOutput.clear();
+        clearSudoPasswordCache();
 
         process.setWorkingDirectory(DIRECTORY_INFO.absoluteFilePath());
         QProcessEnvironment runEnvironment = QProcessEnvironment::systemEnvironment();
+        const QString INHERITED_SUDO_SHIM = runEnvironment.value(QStringLiteral("SSPAD_SUDO_SHIM_PATH"));
+        if (!INHERITED_SUDO_SHIM.isEmpty()) {
+            QStringList pathEntries = runEnvironment.value(QStringLiteral("PATH")).split(
+                QDir::listSeparator(), Qt::SkipEmptyParts);
+            pathEntries.removeAll(INHERITED_SUDO_SHIM);
+            runEnvironment.insert(QStringLiteral("PATH"), pathEntries.join(QDir::listSeparator()));
+        }
+        const QStringList INHERITED_RUNTIME_KEYS = runEnvironment.keys();
+        for (const QString &key : INHERITED_RUNTIME_KEYS) {
+            if (key.startsWith(QStringLiteral("SSPAD_")))
+                runEnvironment.remove(key);
+        }
         const QJsonObject PROFILE = selectedRunProfile();
         const QJsonObject OVERRIDES = PROFILE.value(QStringLiteral("environment")).toObject();
         for (auto it = OVERRIDES.begin(); it != OVERRIDES.end(); ++it)
             runEnvironment.insert(it.key(), it.value().toString());
         runEnvironment.insert(QStringLiteral("PWD"), DIRECTORY_INFO.absoluteFilePath());
         runEnvironment.insert(QStringLiteral("SSPAD_RUNTIME_FILE"), runtimeScriptPath);
+        runEnvironment.insert(QStringLiteral("SSPAD_GUI_SUDO"), guiSudoPromptsAction->isChecked()
+                                  ? QStringLiteral("1") : QStringLiteral("0"));
+        runEnvironment.insert(QStringLiteral("SSPAD_REUSE_SUDO_PASSWORD"),
+                              reuseSudoPasswordAction->isChecked()
+                                  ? QStringLiteral("1") : QStringLiteral("0"));
+        const QString REAL_SUDO = QStandardPaths::findExecutable(
+            QStringLiteral("sudo"), runEnvironment.value(QStringLiteral("PATH")).split(QDir::listSeparator(), Qt::SkipEmptyParts));
+        runEnvironment.insert(QStringLiteral("SSPAD_REAL_SUDO"), REAL_SUDO);
+        if (guiSudoPromptsAction->isChecked() && !REAL_SUDO.isEmpty()) {
+            QString shimError;
+            if (!prepareSudoShim(&shimError)) {
+                QMessageBox::critical(this, QStringLiteral("Could not prepare sudo input routing"), shimError);
+                closeScriptFileDescriptor();
+                cleanupRuntimeScriptFile();
+                closeRunHistoryPipe();
+                closeDebuggerSocket();
+                debuggerEnabled = false;
+                scriptEdit->setReadOnly(false);
+                updateDebuggerActions();
+                if (toggleBreakpointAction)
+                    toggleBreakpointAction->setEnabled(true);
+                return;
+            }
+            runEnvironment.insert(QStringLiteral("PATH"), sudoShimDirectory->path() + QDir::listSeparator()
+                                      + runEnvironment.value(QStringLiteral("PATH")));
+            runEnvironment.insert(QStringLiteral("SSPAD_SUDO_SHIM_PATH"), sudoShimDirectory->path());
+        }
         process.setProcessEnvironment(runEnvironment);
         process.setProgram(QStringLiteral("/bin/bash"));
         process.setArguments({QStringLiteral("--noprofile"), QStringLiteral("--norc"),
@@ -5370,12 +5533,27 @@ df -ih
     {
         if (process.state() == QProcess::NotRunning)
             return;
+        processInputEdit->setEnabled(false);
         promptTimer.stop();
         stopRequested = true;
         statusBar()->showMessage(QStringLiteral("Stopping script…"));
         terminateProcessGroup();
         killTimer.setSingleShot(true);
         killTimer.start(1500);
+    }
+
+    void pauseScript()
+    {
+        if (process.state() == QProcess::NotRunning || debuggerPaused || pauseRequestPending)
+            return;
+        const qint64 PID = process.processId();
+        if (PID <= 0 || ::kill(static_cast<pid_t>(PID), SIGUSR1) != 0) {
+            statusBar()->showMessage(QStringLiteral("Could not request a script pause"), 3000);
+            return;
+        }
+        pauseRequestPending = true;
+        pauseButton->setEnabled(false);
+        statusBar()->showMessage(QStringLiteral("Pause requested; waiting for the next Bash command boundary…"));
     }
 
     void terminateProcessGroup()
@@ -5406,16 +5584,88 @@ df -ih
         runtimeScriptPath.clear();
     }
 
+    void clearSudoPasswordCache()
+    {
+        cachedSudoPassword.fill('\0');
+        cachedSudoPassword.clear();
+        pendingSudoPassword.fill('\0');
+        pendingSudoPassword.clear();
+    }
+
+    bool prepareSudoShim(QString *errorMessage)
+    {
+        sudoShimDirectory = std::make_unique<QTemporaryDir>(
+            QDir(QDir::tempPath()).filePath(QStringLiteral("shell-scratchpad-sudo-XXXXXX")));
+        if (!sudoShimDirectory->isValid()) {
+            if (errorMessage)
+                *errorMessage = QStringLiteral("Could not create a private temporary directory for the sudo command adapter.");
+            sudoShimDirectory.reset();
+            return false;
+        }
+
+        const QString SHIM_PATH = QDir(sudoShimDirectory->path()).filePath(QStringLiteral("sudo"));
+        QFile shim(SHIM_PATH);
+        static const QByteArray SHIM_SCRIPT = R"SSPAD(#!/bin/bash
+if [[ "${SSPAD_GUI_SUDO-0}" != "1" ]]; then
+    exec "$SSPAD_REAL_SUDO" "$@"
+fi
+for argument in "$@"; do
+    if [[ "$argument" == "-n" || "$argument" == "--non-interactive" ]]; then
+        exec "$SSPAD_REAL_SUDO" "$@"
+    fi
+done
+if "$SSPAD_REAL_SUDO" -n -v >/dev/null 2>&1; then
+    exec "$SSPAD_REAL_SUDO" "$@"
+fi
+request_type="sudo"
+attempt=0
+while true; do
+    prompt="Authentication required for: sudo $*"
+    if [[ "$request_type" == "sudo_retry" ]]; then
+        prompt="Authentication failed. Try again: sudo $*"
+    fi
+    encoded_prompt="$(builtin printf '%s' "$prompt" | command base64 -w0 2>/dev/null)"
+    builtin printf '\036SSPAD_INPUT:%s:%s\037\n' "$request_type" "$encoded_prompt" >&2
+    password=""
+    IFS="" builtin read -r -s -u 199 password || exit 1
+    if builtin printf '%s\n' "$password" | "$SSPAD_REAL_SUDO" -S -p '' -v >/dev/null 2>&1; then
+        builtin printf '\036SSPAD_SUDO_AUTHENTICATED\037\n' >&2
+        break
+    fi
+    unset password
+    request_type="sudo_retry"
+    attempt=$((attempt + 1))
+    ((attempt < 3)) || exit 1
+done
+"$SSPAD_REAL_SUDO" "$@"
+command_status=$?
+if [[ "${SSPAD_REUSE_SUDO_PASSWORD-1}" != "1" ]]; then
+    "$SSPAD_REAL_SUDO" -k >/dev/null 2>&1 || true
+fi
+unset password
+exit "$command_status"
+)SSPAD";
+        if (!shim.open(QIODevice::WriteOnly) || shim.write(SHIM_SCRIPT) != SHIM_SCRIPT.size() ||
+            !shim.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner)) {
+            if (errorMessage)
+                *errorMessage = QStringLiteral("Could not create the sudo command adapter: %1")
+                                    .arg(shim.errorString());
+            sudoShimDirectory.reset();
+            return false;
+        }
+        return true;
+    }
+
     void appendOutput(const QString &text)
     {
         if (text.isEmpty())
             return;
-        outputContent += text;
+        terminalOutputRenderer->append(text);
+        outputContent = terminalOutputRenderer->plainText();
         if (outputFindEdit->text().isEmpty()) {
-            QTextCursor cursor = outputEdit->textCursor();
-            cursor.movePosition(QTextCursor::End);
-            cursor.insertText(text);
-            outputEdit->setTextCursor(cursor);
+            if (outputEdit->document() != terminalOutputDocument)
+                outputEdit->setDocument(terminalOutputDocument);
+            outputEdit->setTextCursor(terminalOutputRenderer->cursor());
             outputEdit->ensureCursorVisible();
         } else {
             outputFilterGeneration->fetch_add(1, std::memory_order_relaxed);
@@ -5432,8 +5682,9 @@ df -ih
         outputFilterGeneration->fetch_add(1, std::memory_order_relaxed);
         if (QUERY.isEmpty()) {
             outputMatchHighlighter->setQuery(QString(), outputFindCaseSensitiveAction->isChecked());
-            outputEdit->setPlainText(outputContent);
-            outputEdit->moveCursor(QTextCursor::End);
+            if (outputEdit->document() != terminalOutputDocument)
+                outputEdit->setDocument(terminalOutputDocument);
+            outputEdit->setTextCursor(terminalOutputRenderer->cursor());
             outputEdit->ensureCursorVisible();
             return;
         }
@@ -5517,7 +5768,9 @@ df -ih
                     SELF->outputFindCaseSensitiveAction->isChecked() != CASE_SENSITIVE)
                     return;
                 SELF->outputMatchHighlighter->setQuery(QUERY, CASE_SENSITIVE);
-                SELF->outputEdit->setPlainText(FILTERED);
+                if (SELF->outputEdit->document() != SELF->filteredOutputDocument)
+                    SELF->outputEdit->setDocument(SELF->filteredOutputDocument);
+                SELF->filteredOutputDocument->setPlainText(FILTERED);
                 SELF->outputFindNavigationPosition = 0;
                 SELF->outputEdit->moveCursor(QTextCursor::End);
                 SELF->outputEdit->ensureCursorVisible();
@@ -5532,7 +5785,10 @@ df -ih
         outputFilterTimer.stop();
         outputFilterGeneration->fetch_add(1, std::memory_order_relaxed);
         outputContent.clear();
-        outputEdit->clear();
+        terminalOutputRenderer->clear();
+        filteredOutputDocument->clear();
+        if (outputEdit->document() != terminalOutputDocument)
+            outputEdit->setDocument(terminalOutputDocument);
     }
 
     void copyOutput()
@@ -5546,6 +5802,18 @@ df -ih
             : QStringLiteral("Output copied to clipboard"), 2500);
     }
 
+    void sendProcessInput()
+    {
+        if (process.state() == QProcess::NotRunning || !processInputEdit)
+            return;
+        const QByteArray INPUT = processInputEdit->text().toUtf8() + '\n';
+        if (process.write(INPUT) < 0) {
+            statusBar()->showMessage(QStringLiteral("Could not send input to the running process"), 3000);
+            return;
+        }
+        processInputEdit->clear();
+    }
+
     void processOutputAvailable()
     {
         const QByteArray OUTPUT = process.readAllStandardOutput();
@@ -5556,14 +5824,21 @@ df -ih
         pendingOutput.append(OUTPUT);
 
         while (true) {
-            const qsizetype MARKER_START = pendingOutput.indexOf(INPUT_MARKER_PREFIX);
+            const qsizetype INPUT_START = pendingOutput.indexOf(INPUT_MARKER_PREFIX);
+            const qsizetype AUTH_START = pendingOutput.indexOf(SUDO_AUTH_MARKER);
+            const bool AUTH_MARKER_FIRST = AUTH_START >= 0 &&
+                (INPUT_START < 0 || AUTH_START < INPUT_START);
+            const qsizetype MARKER_START = AUTH_MARKER_FIRST ? AUTH_START : INPUT_START;
             if (MARKER_START < 0) {
                 qsizetype matchingSuffixLength = 0;
-                const qsizetype MAXIMUM_SUFFIX = qMin(pendingOutput.size(), INPUT_MARKER_PREFIX.size() - 1);
-                for (qsizetype LENGTH = MAXIMUM_SUFFIX; LENGTH > 0; --LENGTH) {
-                    if (pendingOutput.endsWith(INPUT_MARKER_PREFIX.left(LENGTH))) {
-                        matchingSuffixLength = LENGTH;
-                        break;
+                const QList<QByteArray> MARKER_PREFIXES{INPUT_MARKER_PREFIX, SUDO_AUTH_MARKER};
+                for (const QByteArray &PREFIX : MARKER_PREFIXES) {
+                    const qsizetype MAXIMUM_SUFFIX = qMin(pendingOutput.size(), PREFIX.size() - 1);
+                    for (qsizetype LENGTH = MAXIMUM_SUFFIX; LENGTH > matchingSuffixLength; --LENGTH) {
+                        if (pendingOutput.endsWith(PREFIX.left(LENGTH))) {
+                            matchingSuffixLength = LENGTH;
+                            break;
+                        }
                     }
                 }
 
@@ -5575,6 +5850,26 @@ df -ih
                     scheduleExternalPromptCheck();
                 }
                 return;
+            }
+
+            if (AUTH_MARKER_FIRST) {
+                if (MARKER_START > 0) {
+                    appendOutput(QString::fromLocal8Bit(pendingOutput.constData(), MARKER_START));
+                    pendingOutput.remove(0, MARKER_START);
+                }
+                pendingOutput.remove(0, SUDO_AUTH_MARKER.size());
+                if (!pendingOutput.isEmpty() && pendingOutput.startsWith('\r'))
+                    pendingOutput.remove(0, 1);
+                if (!pendingOutput.isEmpty() && pendingOutput.startsWith('\n'))
+                    pendingOutput.remove(0, 1);
+                if (!pendingSudoPassword.isEmpty() && reuseSudoPasswordAction->isChecked()) {
+                    cachedSudoPassword.fill('\0');
+                    cachedSudoPassword.clear();
+                    cachedSudoPassword = pendingSudoPassword;
+                }
+                pendingSudoPassword.fill('\0');
+                pendingSudoPassword.clear();
+                continue;
             }
 
             if (MARKER_START > 0) {
@@ -5755,8 +6050,20 @@ df -ih
         promptDialogOpen = true;
         promptTimer.stop();
 
-        const bool IS_SUDO = requestType == QStringLiteral("sudo");
+        const bool IS_SUDO_RETRY = requestType == QStringLiteral("sudo_retry");
+        const bool IS_SUDO = requestType == QStringLiteral("sudo") || IS_SUDO_RETRY;
         const bool IS_PASSWORD = IS_SUDO || requestType == QStringLiteral("password");
+        if (IS_SUDO_RETRY)
+            clearSudoPasswordCache();
+        else if (IS_SUDO && reuseSudoPasswordAction->isChecked() && !cachedSudoPassword.isEmpty()) {
+            process.write(cachedSudoPassword + QByteArray(1, '\n'));
+            promptDialogOpen = false;
+            return;
+        }
+        if (IS_SUDO) {
+            pendingSudoPassword.fill('\0');
+            pendingSudoPassword.clear();
+        }
         const bool PROMPT_WAS_INFERRED = prompt.trimmed().isEmpty();
         if (PROMPT_WAS_INFERRED) {
             prompt = latestOutputLine();
@@ -5811,12 +6118,16 @@ df -ih
 
         if (!accepted) {
             promptDialogOpen = false;
+            pendingSudoPassword.fill('\0');
+            pendingSudoPassword.clear();
             appendOutput(QStringLiteral("\n[Input cancelled; stopping script]\n"));
             stopScript();
             return;
         }
 
         const QByteArray RESPONSE = answer.toUtf8() + '\n';
+        if (IS_SUDO && reuseSudoPasswordAction->isChecked())
+            pendingSudoPassword = answer.toUtf8();
         if (process.state() != QProcess::NotRunning)
             process.write(RESPONSE);
 

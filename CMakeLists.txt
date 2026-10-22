@@ -20,6 +20,8 @@ target_compile_options(shell-scratchpad-syntax PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(shell-scratchpad
     src/main.cpp
+    src/output/TerminalOutput.h
+    src/output/TerminalOutput.cpp
     src/util/FuzzyMatcher.h
     src/util/FuzzyMatcher.cpp
     src/editor/CodeEditor.h

@@ -6,6 +6,7 @@ A small Qt 6 desktop app for KDE/Linux that runs multiline Bash scripts from an 
 
 - Multiline Bash editor with a clear border
 - Live combined stdout/stderr output
+- Terminal-style output handles carriage-return progress updates, common cursor movement and erase controls, and ANSI text colors/styles
 - Output copying uses the selected text when a selection exists, otherwise it copies all output
 - Script editor line numbers
 - Syntax-aware folding for common `if`, loop, `case`, and brace-delimited blocks
@@ -21,11 +22,12 @@ A small Qt 6 desktop app for KDE/Linux that runs multiline Bash scripts from an 
 - A KDE/Dolphin context-menu action, **Open in Shell Scratchpad**, for `.sh` files; script paths can also be passed on the command line
 - `Ctrl+Enter` runs the script while the editor is focused
 - Common Bash `read` prompts (including `read -p`) request input in a dialog. Likely yes/no prompts use a Yes/No dialog, and other input uses a text field; `read -s` is masked.
-- Scripts that call `sudo` use a separate masked password dialog; the password is not printed in the output and is not passed as a command-line argument
+- The **Output** panel has a **Send input** field that sends a line to the running process's standard input. It works with input-reading commands launched directly or through another shell, such as `sh -c 'read answer; echo "$answer"'`.
+- Scripts that call `sudo` use a separate masked password dialog, including calls made from nested shells such as `sh -c`; the password is not printed in the output or passed as a command-line argument
 - Output from external commands is also checked for likely prompts (for example `[Y/n]`) after a short quiet period
 - Find in Output filters to matching lines while typing and highlights matching characters; Ctrl+F follows the focused editor or output pane
 - Run state, exit code, and elapsed time appear in the app status area, outside the script output
-- GUI sudo prompts and reuse of the password for the current run can be controlled with checkboxes
+- GUI sudo prompts and reuse of one password across the current run, including nested shell commands, can be controlled with checkboxes. When reuse is enabled, the app keeps the password in memory only until that run ends.
 - Quick-save and delete user Bash scripts from the Script menu; built-in diagnostic scripts are shown separately and protected from deletion
 - Keep one Latest Draft and clear old output whenever a new or existing script is opened
 - Debounced ShellCheck findings appear in a dockable list and can navigate to the source line; `setup.sh` installs ShellCheck on supported distributions
@@ -62,7 +64,7 @@ cmake --build build -j"$(nproc)"
 
 - Scripts execute with your normal user permissions. This is a shell, not a sandbox: review commands before running them, especially commands using `sudo`, deleting files, or changing system settings.
 - Saved scripts are made executable for owner, group, and others. Scripts are saved in the current working directory unless you explicitly choose another location.
-- Since standard input stays open for dialogs, a command that reads stdin until EOF (for example, a bare `cat`) can wait for more input; redirect it from a file or use `</dev/null` for commands that should see immediate EOF. The app heuristically detects common prompts from external programs when output pauses at a likely question; unusual prompts or full-screen terminal applications may not be detectable or supported.
+- Standard input stays open while a script runs. Use **Send input** to provide lines to any command reading stdin, including commands started through `sh -c`. A command that reads stdin until EOF (for example, a bare `cat`) keeps waiting until it receives enough input; redirect it from a file or use `</dev/null` when it should see immediate EOF. The app also heuristically detects common external prompts and opens a dialog. Full-screen terminal programs that require a TTY are not supported by the pipe-based input/output panel.
 - The `sudo` wrapper asks for a password through a masked dialog and supplies it using `sudo -S`. When calling commands that also need additional interactive input under `sudo`, use their noninteractive options when available (for example, `apt-get -y`) because `sudo` consumes the password from its own standard input.
 - Output combines stdout and stderr so messages appear in one live stream.
 - Execution uses Linux `memfd_create` plus an inherited file descriptor: the script text itself is not saved to a temporary file.

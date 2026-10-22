@@ -14,6 +14,9 @@ Shell Scratchpad is a Linux desktop app for writing, checking, and running Bash 
 - During a debug run, a prominent banner shows whether execution is running or paused, and the current command line is highlighted. Use **F5** to continue, **F10** to step over, **F11** to step into a script-local function, and **Shift+F11** to step out, or choose these actions from the Script menu.
 - While paused, the variable browser shows live Bash declarations and values, grouped as script-local variables, execution-profile overrides, and other variables. Filter the list by name or value, or hover over a variable in the editor to inspect its declaration and value.
 - The Immediate pane evaluates Bash expressions in the paused process. Output and exit status are shown in the pane, and assignments or other side effects persist when execution resumes.
+- The Output panel's **Send input** field writes a line to the running process's standard input, including for commands launched through nested shells.
+- The Output panel interprets carriage returns, common ANSI cursor and erase controls, and ANSI colors/styles so progress output updates in place.
+- With **GUI Sudo Prompts** enabled, `sudo` calls from nested shells also request authentication in the app's masked password dialog.
 - Debugging uses Bash command tracing to pause between shell commands and step through Bash statements and script-local functions. External programs run as individual commands and are not debugged internally.
 - Right-click the editor for actions relevant to the clicked token or selection. Depending on context, you can paste, run code, run selected code, copy, create a snippet, open a command's man page, navigate to a declaration, or copy a line together with its diagnostics. Hold **Ctrl** over a navigable in-script symbol to highlight it, then click to jump to its declaration.
 - A delayed hover tooltip shows available token descriptions. Typing dismisses it until typing pauses; editor focus loss hides suggestions and tooltips.
@@ -45,7 +48,7 @@ Shell Scratchpad is a Linux desktop app for writing, checking, and running Bash 
 - Set the working directory in the field above the editor, use **Browse**, or select a saved run profile. Profiles hold a working directory and environment overrides. A `.sh` file uses the Default profile unless a profile has been saved for that file; selecting Default removes that file's saved profile choice.
 - Choose **Script → Clear output each run** to control whether the previous output is removed before running. Output can also be cleared with **Script → Clear Output**.
 - Run progress, elapsed time, and the final exit status appear in the app's status area. Output contains the program's output rather than extra run-status messages.
-- The Script menu can show GUI password prompts for `sudo` and reuse a password for the duration of that run, so repeated sudo commands do not ask again. Passwords are not saved as part of a run profile.
+- The Script menu can show GUI password prompts for `sudo` and reuse one password across the run, including from nested shells. The app keeps it in memory only until that run ends; passwords are not saved as part of a run profile.
 - Shell Scratchpad can respond to common Bash `read` prompts with input dialogs, including masked input for `read -s`.
 - Open **Tools → Run History** when needed to inspect top-level commands from the latest run, including commands executed through `sudo` and their source lines.
 
