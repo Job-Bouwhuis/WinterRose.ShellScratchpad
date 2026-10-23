@@ -46,6 +46,7 @@
 #include <QTextEdit>
 #include <QStackedWidget>
 #include <QScrollBar>
+#include <QSettings>
 #include <memory>
 #include <limits>
 
@@ -671,6 +672,7 @@ bool GitWorkspaceWindow::showCloneDialog(const QString &directory, QWidget *pare
 GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *parent)
     : QMainWindow(parent), repoPath(QDir(repositoryPath).absolutePath())
 {
+    QSettings().setValue(QStringLiteral("gitWorkspace/lastRepository"), repoPath);
     setAttribute(Qt::WA_DeleteOnClose);
     setWindowTitle(QStringLiteral("Git Workspace — %1").arg(QDir(repoPath).dirName()));
     resize(1100, 760);
@@ -779,9 +781,6 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
             connect(pullAction, &QAction::triggered, this, [this] {
                 runGit({QStringLiteral("pull"), QStringLiteral("--rebase")});
             });
-            QAction *pushAction = syncMenu->addAction(QStringLiteral("Push"));
-            pushAction->setEnabled(!upstream.isEmpty() && !upstream.startsWith(QStringLiteral("fatal:")));
-            connect(pushAction, &QAction::triggered, this, [this] { runGit({QStringLiteral("push")}); });
         }
     });
     pullButton = new QToolButton(root);
@@ -809,6 +808,13 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
             connect(fetch, &QAction::triggered, this, [this] {
                 runGit({QStringLiteral("fetch"), QStringLiteral("--all"), QStringLiteral("--prune")});
             });
+            moreMenu->addSeparator();
+        }
+        if (hasRemote && !hasUnpushedCommits) {
+            QAction *push = moreMenu->addAction(QStringLiteral("Push"));
+            push->setEnabled(!gitOutput({QStringLiteral("branch"), QStringLiteral("--show-current")}).isEmpty());
+            push->setToolTip(QStringLiteral("Push the current branch; Git will report if it is already up to date"));
+            connect(push, &QAction::triggered, this, [this] { pushCurrentBranch(); });
             moreMenu->addSeparator();
         }
         if (!hasStagedChanges) {
@@ -1294,9 +1300,19 @@ void GitWorkspaceWindow::refreshBranches()
     const QString upstream = gitOutput({QStringLiteral("rev-parse"), QStringLiteral("--abbrev-ref"), QStringLiteral("@{upstream}")});
     hasUpstream = !upstream.isEmpty() && !upstream.startsWith(QStringLiteral("fatal:"));
     bool countOk = false;
-    const int unpushedCount = branch.isEmpty() || !hasRemote ? 0
-        : gitOutput({QStringLiteral("rev-list"), QStringLiteral("--count"), QStringLiteral("HEAD"), QStringLiteral("--not"), QStringLiteral("--remotes")}).toInt(&countOk);
-    hasUnpushedCommits = countOk && unpushedCount > 0;
+    int unpushedCount = 0;
+    if (!branch.isEmpty() && hasRemote) {
+        const QStringList countArguments = hasUpstream
+            ? QStringList{QStringLiteral("rev-list"), QStringLiteral("--count"), QStringLiteral("@{upstream}..HEAD")}
+            : QStringList{QStringLiteral("rev-list"), QStringLiteral("--count"), QStringLiteral("HEAD"), QStringLiteral("--not"), QStringLiteral("--remotes")};
+        unpushedCount = gitOutput(countArguments).toInt(&countOk);
+    }
+    const QStringList remoteBranches = gitOutput({QStringLiteral("for-each-ref"), QStringLiteral("--format=%(refname:short)"), QStringLiteral("refs/remotes")})
+        .split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    const bool branchPublished = std::any_of(remoteBranches.cbegin(), remoteBranches.cend(), [&branch](const QString &ref) {
+        return ref.endsWith(QLatin1Char('/') + branch);
+    });
+    hasUnpushedCommits = countOk && (unpushedCount > 0 || (!hasUpstream && !branchPublished));
     branchButton->setText(branch.isEmpty() ? QStringLiteral("Detached HEAD") : branch);
 }
 
@@ -1326,7 +1342,7 @@ void GitWorkspaceWindow::pullCurrentBranch()
 
 void GitWorkspaceWindow::pushCurrentBranch()
 {
-    if (!hasRemote || !hasUnpushedCommits) return;
+    if (!hasRemote) return;
     if (hasUpstream) {
         runGit({QStringLiteral("push")});
         return;
@@ -1830,8 +1846,10 @@ void GitWorkspaceWindow::updateToolbarState()
     if (syncButton) syncButton->setVisible(hasRemote && (hasUpstream || hasUnpushedCommits));
     if (pullButton) pullButton->setVisible(hasRemote);
     if (pushButton) {
-        pushButton->setVisible(hasRemote && hasUnpushedCommits);
-        pushButton->setEnabled(hasRemote && hasUnpushedCommits);
+        const bool canPush = hasRemote && hasUnpushedCommits && !gitOutput({QStringLiteral("branch"), QStringLiteral("--show-current")}).isEmpty();
+        pushButton->setVisible(canPush);
+        pushButton->setEnabled(canPush);
+        pushButton->setToolTip(QStringLiteral("Push local commits to the configured remote"));
     }
     if (branchButton) branchButton->setEnabled(true);
 }

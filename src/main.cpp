@@ -6397,16 +6397,32 @@ int main(int argc, char *argv[])
     }
 
     if (parser.isSet(gitWorkspaceOption)) {
-        QString repositoryPath = POSITIONAL_ARGUMENTS.isEmpty()
-            ? initialWorkingDirectory : QFileInfo(POSITIONAL_ARGUMENTS.first()).absoluteFilePath();
+        const bool explicitRepository = !POSITIONAL_ARGUMENTS.isEmpty();
+        QSettings settings;
+        QString repositoryPath = explicitRepository
+            ? QFileInfo(POSITIONAL_ARGUMENTS.first()).absoluteFilePath()
+            : settings.value(QStringLiteral("gitWorkspace/lastRepository")).toString().trimmed();
+        if (repositoryPath.isEmpty())
+            repositoryPath = initialWorkingDirectory;
         if (repositoryPath == QStringLiteral("~"))
             repositoryPath = QDir::homePath();
         else if (repositoryPath.startsWith(QStringLiteral("~/")))
             repositoryPath = QDir::home().filePath(repositoryPath.mid(2));
         if (!ShellScratchpad::Git::GitWorkspaceWindow::isGitRepository(repositoryPath)) {
-            QMessageBox::critical(nullptr, QStringLiteral("Git repository required"),
-                                  QStringLiteral("The selected folder is not inside a Git working tree."));
-            return 2;
+            if (explicitRepository) {
+                QMessageBox::critical(nullptr, QStringLiteral("Git repository required"),
+                                      QStringLiteral("The selected folder is not inside a Git working tree."));
+                return 2;
+            }
+            repositoryPath = QFileDialog::getExistingDirectory(nullptr, QStringLiteral("Open Git Repository"),
+                QDir(repositoryPath).exists() ? repositoryPath : QDir::homePath());
+            if (repositoryPath.isEmpty())
+                return 0;
+            if (!ShellScratchpad::Git::GitWorkspaceWindow::isGitRepository(repositoryPath)) {
+                QMessageBox::critical(nullptr, QStringLiteral("Git repository required"),
+                                      QStringLiteral("The selected folder is not inside a Git working tree."));
+                return 2;
+            }
         }
         auto *gitWindow = new ShellScratchpad::Git::GitWorkspaceWindow(repositoryPath);
         gitWindow->show();
