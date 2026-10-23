@@ -1131,39 +1131,6 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
         if (!item) return;
         switchToBranch(item->data(Qt::UserRole).toString(), item->data(Qt::UserRole + 1).toBool());
     });
-    branchesList->setContextMenuPolicy(Qt::CustomContextMenu);
-    connect(branchesList, &QListWidget::customContextMenuRequested, this, [this](const QPoint &position) {
-        QListWidgetItem *item = branchesList->itemAt(position);
-        if (!item) return;
-        branchesList->setCurrentItem(item);
-        QString branch = item->text().trimmed();
-        const bool current = branch.startsWith(QStringLiteral("* "));
-        if (current) branch.remove(0, 2);
-        const bool remote = branch.startsWith(QStringLiteral("remotes/"));
-        if (remote) branch.remove(0, QStringLiteral("remotes/").size());
-        if (branch.isEmpty()) return;
-
-        QMenu menu(this);
-        QMenu *mergeMenu = menu.addMenu(QStringLiteral("Merge into Current Branch"));
-        QAction *merge = mergeMenu->addAction(QStringLiteral("Merge"));
-        QAction *noFastForward = mergeMenu->addAction(QStringLiteral("Merge without Fast-forward"));
-        QAction *squash = mergeMenu->addAction(QStringLiteral("Squash Merge"));
-        const bool canMerge = !current;
-        merge->setEnabled(canMerge);
-        noFastForward->setEnabled(canMerge);
-        squash->setEnabled(canMerge);
-        const QString target = remote ? QStringLiteral("refs/remotes/%1").arg(branch) : branch;
-        connect(merge, &QAction::triggered, this, [this, target] {
-            runGit({QStringLiteral("merge"), QStringLiteral("--no-edit"), target});
-        });
-        connect(noFastForward, &QAction::triggered, this, [this, target] {
-            runGit({QStringLiteral("merge"), QStringLiteral("--no-edit"), QStringLiteral("--no-ff"), target});
-        });
-        connect(squash, &QAction::triggered, this, [this, target] {
-            runGit({QStringLiteral("merge"), QStringLiteral("--squash"), target});
-        });
-        menu.exec(branchesList->viewport()->mapToGlobal(position));
-    });
     connect(historyList, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem *item) {
         if (item) showCommit(item->data(Qt::UserRole).toString());
     });
@@ -1462,6 +1429,26 @@ void GitWorkspaceWindow::showBranchContextMenu(const QString &branch, bool remot
 {
     if (branch.isEmpty()) return;
     QMenu menu(this);
+    const QString currentBranch = gitOutput({QStringLiteral("branch"), QStringLiteral("--show-current")});
+    const bool canMerge = branch != currentBranch;
+    QMenu *mergeMenu = menu.addMenu(QStringLiteral("Merge into Current Branch"));
+    QAction *merge = mergeMenu->addAction(QStringLiteral("Merge"));
+    QAction *noFastForward = mergeMenu->addAction(QStringLiteral("Merge without Fast-forward"));
+    QAction *squash = mergeMenu->addAction(QStringLiteral("Squash Merge"));
+    merge->setEnabled(canMerge);
+    noFastForward->setEnabled(canMerge);
+    squash->setEnabled(canMerge);
+    const QString mergeTarget = remote ? QStringLiteral("refs/remotes/%1").arg(branch) : branch;
+    connect(merge, &QAction::triggered, this, [this, mergeTarget] {
+        runGit({QStringLiteral("merge"), QStringLiteral("--no-edit"), mergeTarget});
+    });
+    connect(noFastForward, &QAction::triggered, this, [this, mergeTarget] {
+        runGit({QStringLiteral("merge"), QStringLiteral("--no-edit"), QStringLiteral("--no-ff"), mergeTarget});
+    });
+    connect(squash, &QAction::triggered, this, [this, mergeTarget] {
+        runGit({QStringLiteral("merge"), QStringLiteral("--squash"), mergeTarget});
+    });
+    menu.addSeparator();
     QAction *switchAction = menu.addAction(remote ? QStringLiteral("Create or switch to local branch…") : QStringLiteral("Switch to Branch"));
     connect(switchAction, &QAction::triggered, this, [this, branch, remote] { switchToBranch(branch, remote); });
     menu.addSeparator();
