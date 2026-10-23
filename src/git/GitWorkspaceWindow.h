@@ -12,6 +12,7 @@ class QListWidgetItem;
 class QMenu;
 class QPlainTextEdit;
 class QProcess;
+class QProgressBar;
 class QPoint;
 class QToolButton;
 class QTreeWidget;
@@ -54,6 +55,7 @@ private:
     QAction *stashShortcutAction = nullptr;
     QAction *resolveShortcutAction = nullptr;
     QLabel *branchStatusLabel = nullptr;
+    QProgressBar *gitProgressBar = nullptr;
     QListWidget *branchesList = nullptr;
     QListWidget *historyList = nullptr;
     QListWidget *remotesList = nullptr;
@@ -129,5 +131,7 @@ private:
     void sendCommandInput();
     void updateToolbarState();
     void updateStatusBar();
+    void setGitBusy(bool busy, bool showProgress = false);
+    void updateGitProgress(const QString &output);
 };
 }

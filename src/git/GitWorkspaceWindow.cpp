@@ -33,6 +33,7 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QStatusBar>
+#include <QProgressBar>
 #include <QSplitter>
 #include <QSize>
 #include <QTabWidget>
@@ -585,6 +586,12 @@ public:
         output->setMaximumBlockCount(1000);
         output->setPlaceholderText(QStringLiteral("Clone progress and errors will appear here."));
         layout->addWidget(output, 1);
+        progressBar = new QProgressBar(this);
+        progressBar->setRange(0, 0);
+        progressBar->setTextVisible(true);
+        progressBar->setFormat(QStringLiteral("Cloning…"));
+        progressBar->hide();
+        layout->addWidget(progressBar);
         auto *buttons = new QDialogButtonBox(this);
         cloneButton = buttons->addButton(QStringLiteral("Clone Repository"), QDialogButtonBox::AcceptRole);
         auto *cancelButton = buttons->addButton(QDialogButtonBox::Cancel);
@@ -616,14 +623,18 @@ public:
             output->ensureCursorVisible();
         });
         connect(process, &QProcess::readyReadStandardError, this, [this] {
+            const QString text = QString::fromLocal8Bit(process->readAllStandardError());
+            updateProgress(text);
             output->moveCursor(QTextCursor::End);
-            output->insertPlainText(QString::fromLocal8Bit(process->readAllStandardError()));
+            output->insertPlainText(text);
             output->ensureCursorVisible();
         });
         connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
                 [this](int exitCode, QProcess::ExitStatus exitStatus) {
             if (fetchingRefs) {
                 fetchingRefs = false;
+                progressBar->hide();
+                progressBar->hide();
                 if (exitStatus != QProcess::NormalExit || exitCode != 0)
                     output->appendPlainText(QStringLiteral("\nClone succeeded, but refreshing remote branches failed (exit code %1). You can fetch later from the Git workspace.").arg(exitCode));
                 else
@@ -634,15 +645,19 @@ public:
                 return;
             }
             cloneButton->setEnabled(true);
+            progressBar->hide();
             repositoryUrl->setEnabled(true);
             destinationName->setEnabled(true);
             if (exitStatus == QProcess::NormalExit && exitCode == 0) {
                 clonedPath = QDir(parentDirectory).filePath(destinationName->text().trimmed());
                 output->appendPlainText(QStringLiteral("\nRefreshing remote branches…"));
                 fetchingRefs = true;
+                progressBar->setFormat(QStringLiteral("Refreshing remote branches…"));
+                progressBar->setRange(0, 0);
+                progressBar->show();
                 process->setWorkingDirectory(clonedPath);
                 process->setProgram(QStringLiteral("git"));
-                process->setArguments({QStringLiteral("fetch"), QStringLiteral("--all"), QStringLiteral("--prune")});
+                process->setArguments({QStringLiteral("fetch"), QStringLiteral("--progress"), QStringLiteral("--all"), QStringLiteral("--prune")});
                 process->start();
             } else {
                 output->appendPlainText(QStringLiteral("\nClone failed with exit code %1.").arg(exitCode));
@@ -658,6 +673,7 @@ public:
                 return;
             }
             cloneButton->setEnabled(true);
+            progressBar->hide();
             repositoryUrl->setEnabled(true);
             destinationName->setEnabled(true);
             output->appendPlainText(QStringLiteral("Could not start Git: %1").arg(process->errorString()));
@@ -678,6 +694,21 @@ private:
     bool nameEdited = false;
     bool succeeded = false;
     bool fetchingRefs = false;
+    QProgressBar *progressBar = nullptr;
+
+    void updateProgress(const QString &text)
+    {
+        static const QRegularExpression percentage(QStringLiteral("(\\d{1,3})%"));
+        auto matches = percentage.globalMatch(text);
+        while (matches.hasNext()) {
+            const int value = qBound(0, matches.next().captured(1).toInt(), 100);
+            progressBar->setRange(0, 100);
+            progressBar->setValue(value);
+            progressBar->setFormat(fetchingRefs ? QStringLiteral("Refreshing remote branches… %p%")
+                                                 : QStringLiteral("Cloning… %p%"));
+            progressBar->show();
+        }
+    }
 
     void startClone()
     {
@@ -701,11 +732,14 @@ private:
             return;
         }
         cloneButton->setEnabled(false);
+        progressBar->setRange(0, 0);
+        progressBar->setFormat(QStringLiteral("Cloning…"));
+        progressBar->show();
         repositoryUrl->setEnabled(false);
         destinationName->setEnabled(false);
         output->appendPlainText(QStringLiteral("Cloning into %1…\n").arg(destination));
         process->setProgram(QStringLiteral("git"));
-        process->setArguments({QStringLiteral("clone"), url, destination});
+        process->setArguments({QStringLiteral("clone"), QStringLiteral("--progress"), url, destination});
         process->start();
     }
 };
@@ -1256,6 +1290,12 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
         "padding: 6px; background: palette(base); }"));
     branchStatusLabel = new QLabel(this);
     statusBar()->addPermanentWidget(branchStatusLabel);
+    gitProgressBar = new QProgressBar(this);
+    gitProgressBar->setRange(0, 0);
+    gitProgressBar->setTextVisible(true);
+    gitProgressBar->setMinimumWidth(190);
+    gitProgressBar->hide();
+    statusBar()->addPermanentWidget(gitProgressBar);
     updateStatusBar();
 
     commandProcess = new QProcess(this);
@@ -1267,11 +1307,13 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     });
     connect(commandProcess, &QProcess::readyReadStandardError, this, [this] {
         const QString output = QString::fromLocal8Bit(commandProcess->readAllStandardError());
+        updateGitProgress(output);
         if (actionCommandActive) actionOutput += output;
         else appendOutput(output);
     });
     connect(commandProcess, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
             [this](int code, QProcess::ExitStatus) {
+        setGitBusy(false);
         const bool conflictsExistedBeforeCommand = hadConflictsBeforeCommand;
         const bool pushAfterCommit = commitPushPending;
         const bool pushAfterSync = pushAfterSyncPending;
@@ -1313,10 +1355,11 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
         }
     });
     connect(commandProcess, &QProcess::started, this, [this] {
-        if (!actionCommandActive) commandInput->setEnabled(true);
+        commandInput->setEnabled(false);
     });
     connect(commandProcess, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
         if (error != QProcess::FailedToStart) return;
+        setGitBusy(false);
         const QString message = commandProcess->errorString();
         if (actionCommandActive) {
             actionCommandActive = false;
@@ -2013,6 +2056,14 @@ void GitWorkspaceWindow::runGit(const QStringList &arguments)
     hadConflictsBeforeCommand = hasConflicts;
     actionOutput.clear();
     statusBar()->showMessage(QStringLiteral("Running git %1…").arg(arguments.join(QLatin1Char(' '))));
+    const QString operation = arguments.value(0);
+    const bool showsProgress = operation == QLatin1String("clone") || operation == QLatin1String("fetch")
+        || operation == QLatin1String("pull") || operation == QLatin1String("push")
+        || operation == QLatin1String("submodule");
+    if (showsProgress && (operation == QLatin1String("fetch") || operation == QLatin1String("pull")
+        || operation == QLatin1String("push")) && !arguments.contains(QStringLiteral("--progress")))
+        commandProcess->setArguments(fullArguments + QStringList{QStringLiteral("--progress")});
+    setGitBusy(true, showsProgress);
     commandProcess->start();
 }
 
@@ -2034,9 +2085,46 @@ void GitWorkspaceWindow::runRawCommand()
     commandProcess->setProgram(gitExecutable());
     commandProcess->setArguments(args);
     commandProcess->setWorkingDirectory(repoPath);
+    const QString operation = args.value(0);
+    const bool showsProgress = operation == QLatin1String("clone") || operation == QLatin1String("fetch")
+        || operation == QLatin1String("pull") || operation == QLatin1String("push")
+        || operation == QLatin1String("submodule");
+    if (showsProgress && (operation == QLatin1String("fetch") || operation == QLatin1String("pull")
+        || operation == QLatin1String("push")) && !args.contains(QStringLiteral("--progress")))
+        args.append(QStringLiteral("--progress"));
+    commandProcess->setArguments(args);
+    setGitBusy(true, showsProgress);
     rightTabs->setCurrentIndex(1);
     hadConflictsBeforeCommand = hasConflicts;
     commandProcess->start();
+}
+
+void GitWorkspaceWindow::setGitBusy(bool busy, bool showProgress)
+{
+    if (centralWidget()) centralWidget()->setEnabled(!busy);
+    if (menuBar()) menuBar()->setEnabled(!busy);
+    if (gitProgressBar) {
+        if (busy && showProgress) {
+            gitProgressBar->setRange(0, 0);
+            gitProgressBar->setFormat(QStringLiteral("Git is working…"));
+            gitProgressBar->show();
+        } else {
+            gitProgressBar->hide();
+        }
+    }
+}
+
+void GitWorkspaceWindow::updateGitProgress(const QString &output)
+{
+    if (!gitProgressBar || !gitProgressBar->isVisible()) return;
+    static const QRegularExpression percentage(QStringLiteral("(\\d{1,3})%"));
+    auto matches = percentage.globalMatch(output);
+    while (matches.hasNext()) {
+        const int value = qBound(0, matches.next().captured(1).toInt(), 100);
+        gitProgressBar->setRange(0, 100);
+        gitProgressBar->setValue(value);
+        gitProgressBar->setFormat(QStringLiteral("Git progress: %p%"));
+    }
 }
 
 QString GitWorkspaceWindow::selectedPath() const
