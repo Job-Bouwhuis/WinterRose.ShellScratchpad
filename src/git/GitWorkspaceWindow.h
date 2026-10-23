@@ -49,6 +49,7 @@ private:
     QListWidget *branchesList = nullptr;
     QListWidget *historyList = nullptr;
     QListWidget *remotesList = nullptr;
+    QListWidget *changeGroupsList = nullptr;
     QPlainTextEdit *detailsView = nullptr;
     QStackedWidget *detailsStack = nullptr;
     QTextEdit *originalFileView = nullptr;
@@ -78,10 +79,14 @@ private:
     int stagedPathCount = 0;
     int unstagedPathCount = 0;
     QString actionOutput;
+    QString lastObservedStatus;
+    QString lastObservedDiffFile;
     QString currentDiffCommitHash;
     QStringList conflictedFiles;
 
     void refreshAll();
+    QString readStatusSnapshot() const;
+    void pollRepositoryStatus();
     void refreshStatus();
     void refreshBranches();
     void refreshHistory();
