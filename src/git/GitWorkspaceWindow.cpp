@@ -6,6 +6,7 @@
 #include "syntax/SyntaxHighlighter.h"
 
 #include <QComboBox>
+#include <QAbstractButton>
 #include <QContextMenuEvent>
 #include <QAction>
 #include <QApplication>
@@ -1194,8 +1195,8 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     closeWorkspaceAction->setShortcutContext(Qt::WindowShortcut);
     connect(closeWorkspaceAction, &QAction::triggered, this, &QWidget::close);
 
-    QMenu *gitActionsMenu = menuBar()->addMenu(QStringLiteral("&Git"));
-    const auto addGitAction = [this, gitActionsMenu](const QString &label, const QString &shortcut,
+    gitActionsMenu = menuBar()->addMenu(QStringLiteral("&Git"));
+    const auto addGitAction = [this](const QString &label, const QString &shortcut,
                                                      const std::function<void()> &callback) {
         QAction *action = gitActionsMenu->addAction(label);
         action->setShortcut(QKeySequence::fromString(shortcut, QKeySequence::PortableText));
@@ -2133,8 +2134,28 @@ void GitWorkspaceWindow::runRawCommand()
 
 void GitWorkspaceWindow::setGitBusy(bool busy, bool showProgress)
 {
-    if (centralWidget()) centralWidget()->setEnabled(!busy);
-    if (menuBar()) menuBar()->setEnabled(!busy);
+    if (busy) {
+        busyDisabledWidgets.clear();
+        const auto disableIfEnabled = [this](QWidget *widget) {
+            if (!widget || !widget->isEnabled()) return;
+            busyDisabledWidgets.append(widget);
+            widget->setEnabled(false);
+        };
+        const auto buttons = findChildren<QAbstractButton *>();
+        for (QAbstractButton *button : buttons) disableIfEnabled(button);
+        disableIfEnabled(commandEditor);
+        disableIfEnabled(commandInput);
+        disableIfEnabled(userNameEdit);
+        disableIfEnabled(emailEdit);
+        disableIfEnabled(credentialHelperCombo);
+    } else {
+        for (const QPointer<QWidget> &widget : busyDisabledWidgets) {
+            if (widget) widget->setEnabled(true);
+        }
+        busyDisabledWidgets.clear();
+        updateToolbarState();
+    }
+    if (gitActionsMenu) gitActionsMenu->setEnabled(!busy);
     if (gitProgressBar) {
         if (busy && showProgress) {
             gitProgressBar->setRange(0, 0);

@@ -1,7 +1,9 @@
 #pragma once
 
 #include <QMainWindow>
+#include <QPointer>
 #include <QStringList>
+#include <QVector>
 
 class QComboBox;
 class QAction;
@@ -15,6 +17,7 @@ class QMenu;
 class QPlainTextEdit;
 class QProcess;
 class QProgressBar;
+class QWidget;
 class QTimer;
 class QPoint;
 class QToolButton;
@@ -60,6 +63,8 @@ private:
     QLabel *branchStatusLabel = nullptr;
     QProgressBar *gitProgressBar = nullptr;
     QTimer *lastRepositoryFocusTimer = nullptr;
+    QMenu *gitActionsMenu = nullptr;
+    QVector<QPointer<QWidget>> busyDisabledWidgets;
     QListWidget *branchesList = nullptr;
     QListWidget *historyList = nullptr;
     QListWidget *remotesList = nullptr;
