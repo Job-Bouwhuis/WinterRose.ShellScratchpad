@@ -1083,8 +1083,8 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     commandEditor = new CodeEditor(commandPanel);
     commandEditor->setMaximumBlockCount(2);
     commandEditor->setFixedHeight(72);
-    commandEditor->setPlaceholderText(QStringLiteral("git status --short --branch"));
-    commandEditor->setPlainText(QStringLiteral("git status --short --branch"));
+    commandEditor->setPlaceholderText(QStringLiteral("status --short --branch"));
+    commandEditor->setPlainText(QStringLiteral("status --short --branch"));
     new ShellScratchpad::Syntax::SyntaxHighlighter(commandEditor);
     completionController = new ShellScratchpad::Completion::CompletionController(commandEditor, commandEditor);
     completionController->setWorkingDirectory(repoPath);

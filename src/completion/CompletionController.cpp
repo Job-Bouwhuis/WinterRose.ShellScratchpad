@@ -102,13 +102,58 @@ QHash<QString, QStringList> argumentCatalog()
     };
 }
 
+QHash<QString, QString> gitOptionDescriptionsFromHelp(const QString &command)
+{
+    static QHash<QString, QHash<QString, QString>> cache;
+    if (cache.contains(command)) return cache.value(command);
+
+    QHash<QString, QString> descriptions;
+    QProcess process;
+    process.setProgram(QStringLiteral("git"));
+    process.setArguments({command, QStringLiteral("-h")});
+    process.start();
+    if (process.waitForFinished(1500)) {
+        const QString help = QString::fromLocal8Bit(process.readAllStandardOutput() + process.readAllStandardError());
+        const QStringList lines = help.split(QLatin1Char('\n'));
+        QString activeDescription;
+        for (const QString &line : lines) {
+            const QString trimmed = line.trimmed();
+            if (trimmed.isEmpty()) continue;
+            if (line.startsWith(QLatin1Char(' ')) && !activeDescription.isEmpty() && !trimmed.startsWith(QLatin1Char('-'))) {
+                activeDescription += QLatin1Char(' ') + trimmed;
+                continue;
+            }
+            static const QRegularExpression optionLine(QStringLiteral("^\\s*((?:-[A-Za-z0-9],?\\s*)*(?:--?[^\\s,]+(?:\\s*,\\s*--?[^\\s,]+)*))\\s{2,}(.+)$"));
+            const auto match = optionLine.match(line);
+            if (!match.hasMatch()) {
+                activeDescription.clear();
+                continue;
+            }
+            activeDescription = match.captured(2).trimmed();
+            static const QRegularExpression optionToken(QStringLiteral("--\\[no-\\]([A-Za-z0-9][A-Za-z0-9-]*)|(--[A-Za-z0-9][A-Za-z0-9-]*)(?:[=\\[].*)?|(-[A-Za-z0-9])"));
+            auto tokens = optionToken.globalMatch(match.captured(1));
+            while (tokens.hasNext()) {
+                const auto token = tokens.next();
+                QString option = token.captured(1).isEmpty() ? token.captured(2) : QStringLiteral("--") + token.captured(1);
+                if (option.isEmpty()) option = token.captured(3);
+                if (!option.isEmpty()) descriptions.insert(option, activeDescription);
+            }
+        }
+    }
+    cache.insert(command, descriptions);
+    return descriptions;
+}
+
 QString optionDescription(const QString &command, const QString &option)
 {
     static const QHash<QString, QString> gitCommandDescriptions = {
+        {QStringLiteral("am"), QStringLiteral("Apply a series of patches formatted as email messages.")},
+        {QStringLiteral("archive"), QStringLiteral("Create an archive of files from a commit or tree.")},
         {QStringLiteral("add"), QStringLiteral("Stage file contents for the next commit.")},
         {QStringLiteral("bisect"), QStringLiteral("Find the commit that introduced a bug by binary search.")},
         {QStringLiteral("blame"), QStringLiteral("Show which commit and author last changed each line.")},
         {QStringLiteral("branch"), QStringLiteral("List, create, rename, or delete branches.")},
+        {QStringLiteral("bundle"), QStringLiteral("Pack refs and Git objects into a file for transfer or backup.")},
         {QStringLiteral("checkout"), QStringLiteral("Switch branches or restore paths; prefer switch/restore for clarity.")},
         {QStringLiteral("cherry-pick"), QStringLiteral("Apply changes from existing commits to the current branch.")},
         {QStringLiteral("clean"), QStringLiteral("Remove untracked files; use -n first to preview deletions.")},
@@ -117,9 +162,12 @@ QString optionDescription(const QString &command, const QString &option)
         {QStringLiteral("config"), QStringLiteral("Read or change Git configuration at system, global, or repository scope.")},
         {QStringLiteral("diff"), QStringLiteral("Compare working tree, index, commits, or paths.")},
         {QStringLiteral("fetch"), QStringLiteral("Download remote refs and objects without integrating them.")},
+        {QStringLiteral("format-patch"), QStringLiteral("Prepare commits as patch files suitable for sending by email.")},
+        {QStringLiteral("grep"), QStringLiteral("Search tracked files, commits, or the working tree for matching text.")},
         {QStringLiteral("init"), QStringLiteral("Create an empty Git repository or reinitialize one.")},
         {QStringLiteral("log"), QStringLiteral("Show commit history with filters and formatting options.")},
         {QStringLiteral("merge"), QStringLiteral("Join another branch's history into the current branch.")},
+        {QStringLiteral("mv"), QStringLiteral("Move or rename a file while updating the index.")},
         {QStringLiteral("pull"), QStringLiteral("Fetch and integrate changes from a remote branch.")},
         {QStringLiteral("push"), QStringLiteral("Update refs on a remote; --force can overwrite remote history.")},
         {QStringLiteral("rebase"), QStringLiteral("Replay commits on a new base; interactive mode can rewrite local history.")},
@@ -127,9 +175,13 @@ QString optionDescription(const QString &command, const QString &option)
         {QStringLiteral("reset"), QStringLiteral("Move HEAD and optionally reset the index or working tree; --hard discards changes.")},
         {QStringLiteral("restore"), QStringLiteral("Restore working tree or staged paths from a source.")},
         {QStringLiteral("revert"), QStringLiteral("Create a new commit that reverses an earlier commit.")},
+        {QStringLiteral("rm"), QStringLiteral("Remove files from the working tree and the index.")},
         {QStringLiteral("show"), QStringLiteral("Inspect commits, tags, trees, and blobs.")},
+        {QStringLiteral("sparse-checkout"), QStringLiteral("Limit which tracked paths are populated in the working tree.")},
         {QStringLiteral("stash"), QStringLiteral("Temporarily save and later reapply working tree changes.")},
         {QStringLiteral("status"), QStringLiteral("Show staged, unstaged, and untracked changes.")},
+        {QStringLiteral("submodule"), QStringLiteral("Initialize, inspect, and update repositories nested as submodules.")},
+        {QStringLiteral("switch"), QStringLiteral("Switch branches or create a new branch.")},
         {QStringLiteral("tag"), QStringLiteral("Create, list, verify, or delete tags.")},
         {QStringLiteral("worktree"), QStringLiteral("Manage multiple working trees attached to one repository.")}
     };
@@ -159,6 +211,14 @@ QString optionDescription(const QString &command, const QString &option)
     const QString gitOptionKey = command + QLatin1Char(':') + option;
     if (gitOptionDescriptions.contains(gitOptionKey))
         return gitOptionDescriptions.value(gitOptionKey);
+    if (command != QLatin1String("git")) {
+        const QHash<QString, QString> helpDescriptions = gitOptionDescriptionsFromHelp(command);
+        if (helpDescriptions.contains(option)) return helpDescriptions.value(option);
+    }
+    if (command == QLatin1String("git") && option == QLatin1String("--help"))
+        return QStringLiteral("Show help for a Git command.");
+    if (command == QLatin1String("git") && option == QLatin1String("--version"))
+        return QStringLiteral("Print the installed Git version.");
     static const QHash<QString, QString> descriptions = {
         {QStringLiteral("-a"), QStringLiteral("Include hidden entries.")},
         {QStringLiteral("-l"), QStringLiteral("Use the long listing format.")},
