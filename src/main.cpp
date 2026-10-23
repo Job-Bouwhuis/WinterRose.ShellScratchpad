@@ -2661,6 +2661,8 @@ private:
 
         QMenu *helpMenu = menuBar()->addMenu(QStringLiteral("&Help"));
         QAction *shortcutsAction = helpMenu->addAction(QStringLiteral("Keyboard Shortcuts"));
+        shortcutsAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+H")));
+        shortcutsAction->setShortcutContext(Qt::WindowShortcut);
         connect(shortcutsAction, &QAction::triggered, this, [this]() { showKeyboardShortcuts(); });
         QAction *aboutAction = helpMenu->addAction(QStringLiteral("About Shell Scratchpad"));
         connect(aboutAction, &QAction::triggered, this, [this]() {
@@ -6398,10 +6400,10 @@ int main(int argc, char *argv[])
 
     if (parser.isSet(gitWorkspaceOption)) {
         const bool explicitRepository = !POSITIONAL_ARGUMENTS.isEmpty();
-        QSettings settings;
+
         QString repositoryPath = explicitRepository
             ? QFileInfo(POSITIONAL_ARGUMENTS.first()).absoluteFilePath()
-            : settings.value(QStringLiteral("gitWorkspace/lastRepository")).toString().trimmed();
+            : QSettings().value(QStringLiteral("gitWorkspace/lastRepository")).toString().trimmed();
         if (repositoryPath.isEmpty())
             repositoryPath = initialWorkingDirectory;
         if (repositoryPath == QStringLiteral("~"))

@@ -23,6 +23,8 @@
 #include <QMessageBox>
 #include <QMenu>
 #include <QIcon>
+#include <QKeySequence>
+#include <QMenuBar>
 #include <QDialog>
 #include <QPlainTextEdit>
 #include <QPlainTextDocumentLayout>
@@ -46,6 +48,9 @@
 #include <QTextEdit>
 #include <QStackedWidget>
 #include <QScrollBar>
+
+#include <QTimer>
+#include <QCryptographicHash>
 #include <QSettings>
 #include <memory>
 #include <limits>
@@ -63,6 +68,16 @@ struct DiffLine
     DiffLineKind rightKind = DiffLineKind::Unchanged;
     int leftNumber = 0;
     int rightNumber = 0;
+};
+
+struct DiffGroup
+{
+    int startRow = 0;
+    int endRow = 0;
+    int firstLine = std::numeric_limits<int>::max();
+    int lastLine = 0;
+    int added = 0;
+    int removed = 0;
 };
 
 QStringList fileLines(const QString &text)
@@ -196,6 +211,68 @@ QVector<DiffLine> makeSideBySideDiff(const QString &original, const QString &mod
         }
     }
     return output;
+}
+
+QVector<DiffGroup> makeDiffGroups(const QVector<DiffLine> &rows)
+{
+    QVector<DiffGroup> groups;
+    DiffGroup current;
+    bool active = false;
+    const auto finishGroup = [&] {
+        if (active) groups.append(current);
+        current = DiffGroup{};
+        active = false;
+    };
+    for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
+        const DiffLine &row = rows.at(rowIndex);
+        const bool changed = row.leftKind != DiffLineKind::Unchanged || row.rightKind != DiffLineKind::Unchanged;
+        if (!changed) {
+            finishGroup();
+            continue;
+        }
+        if (!active) {
+            current.startRow = rowIndex;
+            active = true;
+        }
+        current.endRow = rowIndex;
+        if (row.leftKind == DiffLineKind::Removed) ++current.removed;
+        if (row.rightKind == DiffLineKind::Added) ++current.added;
+        for (int line : {row.leftNumber, row.rightNumber}) {
+            if (line <= 0) continue;
+            current.firstLine = qMin(current.firstLine, line);
+            current.lastLine = qMax(current.lastLine, line);
+        }
+    }
+    finishGroup();
+    return groups;
+}
+
+QString diffGroupLabel(int index, const DiffGroup &group)
+{
+    const QString lineRange = group.firstLine == group.lastLine
+        ? QStringLiteral("line %1").arg(group.firstLine)
+        : QStringLiteral("lines %1–%2").arg(group.firstLine).arg(group.lastLine);
+    return QStringLiteral("Change %1 · %2 (+%3/−%4)")
+        .arg(index + 1).arg(lineRange).arg(group.added).arg(group.removed);
+}
+
+void populateChangeGroups(QListWidget *list, const QVector<DiffLine> &rows)
+{
+    list->clear();
+    const QVector<DiffGroup> groups = makeDiffGroups(rows);
+    for (int index = 0; index < groups.size(); ++index) {
+        auto *item = new QListWidgetItem(diffGroupLabel(index, groups.at(index)), list);
+        item->setData(Qt::UserRole, groups.at(index).startRow);
+    }
+    if (!groups.isEmpty())
+        list->setCurrentRow(0);
+}
+
+void sizeFileListToRows(QListWidget *list)
+{
+    const int rowHeight = qMax(22, list->sizeHintForRow(0));
+    const int rowCount = qMax(1, list->count());
+    list->setFixedHeight(qMin(180, rowCount * rowHeight + 8));
 }
 
 void renderDiffLines(QTextEdit *view, const QStringList &lines, const QVector<DiffLineKind> &kinds,
@@ -874,16 +951,20 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     layout->addLayout(toolbar);
 
     auto *mainSplitter = new QSplitter(Qt::Horizontal, root);
+    auto *branchTabs = new QTabWidget(mainSplitter);
+    branchesList = new QListWidget(branchTabs);
+    branchTabs->addTab(branchesList, QStringLiteral("Branches"));
+    branchTabs->setMinimumWidth(165);
+
     auto *leftTabs = new QTabWidget(mainSplitter);
     changesTree = new QTreeWidget(leftTabs);
     changesTree->setHeaderLabels({QStringLiteral("Working tree changes"), QStringLiteral("Status")});
     changesTree->header()->setSectionResizeMode(0, QHeaderView::Stretch);
     changesTree->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
     leftTabs->addTab(changesTree, QStringLiteral("Changes"));
-    branchesList = new QListWidget(leftTabs);
-    leftTabs->addTab(branchesList, QStringLiteral("Branches"));
     historyList = new QListWidget(leftTabs);
     leftTabs->addTab(historyList, QStringLiteral("History"));
+    leftTabs->setMinimumWidth(210);
 
     rightTabs = new QTabWidget(mainSplitter);
     detailsStack = new QStackedWidget(rightTabs);
@@ -901,6 +982,21 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     diffContentLayout->setContentsMargins(0, 0, 0, 0);
     diffSummaryLabel = new QLabel(diffContent);
     diffContentLayout->addWidget(diffSummaryLabel);
+    changeGroupsList = new QListWidget;
+    changeGroupsList->setSelectionMode(QAbstractItemView::SingleSelection);
+    changeGroupsList->setToolTip(QStringLiteral("Select a change group to jump to it in the diff"));
+    connect(changeGroupsList, &QListWidget::currentItemChanged, this, [this](QListWidgetItem *item) {
+        if (!item) return;
+        const int targetRow = item->data(Qt::UserRole).toInt();
+        for (QTextEdit *view : {originalFileView, workingFileView}) {
+            QTextCursor cursor(view->document());
+            cursor.movePosition(QTextCursor::Start);
+            for (int row = 0; row < targetRow; ++row)
+                cursor.movePosition(QTextCursor::NextBlock);
+            view->setTextCursor(cursor);
+            view->ensureCursorVisible();
+        }
+    });
     auto *diffLabels = new QHBoxLayout;
     originalDiffLabel = new QLabel(QStringLiteral("Original"), diffContent);
     changedDiffLabel = new QLabel(QStringLiteral("Changed"), diffContent);
@@ -919,8 +1015,14 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     diffColumns->addWidget(workingFileView);
     synchronizeDiffViews(originalFileView, workingFileView);
     diffContentLayout->addWidget(diffColumns, 1);
+    auto *diffNavigation = new QWidget(diffPanel);
+    auto *diffNavigationLayout = new QVBoxLayout(diffNavigation);
+    diffNavigationLayout->setContentsMargins(0, 0, 0, 0);
+    diffNavigationLayout->setSpacing(4);
+    diffNavigationLayout->addWidget(diffFilesList);
+    diffNavigationLayout->addWidget(changeGroupsList, 1);
     auto *diffOuterSplitter = new QSplitter(Qt::Horizontal, diffPanel);
-    diffOuterSplitter->addWidget(diffFilesList);
+    diffOuterSplitter->addWidget(diffNavigation);
     diffOuterSplitter->addWidget(diffContent);
     diffOuterSplitter->setStretchFactor(0, 0);
     diffOuterSplitter->setStretchFactor(1, 1);
@@ -1046,10 +1148,113 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     credentialsForm->addRow(new QLabel(QStringLiteral("Credentials are passed to Git’s configured credential helper. The app does not save passwords in its own settings."), credentialsPanel));
     rightTabs->addTab(credentialsPanel, QStringLiteral("Identity & Credentials"));
 
+    QMenu *gitActionsMenu = menuBar()->addMenu(QStringLiteral("&Git"));
+    const auto addGitAction = [this, gitActionsMenu](const QString &label, const QString &shortcut,
+                                                     const std::function<void()> &callback) {
+        QAction *action = gitActionsMenu->addAction(label);
+        action->setShortcut(QKeySequence::fromString(shortcut, QKeySequence::PortableText));
+        action->setShortcutContext(Qt::WindowShortcut);
+        connect(action, &QAction::triggered, this, callback);
+        return action;
+    };
+    stageAllShortcutAction = addGitAction(QStringLiteral("Stage All Changes"), QStringLiteral("Ctrl+Alt+A"), [this] {
+        runGit({QStringLiteral("add"), QStringLiteral("-A")});
+    });
+    commitShortcutAction = addGitAction(QStringLiteral("Commit Staged Changes…"), QStringLiteral("Ctrl+Alt+C"), [this] {
+        bool ok = false;
+        const QString message = QInputDialog::getText(this, QStringLiteral("Commit"),
+            QStringLiteral("Commit message:"), QLineEdit::Normal, QString(), &ok).trimmed();
+        if (ok && !message.isEmpty()) runGit({QStringLiteral("commit"), QStringLiteral("-m"), message});
+    });
+    gitActionsMenu->addSeparator();
+    pushShortcutAction = addGitAction(QStringLiteral("Push"), QStringLiteral("Ctrl+Alt+P"), [this] { pushCurrentBranch(); });
+    pullShortcutAction = addGitAction(QStringLiteral("Pull"), QStringLiteral("Ctrl+Alt+L"), [this] { pullCurrentBranch(); });
+    fetchShortcutAction = addGitAction(QStringLiteral("Fetch All Remotes"), QStringLiteral("Ctrl+Alt+F"), [this] {
+        runGit({QStringLiteral("fetch"), QStringLiteral("--all"), QStringLiteral("--prune")});
+    });
+    gitActionsMenu->addSeparator();
+    stashShortcutAction = addGitAction(QStringLiteral("Stash Changes"), QStringLiteral("Ctrl+G, Ctrl+S"), [this] {
+        runGit({QStringLiteral("stash"), QStringLiteral("push")});
+    });
+    addGitAction(QStringLiteral("Apply Latest Stash"), QStringLiteral("Ctrl+G, Ctrl+U"), [this] {
+        runGit({QStringLiteral("stash"), QStringLiteral("pop")});
+    });
+    addGitAction(QStringLiteral("Refresh Status"), QStringLiteral("Ctrl+Alt+R"), [this] { refreshAll(); });
+    resolveShortcutAction = addGitAction(QStringLiteral("Resolve Conflicts"), QStringLiteral("Ctrl+G, Ctrl+X"), [this] {
+        if (conflictsButton->isEnabled()) conflictsButton->click();
+    });
+
+    QMenu *navigateMenu = menuBar()->addMenu(QStringLiteral("&Navigate"));
+    const auto addNavigationAction = [this, navigateMenu](const QString &label, const QString &shortcut,
+                                                           const std::function<void()> &callback) {
+        QAction *action = navigateMenu->addAction(label);
+        action->setShortcut(QKeySequence::fromString(shortcut, QKeySequence::PortableText));
+        action->setShortcutContext(Qt::WindowShortcut);
+        connect(action, &QAction::triggered, this, callback);
+    };
+    addNavigationAction(QStringLiteral("Changes"), QStringLiteral("Ctrl+G, Ctrl+C"), [this, leftTabs] {
+        leftTabs->setCurrentIndex(0);
+        changesTree->setFocus();
+    });
+    addNavigationAction(QStringLiteral("Branches"), QStringLiteral("Ctrl+G, Ctrl+B"), [this, branchTabs] {
+        branchTabs->setCurrentIndex(0);
+        branchesList->setFocus();
+    });
+    addNavigationAction(QStringLiteral("History"), QStringLiteral("Ctrl+G, Ctrl+H"), [this, leftTabs] {
+        leftTabs->setCurrentIndex(1);
+        historyList->setFocus();
+    });
+    addNavigationAction(QStringLiteral("Details / Diff"), QStringLiteral("Ctrl+G, Ctrl+D"), [this] {
+        rightTabs->setCurrentWidget(detailsStack);
+        detailsStack->setFocus();
+    });
+    addNavigationAction(QStringLiteral("Git Command"), QStringLiteral("Ctrl+G, Ctrl+T"), [this] {
+        rightTabs->setCurrentIndex(1);
+        commandEditor->setFocus();
+    });
+    addNavigationAction(QStringLiteral("Remotes"), QStringLiteral("Ctrl+G, Ctrl+R"), [this] {
+        rightTabs->setCurrentIndex(2);
+        remotesList->setFocus();
+    });
+    addNavigationAction(QStringLiteral("Identity & Credentials"), QStringLiteral("Ctrl+G, Ctrl+I"), [this] {
+        rightTabs->setCurrentIndex(3);
+        userNameEdit->setFocus();
+    });
+
+    QMenu *helpMenu = menuBar()->addMenu(QStringLiteral("&Help"));
+    QAction *shortcutsAction = helpMenu->addAction(QStringLiteral("Keyboard Shortcuts"));
+    shortcutsAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+H")));
+    shortcutsAction->setShortcutContext(Qt::WindowShortcut);
+    connect(shortcutsAction, &QAction::triggered, this, [this] {
+        QMessageBox::information(this, QStringLiteral("Git Workspace Shortcuts"),
+            QStringLiteral("<b>Git actions</b><br>"
+                           "Ctrl+Alt+A — Stage all changes<br>"
+                           "Ctrl+Alt+C — Commit staged changes<br>"
+                           "Ctrl+Alt+P — Push<br>"
+                           "Ctrl+Alt+L — Pull<br>"
+                           "Ctrl+Alt+F — Fetch all remotes<br>"
+                           "Ctrl+Alt+R — Refresh status<br>"
+                           "Ctrl+Enter — Run Git command<br>"
+                           "Ctrl+G, Ctrl+S — Stash changes<br>"
+                           "Ctrl+G, Ctrl+U — Apply latest stash<br>"
+                           "Ctrl+G, Ctrl+X — Resolve conflicts<br><br>"
+                           "<b>Navigate</b><br>"
+                           "Ctrl+G, Ctrl+C — Changes<br>"
+                           "Ctrl+G, Ctrl+B — Branches<br>"
+                           "Ctrl+G, Ctrl+H — History<br>"
+                           "Ctrl+G, Ctrl+D — Details / Diff<br>"
+                           "Ctrl+G, Ctrl+T — Git Command<br>"
+                           "Ctrl+G, Ctrl+R — Remotes<br>"
+                           "Ctrl+G, Ctrl+I — Identity &amp; Credentials"));
+    });
+
+    mainSplitter->addWidget(branchTabs);
     mainSplitter->addWidget(leftTabs);
     mainSplitter->addWidget(rightTabs);
-    mainSplitter->setStretchFactor(0, 1);
-    mainSplitter->setStretchFactor(1, 2);
+    mainSplitter->setStretchFactor(0, 0);
+    mainSplitter->setStretchFactor(1, 0);
+    mainSplitter->setStretchFactor(2, 2);
+    mainSplitter->setSizes({175, 245, 680});
     layout->addWidget(mainSplitter, 1);
     setCentralWidget(root);
     setStyleSheet(QStringLiteral(
@@ -1193,6 +1398,11 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
         menu.exec(changesTree->viewport()->mapToGlobal(position));
     });
     refreshAll();
+    lastObservedStatus = readStatusSnapshot();
+    auto *statusWatchTimer = new QTimer(this);
+    statusWatchTimer->setInterval(1000);
+    connect(statusWatchTimer, &QTimer::timeout, this, [this] { pollRepositoryStatus(); });
+    statusWatchTimer->start();
 }
 
 QString GitWorkspaceWindow::gitOutput(const QStringList &arguments, int *exitCode) const
@@ -1215,6 +1425,9 @@ QString GitWorkspaceWindow::gitOutput(const QStringList &arguments, int *exitCod
 
 void GitWorkspaceWindow::refreshAll()
 {
+    const QString selectedDiffPath = selectedPath();
+    const bool showingWorkingDiff = !selectedDiffPath.isEmpty() && currentDiffCommitHash.isEmpty()
+        && detailsStack->currentWidget() == detailsStack->widget(1);
     refreshStatus();
     refreshBranches();
     refreshRemotes();
@@ -1223,6 +1436,64 @@ void GitWorkspaceWindow::refreshAll()
     hasStashes = !gitOutput({QStringLiteral("stash"), QStringLiteral("list")}).isEmpty();
     updateToolbarState();
     updateStatusBar();
+    lastObservedStatus = readStatusSnapshot();
+    if (showingWorkingDiff) {
+        QTreeWidgetItem *matchingItem = nullptr;
+        for (int index = 0; index < changesTree->topLevelItemCount(); ++index) {
+            QTreeWidgetItem *item = changesTree->topLevelItem(index);
+            if (item->data(0, Qt::UserRole).toString() == selectedDiffPath) {
+                matchingItem = item;
+                break;
+            }
+        }
+        if (matchingItem) {
+            changesTree->setCurrentItem(matchingItem);
+            showDiff(selectedDiffPath);
+        } else {
+            detailsView->setPlainText(QStringLiteral("This file is no longer listed as changed."));
+            detailsStack->setCurrentWidget(detailsView);
+            lastObservedDiffFile.clear();
+        }
+    }
+}
+
+QString GitWorkspaceWindow::readStatusSnapshot() const
+{
+    QProcess process;
+    process.setProgram(gitExecutable());
+    process.setArguments({QStringLiteral("status"), QStringLiteral("--porcelain=v2"),
+                          QStringLiteral("--branch"), QStringLiteral("-z")});
+    process.setWorkingDirectory(repoPath);
+    process.start();
+    if (!process.waitForFinished(2000) || process.exitCode() != 0) {
+        process.kill();
+        process.waitForFinished();
+        return {};
+    }
+    return QString::fromLocal8Bit(process.readAllStandardOutput());
+}
+
+void GitWorkspaceWindow::pollRepositoryStatus()
+{
+    if (commandProcess->state() != QProcess::NotRunning)
+        return;
+    const QString snapshot = readStatusSnapshot();
+    if (snapshot.isNull())
+        return;
+    if (snapshot != lastObservedStatus) {
+        refreshAll();
+        return;
+    }
+    const QString path = selectedPath();
+    if (path.isEmpty() || !currentDiffCommitHash.isEmpty() || detailsStack->currentWidget() != detailsStack->widget(1))
+        return;
+    QFile file(QDir(repoPath).filePath(path));
+    QByteArray fileSnapshot;
+    if (file.open(QIODevice::ReadOnly))
+        fileSnapshot = QCryptographicHash::hash(file.readAll(), QCryptographicHash::Sha256).toHex();
+    const QString currentSnapshot = QString::fromLatin1(fileSnapshot);
+    if (currentSnapshot != lastObservedDiffFile)
+        showDiff(path);
 }
 
 void GitWorkspaceWindow::refreshStatus()
@@ -1609,10 +1880,16 @@ void GitWorkspaceWindow::showDiff(const QString &path)
 {
     if (path.isEmpty()) return;
     currentDiffCommitHash.clear();
+    QFile snapshotFile(QDir(repoPath).filePath(path));
+    lastObservedDiffFile = snapshotFile.open(QIODevice::ReadOnly)
+        ? QString::fromLatin1(QCryptographicHash::hash(snapshotFile.readAll(), QCryptographicHash::Sha256).toHex())
+        : QString();
     diffFilesList->clear();
+    changeGroupsList->clear();
     auto *fileItem = new QListWidgetItem(path, diffFilesList);
     fileItem->setData(Qt::UserRole, path);
-    diffSummaryLabel->setText(QStringLiteral("Working tree changes compared with HEAD"));
+    sizeFileListToRows(diffFilesList);
+    diffSummaryLabel->setText(path);
     originalDiffLabel->setText(QStringLiteral("Latest in repository (HEAD)"));
     changedDiffLabel->setText(QStringLiteral("Working file"));
     QByteArray originalBytes;
@@ -1641,6 +1918,7 @@ void GitWorkspaceWindow::showDiff(const QString &path)
     }
     renderDiffSide(originalFileView, rows, true);
     renderDiffSide(workingFileView, rows, false);
+    populateChangeGroups(changeGroupsList, rows);
     detailsStack->setCurrentWidget(detailsStack->widget(1));
 }
 
@@ -1649,6 +1927,7 @@ void GitWorkspaceWindow::showCommit(const QString &hash)
     if (hash.isEmpty()) return;
     currentDiffCommitHash = hash;
     diffFilesList->clear();
+    changeGroupsList->clear();
     int parentCode = -1;
     const QString parent = gitOutput({QStringLiteral("rev-parse"), QStringLiteral("--verify"), hash + QLatin1Char('^')}, &parentCode);
     QStringList arguments{QStringLiteral("diff-tree"), QStringLiteral("--no-commit-id"),
@@ -1684,6 +1963,7 @@ void GitWorkspaceWindow::showCommit(const QString &hash)
         item->setData(Qt::UserRole + 1, oldPath);
         item->setToolTip(path == oldPath ? path : QStringLiteral("%1 → %2").arg(oldPath, path));
     }
+    sizeFileListToRows(diffFilesList);
     if (diffFilesList->count() == 0) {
         currentDiffCommitHash.clear();
         detailsView->setPlainText(gitOutput({QStringLiteral("show"), QStringLiteral("--no-patch"),
@@ -1726,6 +2006,7 @@ void GitWorkspaceWindow::showCommitFile(const QString &path, const QString &oldP
     const QVector<DiffLine> rows = makeSideBySideDiff(QString::fromUtf8(originalBytes), QString::fromUtf8(modifiedBytes));
     renderDiffSide(originalFileView, rows, true);
     renderDiffSide(workingFileView, rows, false);
+    populateChangeGroups(changeGroupsList, rows);
     detailsStack->setCurrentWidget(detailsStack->widget(1));
 }
 
@@ -1835,6 +2116,13 @@ void GitWorkspaceWindow::sendCommandInput()
 
 void GitWorkspaceWindow::updateToolbarState()
 {
+    if (stageAllShortcutAction) stageAllShortcutAction->setEnabled(hasUnstagedChanges);
+    if (commitShortcutAction) commitShortcutAction->setEnabled(hasStagedChanges);
+    if (pushShortcutAction) pushShortcutAction->setEnabled(hasRemote && hasUnpushedCommits);
+    if (pullShortcutAction) pullShortcutAction->setEnabled(hasRemote);
+    if (fetchShortcutAction) fetchShortcutAction->setEnabled(hasRemote);
+    if (stashShortcutAction) stashShortcutAction->setEnabled(hasStagedChanges || hasUnstagedChanges);
+    if (resolveShortcutAction) resolveShortcutAction->setEnabled(hasConflicts);
     if (commitButton) {
         commitButton->setVisible(hasStagedChanges);
         commitButton->setEnabled(hasStagedChanges);
