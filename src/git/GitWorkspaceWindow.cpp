@@ -1278,6 +1278,7 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     });
     connect(commandProcess, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
             [this](int code, QProcess::ExitStatus) {
+        const bool conflictsExistedBeforeCommand = hadConflictsBeforeCommand;
         if (actionCommandActive) {
             QString summary = actionOutput;
             static const QRegularExpression ANSI_SEQUENCE(QStringLiteral("\\x1B\\[[0-?]*[ -/]*[@-~]"));
@@ -1296,6 +1297,12 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
         }
         commandInput->setEnabled(false);
         refreshAll();
+        hadConflictsBeforeCommand = hasConflicts;
+        if (!conflictsExistedBeforeCommand && hasConflicts) {
+            statusBar()->showMessage(QStringLiteral("Merge conflicts need your attention (%1 file(s))")
+                                         .arg(conflictedFiles.size()), 10000);
+            showMergeConflictsDialog();
+        }
     });
     connect(commandProcess, &QProcess::started, this, [this] {
         if (!actionCommandActive) commandInput->setEnabled(true);
@@ -1829,6 +1836,75 @@ void GitWorkspaceWindow::resolveConflictFile(const QString &path)
     runGit({QStringLiteral("add"), QStringLiteral("--"), path});
 }
 
+void GitWorkspaceWindow::showMergeConflictsDialog()
+{
+    if (conflictedFiles.isEmpty()) return;
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("Merge Conflicts Need Attention"));
+    dialog.resize(560, 430);
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *heading = new QLabel(&dialog);
+    heading->setTextFormat(Qt::RichText);
+    heading->setText(QStringLiteral("<span style='color:#b42318;font-size:16pt;font-weight:bold'>Git found merge conflicts.</span><br>"
+                                   "Git could not complete the merge automatically. Resolve every listed file, then commit to finish the merge."));
+    heading->setWordWrap(true);
+    layout->addWidget(heading);
+    auto *fileList = new QListWidget(&dialog);
+    fileList->setMinimumHeight(220);
+    layout->addWidget(fileList, 1);
+    auto *progress = new QLabel(&dialog);
+    progress->setWordWrap(true);
+    layout->addWidget(progress);
+
+    auto *buttonRow = new QHBoxLayout;
+    auto *resolveSelected = new QPushButton(QStringLiteral("Resolve Selected…"), &dialog);
+    auto *resolveNext = new QPushButton(QStringLiteral("Resolve Next Conflict…"), &dialog);
+    auto *close = new QPushButton(QStringLiteral("Close"), &dialog);
+    buttonRow->addWidget(resolveSelected);
+    buttonRow->addWidget(resolveNext);
+    buttonRow->addStretch(1);
+    buttonRow->addWidget(close);
+    layout->addLayout(buttonRow);
+
+    const auto updateConflictList = [this, fileList, progress, resolveSelected, resolveNext] {
+        const QString selectedPath = fileList->currentItem()
+            ? fileList->currentItem()->data(Qt::UserRole).toString() : QString();
+        fileList->clear();
+        for (const QString &path : conflictedFiles) {
+            auto *item = new QListWidgetItem(path, fileList);
+            item->setData(Qt::UserRole, path);
+            if (path == selectedPath) fileList->setCurrentItem(item);
+        }
+        if (fileList->count() > 0 && !fileList->currentItem())
+            fileList->setCurrentRow(0);
+        const bool remaining = !conflictedFiles.isEmpty();
+        progress->setText(remaining
+            ? QStringLiteral("%1 file(s) still have unresolved conflict markers. Resolve them one at a time.").arg(conflictedFiles.size())
+            : QStringLiteral("All file conflicts are resolved and staged. Commit the merge to complete it."));
+        const bool canResolve = remaining && commandProcess->state() == QProcess::NotRunning;
+        resolveSelected->setEnabled(canResolve);
+        resolveNext->setEnabled(canResolve);
+    };
+    updateConflictList();
+
+    const auto openResolver = [this, fileList, resolveSelected, resolveNext](bool firstUnresolved) {
+        QListWidgetItem *item = firstUnresolved ? fileList->item(0) : fileList->currentItem();
+        if (!item && fileList->count() > 0) item = fileList->item(0);
+        if (!item) return;
+        resolveConflictFile(item->data(Qt::UserRole).toString());
+        if (commandProcess->state() != QProcess::NotRunning) {
+            resolveSelected->setEnabled(false);
+            resolveNext->setEnabled(false);
+        }
+    };
+    connect(resolveSelected, &QPushButton::clicked, &dialog, [openResolver] { openResolver(false); });
+    connect(resolveNext, &QPushButton::clicked, &dialog, [openResolver] { openResolver(true); });
+    connect(close, &QPushButton::clicked, &dialog, &QDialog::accept);
+    connect(commandProcess, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), &dialog,
+            [updateConflictList](int, QProcess::ExitStatus) { updateConflictList(); });
+    dialog.exec();
+}
+
 void GitWorkspaceWindow::refreshIdentity()
 {
     userNameEdit->setText(gitOutput({QStringLiteral("config"), QStringLiteral("--get"), QStringLiteral("user.name")}));
@@ -1847,6 +1923,7 @@ void GitWorkspaceWindow::runGit(const QStringList &arguments)
     commandProcess->setProgram(gitExecutable());
     commandProcess->setWorkingDirectory(repoPath);
     actionCommandActive = true;
+    hadConflictsBeforeCommand = hasConflicts;
     actionOutput.clear();
     statusBar()->showMessage(QStringLiteral("Running git %1…").arg(arguments.join(QLatin1Char(' '))));
     commandProcess->start();
@@ -1867,6 +1944,7 @@ void GitWorkspaceWindow::runRawCommand()
     commandProcess->setArguments(args);
     commandProcess->setWorkingDirectory(repoPath);
     rightTabs->setCurrentIndex(1);
+    hadConflictsBeforeCommand = hasConflicts;
     commandProcess->start();
 }
 

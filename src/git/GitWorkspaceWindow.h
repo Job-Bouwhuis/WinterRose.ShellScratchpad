@@ -84,6 +84,7 @@ private:
     bool hasUpstream = false;
     bool hasUnpushedCommits = false;
     bool hasConflicts = false;
+    bool hadConflictsBeforeCommand = false;
     int stagedPathCount = 0;
     int unstagedPathCount = 0;
     QString actionOutput;
@@ -104,6 +105,7 @@ private:
     void showBranchContextMenu(const QString &branch, bool remote, const QPoint &globalPosition);
     void showHistoryContextMenu(QListWidgetItem *item, const QPoint &globalPosition);
     void resolveConflictFile(const QString &path);
+    void showMergeConflictsDialog();
     void addRemote();
     void changeRemoteUrl(const QString &name);
     void removeRemote(const QString &name);
