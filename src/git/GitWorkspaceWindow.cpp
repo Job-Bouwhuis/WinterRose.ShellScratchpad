@@ -813,13 +813,6 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
             if (ok && !name.isEmpty()) runGit({QStringLiteral("switch"), QStringLiteral("-c"), name});
         });
     });
-    commitPushButton = new QToolButton(root);
-    commitPushButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-    commitPushButton->setIcon(gitIcon(QStringLiteral("commit")));
-    commitPushButton->setText(QStringLiteral("Commit & Push…"));
-    commitPushButton->setToolTip(QStringLiteral("Commit staged changes, then push the current branch"));
-    commitPushButton->setVisible(false);
-    connect(commitPushButton, &QToolButton::clicked, this, [this] { showCommitDialog(); });
     commitButton = new QToolButton(root);
     commitButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
     commitButton->setIcon(gitIcon(QStringLiteral("commit")));
@@ -942,7 +935,6 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
         else refreshAll();
     });
     toolbar->addWidget(branchButton);
-    toolbar->addWidget(commitPushButton);
     toolbar->addWidget(commitButton);
     toolbar->addWidget(stageAllButton);
     toolbar->addWidget(syncButton);
@@ -1939,7 +1931,7 @@ void GitWorkspaceWindow::showCommitDialog()
     messageEdit->setPlaceholderText(QStringLiteral("Summary line\n\nOptional commit description"));
     layout->addWidget(messageEdit, 1);
     auto *buttonRow = new QHBoxLayout;
-    auto *commitPush = new QPushButton(QStringLiteral("Commit & Push"), &dialog);
+    auto *commitPush = new QPushButton(QStringLiteral("Commit and Push"), &dialog);
     auto *commitOnly = new QPushButton(QStringLiteral("Commit"), &dialog);
     auto *cancel = new QPushButton(QStringLiteral("Cancel"), &dialog);
     buttonRow->addStretch(1);
@@ -2303,10 +2295,6 @@ void GitWorkspaceWindow::updateToolbarState()
     if (commitButton) {
         commitButton->setVisible(hasStagedChanges);
         commitButton->setEnabled(hasStagedChanges);
-    }
-    if (commitPushButton) {
-        commitPushButton->setVisible(hasStagedChanges);
-        commitPushButton->setEnabled(hasStagedChanges);
     }
     if (stageAllButton) {
         stageAllButton->setVisible(hasUnstagedChanges);

@@ -40,7 +40,6 @@ private:
     QTabWidget *rightTabs = nullptr;
     QToolButton *branchButton = nullptr;
     QToolButton *commitButton = nullptr;
-    QToolButton *commitPushButton = nullptr;
     QToolButton *stageAllButton = nullptr;
     QToolButton *syncButton = nullptr;
     QToolButton *pullButton = nullptr;
