@@ -53,6 +53,9 @@
 #include <QTimer>
 #include <QCryptographicHash>
 #include <QSettings>
+#include <QCloseEvent>
+#include <QEvent>
+#include <QTimer>
 #include <memory>
 #include <limits>
 
@@ -783,7 +786,13 @@ bool GitWorkspaceWindow::showCloneDialog(const QString &directory, QWidget *pare
 GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *parent)
     : QMainWindow(parent), repoPath(QDir(repositoryPath).absolutePath())
 {
-    QSettings().setValue(QStringLiteral("gitWorkspace/lastRepository"), repoPath);
+    lastRepositoryFocusTimer = new QTimer(this);
+    lastRepositoryFocusTimer->setSingleShot(true);
+    lastRepositoryFocusTimer->setInterval(5000);
+    connect(lastRepositoryFocusTimer, &QTimer::timeout, this, [this] {
+        if (isActiveWindow())
+            QSettings().setValue(QStringLiteral("gitWorkspace/lastRepository"), repoPath);
+    });
     setAttribute(Qt::WA_DeleteOnClose);
     setWindowTitle(QStringLiteral("Git Workspace — %1").arg(QDir(repoPath).dirName()));
     resize(1100, 760);
@@ -1179,6 +1188,12 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     credentialsForm->addRow(new QLabel(QStringLiteral("Credentials are passed to Git’s configured credential helper. The app does not save passwords in its own settings."), credentialsPanel));
     rightTabs->addTab(credentialsPanel, QStringLiteral("Identity & Credentials"));
 
+    QMenu *fileMenu = menuBar()->addMenu(QStringLiteral("&File"));
+    QAction *closeWorkspaceAction = fileMenu->addAction(QStringLiteral("Close Git Workspace"));
+    closeWorkspaceAction->setShortcut(QKeySequence::Close);
+    closeWorkspaceAction->setShortcutContext(Qt::WindowShortcut);
+    connect(closeWorkspaceAction, &QAction::triggered, this, &QWidget::close);
+
     QMenu *gitActionsMenu = menuBar()->addMenu(QStringLiteral("&Git"));
     const auto addGitAction = [this, gitActionsMenu](const QString &label, const QString &shortcut,
                                                      const std::function<void()> &callback) {
@@ -1262,6 +1277,7 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
                            "Ctrl+Alt+L — Pull<br>"
                            "Ctrl+Alt+F — Fetch all remotes<br>"
                            "Ctrl+Alt+R — Refresh status<br>"
+                           "Ctrl+W — Close Git Workspace<br>"
                            "Ctrl+Enter — Run Git command<br>"
                            "Ctrl+G, Ctrl+S — Stash changes<br>"
                            "Ctrl+G, Ctrl+U — Apply latest stash<br>"
@@ -1461,6 +1477,22 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     statusWatchTimer->setInterval(1000);
     connect(statusWatchTimer, &QTimer::timeout, this, [this] { pollRepositoryStatus(); });
     statusWatchTimer->start();
+}
+
+bool GitWorkspaceWindow::event(QEvent *event)
+{
+    if (event->type() == QEvent::WindowActivate) {
+        lastRepositoryFocusTimer->start();
+    } else if (event->type() == QEvent::WindowDeactivate) {
+        lastRepositoryFocusTimer->stop();
+    }
+    return QMainWindow::event(event);
+}
+
+void GitWorkspaceWindow::closeEvent(QCloseEvent *event)
+{
+    lastRepositoryFocusTimer->stop();
+    QMainWindow::closeEvent(event);
 }
 
 QString GitWorkspaceWindow::gitOutput(const QStringList &arguments, int *exitCode) const

@@ -5,6 +5,8 @@
 
 class QComboBox;
 class QAction;
+class QCloseEvent;
+class QEvent;
 class QLineEdit;
 class QLabel;
 class QListWidget;
@@ -13,6 +15,7 @@ class QMenu;
 class QPlainTextEdit;
 class QProcess;
 class QProgressBar;
+class QTimer;
 class QPoint;
 class QToolButton;
 class QTreeWidget;
@@ -56,6 +59,7 @@ private:
     QAction *resolveShortcutAction = nullptr;
     QLabel *branchStatusLabel = nullptr;
     QProgressBar *gitProgressBar = nullptr;
+    QTimer *lastRepositoryFocusTimer = nullptr;
     QListWidget *branchesList = nullptr;
     QListWidget *historyList = nullptr;
     QListWidget *remotesList = nullptr;
@@ -133,5 +137,7 @@ private:
     void updateStatusBar();
     void setGitBusy(bool busy, bool showProgress = false);
     void updateGitProgress(const QString &output);
+    bool event(QEvent *event) override;
+    void closeEvent(QCloseEvent *event) override;
 };
 }
