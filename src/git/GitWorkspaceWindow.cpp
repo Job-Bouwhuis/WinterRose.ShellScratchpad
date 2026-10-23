@@ -23,6 +23,8 @@
 #include <QMessageBox>
 #include <QMenu>
 #include <QIcon>
+#include <QKeySequence>
+#include <QMenuBar>
 #include <QDialog>
 #include <QPlainTextEdit>
 #include <QPlainTextDocumentLayout>
@@ -1141,6 +1143,106 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     credentialsForm->addRow(new QLabel(QStringLiteral("Credentials are passed to Git’s configured credential helper. The app does not save passwords in its own settings."), credentialsPanel));
     rightTabs->addTab(credentialsPanel, QStringLiteral("Identity & Credentials"));
 
+    QMenu *gitActionsMenu = menuBar()->addMenu(QStringLiteral("&Git"));
+    const auto addGitAction = [this, gitActionsMenu](const QString &label, const QString &shortcut,
+                                                     const std::function<void()> &callback) {
+        QAction *action = gitActionsMenu->addAction(label);
+        action->setShortcut(QKeySequence::fromString(shortcut, QKeySequence::PortableText));
+        action->setShortcutContext(Qt::WindowShortcut);
+        connect(action, &QAction::triggered, this, callback);
+        return action;
+    };
+    stageAllShortcutAction = addGitAction(QStringLiteral("Stage All Changes"), QStringLiteral("Ctrl+Alt+A"), [this] {
+        runGit({QStringLiteral("add"), QStringLiteral("-A")});
+    });
+    commitShortcutAction = addGitAction(QStringLiteral("Commit Staged Changes…"), QStringLiteral("Ctrl+Alt+C"), [this] {
+        bool ok = false;
+        const QString message = QInputDialog::getText(this, QStringLiteral("Commit"),
+            QStringLiteral("Commit message:"), QLineEdit::Normal, QString(), &ok).trimmed();
+        if (ok && !message.isEmpty()) runGit({QStringLiteral("commit"), QStringLiteral("-m"), message});
+    });
+    gitActionsMenu->addSeparator();
+    pushShortcutAction = addGitAction(QStringLiteral("Push"), QStringLiteral("Ctrl+Alt+P"), [this] { pushCurrentBranch(); });
+    pullShortcutAction = addGitAction(QStringLiteral("Pull"), QStringLiteral("Ctrl+Alt+L"), [this] { pullCurrentBranch(); });
+    fetchShortcutAction = addGitAction(QStringLiteral("Fetch All Remotes"), QStringLiteral("Ctrl+Alt+F"), [this] {
+        runGit({QStringLiteral("fetch"), QStringLiteral("--all"), QStringLiteral("--prune")});
+    });
+    gitActionsMenu->addSeparator();
+    stashShortcutAction = addGitAction(QStringLiteral("Stash Changes"), QStringLiteral("Ctrl+G, Ctrl+S"), [this] {
+        runGit({QStringLiteral("stash"), QStringLiteral("push")});
+    });
+    addGitAction(QStringLiteral("Apply Latest Stash"), QStringLiteral("Ctrl+G, Ctrl+U"), [this] {
+        runGit({QStringLiteral("stash"), QStringLiteral("pop")});
+    });
+    addGitAction(QStringLiteral("Refresh Status"), QStringLiteral("Ctrl+Alt+R"), [this] { refreshAll(); });
+    resolveShortcutAction = addGitAction(QStringLiteral("Resolve Conflicts"), QStringLiteral("Ctrl+G, Ctrl+X"), [this] {
+        if (conflictsButton->isEnabled()) conflictsButton->click();
+    });
+
+    QMenu *navigateMenu = menuBar()->addMenu(QStringLiteral("&Navigate"));
+    const auto addNavigationAction = [this, navigateMenu](const QString &label, const QString &shortcut,
+                                                           const std::function<void()> &callback) {
+        QAction *action = navigateMenu->addAction(label);
+        action->setShortcut(QKeySequence::fromString(shortcut, QKeySequence::PortableText));
+        action->setShortcutContext(Qt::WindowShortcut);
+        connect(action, &QAction::triggered, this, callback);
+    };
+    addNavigationAction(QStringLiteral("Changes"), QStringLiteral("Ctrl+G, Ctrl+C"), [this, leftTabs] {
+        leftTabs->setCurrentIndex(0);
+        changesTree->setFocus();
+    });
+    addNavigationAction(QStringLiteral("Branches"), QStringLiteral("Ctrl+G, Ctrl+B"), [this, branchTabs] {
+        branchTabs->setCurrentIndex(0);
+        branchesList->setFocus();
+    });
+    addNavigationAction(QStringLiteral("History"), QStringLiteral("Ctrl+G, Ctrl+H"), [this, leftTabs] {
+        leftTabs->setCurrentIndex(1);
+        historyList->setFocus();
+    });
+    addNavigationAction(QStringLiteral("Details / Diff"), QStringLiteral("Ctrl+G, Ctrl+D"), [this] {
+        rightTabs->setCurrentWidget(detailsStack);
+        detailsStack->setFocus();
+    });
+    addNavigationAction(QStringLiteral("Git Command"), QStringLiteral("Ctrl+G, Ctrl+T"), [this] {
+        rightTabs->setCurrentIndex(1);
+        commandEditor->setFocus();
+    });
+    addNavigationAction(QStringLiteral("Remotes"), QStringLiteral("Ctrl+G, Ctrl+R"), [this] {
+        rightTabs->setCurrentIndex(2);
+        remotesList->setFocus();
+    });
+    addNavigationAction(QStringLiteral("Identity & Credentials"), QStringLiteral("Ctrl+G, Ctrl+I"), [this] {
+        rightTabs->setCurrentIndex(3);
+        userNameEdit->setFocus();
+    });
+
+    QMenu *helpMenu = menuBar()->addMenu(QStringLiteral("&Help"));
+    QAction *shortcutsAction = helpMenu->addAction(QStringLiteral("Keyboard Shortcuts"));
+    shortcutsAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+H")));
+    shortcutsAction->setShortcutContext(Qt::WindowShortcut);
+    connect(shortcutsAction, &QAction::triggered, this, [this] {
+        QMessageBox::information(this, QStringLiteral("Git Workspace Shortcuts"),
+            QStringLiteral("<b>Git actions</b><br>"
+                           "Ctrl+Alt+A — Stage all changes<br>"
+                           "Ctrl+Alt+C — Commit staged changes<br>"
+                           "Ctrl+Alt+P — Push<br>"
+                           "Ctrl+Alt+L — Pull<br>"
+                           "Ctrl+Alt+F — Fetch all remotes<br>"
+                           "Ctrl+Alt+R — Refresh status<br>"
+                           "Ctrl+Enter — Run Git command<br>"
+                           "Ctrl+G, Ctrl+S — Stash changes<br>"
+                           "Ctrl+G, Ctrl+U — Apply latest stash<br>"
+                           "Ctrl+G, Ctrl+X — Resolve conflicts<br><br>"
+                           "<b>Navigate</b><br>"
+                           "Ctrl+G, Ctrl+C — Changes<br>"
+                           "Ctrl+G, Ctrl+B — Branches<br>"
+                           "Ctrl+G, Ctrl+H — History<br>"
+                           "Ctrl+G, Ctrl+D — Details / Diff<br>"
+                           "Ctrl+G, Ctrl+T — Git Command<br>"
+                           "Ctrl+G, Ctrl+R — Remotes<br>"
+                           "Ctrl+G, Ctrl+I — Identity &amp; Credentials"));
+    });
+
     mainSplitter->addWidget(branchTabs);
     mainSplitter->addWidget(leftTabs);
     mainSplitter->addWidget(rightTabs);
@@ -1999,6 +2101,13 @@ void GitWorkspaceWindow::sendCommandInput()
 
 void GitWorkspaceWindow::updateToolbarState()
 {
+    if (stageAllShortcutAction) stageAllShortcutAction->setEnabled(hasUnstagedChanges);
+    if (commitShortcutAction) commitShortcutAction->setEnabled(hasStagedChanges);
+    if (pushShortcutAction) pushShortcutAction->setEnabled(hasRemote && hasUnpushedCommits);
+    if (pullShortcutAction) pullShortcutAction->setEnabled(hasRemote);
+    if (fetchShortcutAction) fetchShortcutAction->setEnabled(hasRemote);
+    if (stashShortcutAction) stashShortcutAction->setEnabled(hasStagedChanges || hasUnstagedChanges);
+    if (resolveShortcutAction) resolveShortcutAction->setEnabled(hasConflicts);
     if (commitButton) {
         commitButton->setVisible(hasStagedChanges);
         commitButton->setEnabled(hasStagedChanges);

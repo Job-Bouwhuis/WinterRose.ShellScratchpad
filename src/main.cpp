@@ -2661,6 +2661,8 @@ private:
 
         QMenu *helpMenu = menuBar()->addMenu(QStringLiteral("&Help"));
         QAction *shortcutsAction = helpMenu->addAction(QStringLiteral("Keyboard Shortcuts"));
+        shortcutsAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+H")));
+        shortcutsAction->setShortcutContext(Qt::WindowShortcut);
         connect(shortcutsAction, &QAction::triggered, this, [this]() { showKeyboardShortcuts(); });
         QAction *aboutAction = helpMenu->addAction(QStringLiteral("About Shell Scratchpad"));
         connect(aboutAction, &QAction::triggered, this, [this]() {

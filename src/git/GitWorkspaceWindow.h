@@ -4,6 +4,7 @@
 #include <QStringList>
 
 class QComboBox;
+class QAction;
 class QLineEdit;
 class QLabel;
 class QListWidget;
@@ -45,6 +46,13 @@ private:
     QToolButton *pushButton = nullptr;
     QToolButton *moreButton = nullptr;
     QToolButton *conflictsButton = nullptr;
+    QAction *stageAllShortcutAction = nullptr;
+    QAction *commitShortcutAction = nullptr;
+    QAction *pushShortcutAction = nullptr;
+    QAction *pullShortcutAction = nullptr;
+    QAction *fetchShortcutAction = nullptr;
+    QAction *stashShortcutAction = nullptr;
+    QAction *resolveShortcutAction = nullptr;
     QLabel *branchStatusLabel = nullptr;
     QListWidget *branchesList = nullptr;
     QListWidget *historyList = nullptr;
