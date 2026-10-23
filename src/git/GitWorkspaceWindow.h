@@ -40,6 +40,7 @@ private:
     QTabWidget *rightTabs = nullptr;
     QToolButton *branchButton = nullptr;
     QToolButton *commitButton = nullptr;
+    QToolButton *commitPushButton = nullptr;
     QToolButton *stageAllButton = nullptr;
     QToolButton *syncButton = nullptr;
     QToolButton *pullButton = nullptr;
@@ -85,6 +86,9 @@ private:
     bool hasUnpushedCommits = false;
     bool hasConflicts = false;
     bool hadConflictsBeforeCommand = false;
+    bool commitPushPending = false;
+    bool pushAfterSyncPending = false;
+    QStringList deferredPushArguments;
     int stagedPathCount = 0;
     int unstagedPathCount = 0;
     QString actionOutput;
@@ -106,6 +110,7 @@ private:
     void showHistoryContextMenu(QListWidgetItem *item, const QPoint &globalPosition);
     void resolveConflictFile(const QString &path);
     void showMergeConflictsDialog();
+    void showCommitDialog();
     void addRemote();
     void changeRemoteUrl(const QString &name);
     void removeRemote(const QString &name);

@@ -813,16 +813,20 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
             if (ok && !name.isEmpty()) runGit({QStringLiteral("switch"), QStringLiteral("-c"), name});
         });
     });
+    commitPushButton = new QToolButton(root);
+    commitPushButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    commitPushButton->setIcon(gitIcon(QStringLiteral("commit")));
+    commitPushButton->setText(QStringLiteral("Commit & Push…"));
+    commitPushButton->setToolTip(QStringLiteral("Commit staged changes, then push the current branch"));
+    commitPushButton->setVisible(false);
+    connect(commitPushButton, &QToolButton::clicked, this, [this] { showCommitDialog(); });
     commitButton = new QToolButton(root);
     commitButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
     commitButton->setIcon(gitIcon(QStringLiteral("commit")));
     commitButton->setText(QStringLiteral("Commit…"));
     commitButton->setToolTip(QStringLiteral("Commit staged changes"));
     connect(commitButton, &QToolButton::clicked, this, [this] {
-        bool ok = false;
-        const QString message = QInputDialog::getText(this, QStringLiteral("Commit"),
-            QStringLiteral("Commit message:"), QLineEdit::Normal, QString(), &ok).trimmed();
-        if (ok && !message.isEmpty()) runGit({QStringLiteral("commit"), QStringLiteral("-m"), message});
+        showCommitDialog();
     });
     stageAllButton = new QToolButton(root);
     stageAllButton->setText(QStringLiteral("Stage All"));
@@ -938,6 +942,7 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
         else refreshAll();
     });
     toolbar->addWidget(branchButton);
+    toolbar->addWidget(commitPushButton);
     toolbar->addWidget(commitButton);
     toolbar->addWidget(stageAllButton);
     toolbar->addWidget(syncButton);
@@ -1161,10 +1166,7 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
         runGit({QStringLiteral("add"), QStringLiteral("-A")});
     });
     commitShortcutAction = addGitAction(QStringLiteral("Commit Staged Changes…"), QStringLiteral("Ctrl+Alt+C"), [this] {
-        bool ok = false;
-        const QString message = QInputDialog::getText(this, QStringLiteral("Commit"),
-            QStringLiteral("Commit message:"), QLineEdit::Normal, QString(), &ok).trimmed();
-        if (ok && !message.isEmpty()) runGit({QStringLiteral("commit"), QStringLiteral("-m"), message});
+        showCommitDialog();
     });
     gitActionsMenu->addSeparator();
     pushShortcutAction = addGitAction(QStringLiteral("Push"), QStringLiteral("Ctrl+Alt+P"), [this] { pushCurrentBranch(); });
@@ -1279,6 +1281,12 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     connect(commandProcess, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
             [this](int code, QProcess::ExitStatus) {
         const bool conflictsExistedBeforeCommand = hadConflictsBeforeCommand;
+        const bool pushAfterCommit = commitPushPending;
+        const bool pushAfterSync = pushAfterSyncPending;
+        const QStringList pushArguments = deferredPushArguments;
+        commitPushPending = false;
+        pushAfterSyncPending = false;
+        deferredPushArguments.clear();
         if (actionCommandActive) {
             QString summary = actionOutput;
             static const QRegularExpression ANSI_SEQUENCE(QStringLiteral("\\x1B\\[[0-?]*[ -/]*[@-~]"));
@@ -1302,6 +1310,14 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
             statusBar()->showMessage(QStringLiteral("Merge conflicts need your attention (%1 file(s))")
                                          .arg(conflictedFiles.size()), 10000);
             showMergeConflictsDialog();
+        }
+        if (code == 0 && !hasConflicts) {
+            if (pushAfterCommit)
+                runGit({QStringLiteral("push")});
+            else if (pushAfterSync && !pushArguments.isEmpty())
+                runGit(pushArguments);
+        } else if (pushAfterCommit || pushAfterSync) {
+            statusBar()->showMessage(QStringLiteral("Push was not started because the preceding Git operation did not complete cleanly."), 8000);
         }
     });
     connect(commandProcess, &QProcess::started, this, [this] {
@@ -1905,6 +1921,56 @@ void GitWorkspaceWindow::showMergeConflictsDialog()
     dialog.exec();
 }
 
+void GitWorkspaceWindow::showCommitDialog()
+{
+    if (!hasStagedChanges) return;
+    if (commandProcess->state() != QProcess::NotRunning) {
+        QMessageBox::information(this, QStringLiteral("Git is busy"),
+            QStringLiteral("Wait for the current Git command to finish before committing."));
+        return;
+    }
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("Commit Staged Changes"));
+    dialog.resize(620, 420);
+    auto *layout = new QVBoxLayout(&dialog);
+    layout->addWidget(new QLabel(QStringLiteral("Commit message (use multiple lines for a longer description):"), &dialog));
+    auto *messageEdit = new QPlainTextEdit(&dialog);
+    messageEdit->setPlaceholderText(QStringLiteral("Summary line\n\nOptional commit description"));
+    layout->addWidget(messageEdit, 1);
+    auto *buttonRow = new QHBoxLayout;
+    auto *commitPush = new QPushButton(QStringLiteral("Commit & Push"), &dialog);
+    auto *commitOnly = new QPushButton(QStringLiteral("Commit"), &dialog);
+    auto *cancel = new QPushButton(QStringLiteral("Cancel"), &dialog);
+    buttonRow->addStretch(1);
+    buttonRow->addWidget(commitPush);
+    buttonRow->addWidget(commitOnly);
+    buttonRow->addWidget(cancel);
+    layout->addLayout(buttonRow);
+
+    QString message;
+    bool pushAfterCommit = false;
+    const auto acceptCommit = [&dialog, messageEdit, &message](bool push) {
+        message = messageEdit->toPlainText().trimmed();
+        if (message.isEmpty()) {
+            QMessageBox::warning(&dialog, QStringLiteral("Commit message required"),
+                QStringLiteral("Enter a commit message before committing."));
+            messageEdit->setFocus();
+            return;
+        }
+        dialog.setProperty("pushAfterCommit", push);
+        dialog.accept();
+    };
+    connect(commitPush, &QPushButton::clicked, &dialog, [&acceptCommit] { acceptCommit(true); });
+    connect(commitOnly, &QPushButton::clicked, &dialog, [&acceptCommit] { acceptCommit(false); });
+    connect(cancel, &QPushButton::clicked, &dialog, &QDialog::reject);
+    messageEdit->setFocus();
+    if (dialog.exec() != QDialog::Accepted) return;
+    pushAfterCommit = dialog.property("pushAfterCommit").toBool();
+    commitPushPending = pushAfterCommit;
+    runGit({QStringLiteral("commit"), QStringLiteral("-m"), message});
+}
+
 void GitWorkspaceWindow::refreshIdentity()
 {
     userNameEdit->setText(gitOutput({QStringLiteral("config"), QStringLiteral("--get"), QStringLiteral("user.name")}));
@@ -1916,6 +1982,35 @@ void GitWorkspaceWindow::runGit(const QStringList &arguments)
     if (commandProcess->state() != QProcess::NotRunning) {
         QMessageBox::information(this, QStringLiteral("Git is busy"), QStringLiteral("Wait for the current Git command to finish."));
         return;
+    }
+    if (!arguments.isEmpty() && arguments.first() == QLatin1String("push") && !arguments.contains(QStringLiteral("--delete"))) {
+        const QString currentBranch = gitOutput({QStringLiteral("branch"), QStringLiteral("--show-current")});
+        const QStringList remoteNames = gitOutput({QStringLiteral("remote")}).split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+        const bool explicitRefspec = arguments.size() >= 3 && !arguments.last().startsWith(QLatin1Char('-'))
+            && !remoteNames.contains(arguments.last());
+        const bool pushesCurrentBranch = !explicitRefspec || arguments.last() == currentBranch || arguments.last() == QLatin1String("HEAD");
+        if (pushesCurrentBranch && hasUpstream) {
+            bool countOk = false;
+            const int incomingCount = gitOutput({QStringLiteral("rev-list"), QStringLiteral("--count"),
+                QStringLiteral("HEAD..@{upstream}")}).toInt(&countOk);
+            if (countOk && incomingCount > 0) {
+                QMessageBox prompt(this);
+                prompt.setIcon(QMessageBox::Warning);
+                prompt.setWindowTitle(QStringLiteral("Upstream Commits Need Pulling"));
+                prompt.setText(QStringLiteral("Your upstream branch has %1 commit(s) that are not in this repository.").arg(incomingCount));
+                prompt.setInformativeText(QStringLiteral("Sync with the upstream using Pull with Rebase before pushing?"));
+                QPushButton *syncAndPush = prompt.addButton(QStringLiteral("Sync Then Push"), QMessageBox::AcceptRole);
+                prompt.addButton(QStringLiteral("Do Nothing"), QMessageBox::RejectRole);
+                prompt.setDefaultButton(syncAndPush);
+                prompt.exec();
+                if (prompt.clickedButton() == syncAndPush) {
+                    pushAfterSyncPending = true;
+                    deferredPushArguments = arguments;
+                    runGit({QStringLiteral("pull"), QStringLiteral("--rebase")});
+                }
+                return;
+            }
+        }
     }
     QStringList fullArguments{QStringLiteral("-C"), repoPath};
     fullArguments.append(arguments);
@@ -1938,6 +2033,10 @@ void GitWorkspaceWindow::runRawCommand()
     QStringList args = QProcess::splitCommand(commandEditor->toPlainText().trimmed());
     if (!args.isEmpty() && args.first() == QLatin1String("git")) args.removeFirst();
     if (args.isEmpty()) return;
+    if (args.first() == QLatin1String("push")) {
+        runGit(args);
+        return;
+    }
     appendOutput(QStringLiteral("$ git %1\n").arg(args.join(QLatin1Char(' '))));
     actionCommandActive = false;
     commandProcess->setProgram(gitExecutable());
@@ -2204,6 +2303,10 @@ void GitWorkspaceWindow::updateToolbarState()
     if (commitButton) {
         commitButton->setVisible(hasStagedChanges);
         commitButton->setEnabled(hasStagedChanges);
+    }
+    if (commitPushButton) {
+        commitPushButton->setVisible(hasStagedChanges);
+        commitPushButton->setEnabled(hasStagedChanges);
     }
     if (stageAllButton) {
         stageAllButton->setVisible(hasUnstagedChanges);
