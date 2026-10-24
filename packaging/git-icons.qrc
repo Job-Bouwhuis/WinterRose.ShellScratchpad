@@ -7,5 +7,8 @@
     <file alias="push.svg">git-icons/push.svg</file>
     <file alias="refresh.svg">git-icons/refresh.svg</file>
     <file alias="more.svg">git-icons/more.svg</file>
+    <file alias="stash.svg">git-icons/stash.svg</file>
+    <file alias="stash-apply.svg">git-icons/stash-apply.svg</file>
+    <file alias="stage.svg">git-icons/stage.svg</file>
   </qresource>
 </RCC>

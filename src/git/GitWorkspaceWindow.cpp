@@ -12,11 +12,15 @@
 #include <QContextMenuEvent>
 #include <QAction>
 #include <QApplication>
+#include <QBuffer>
 #include <QClipboard>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QFontDatabase>
+#include <QImage>
+#include <QImageReader>
+#include <QPixmap>
 #include <QFormLayout>
 #include <QHeaderView>
 #include <QInputDialog>
@@ -38,6 +42,7 @@
 #include <QStatusBar>
 #include <QProgressBar>
 #include <QSplitter>
+#include <QStandardPaths>
 #include <QSize>
 #include <QTabWidget>
 #include <QTextCursor>
@@ -54,6 +59,8 @@
 #include <QSaveFile>
 #include <QTextEdit>
 #include <QStackedWidget>
+#include <QResizeEvent>
+#include <QTemporaryFile>
 #include <QScrollBar>
 #include <algorithm>
 
@@ -68,6 +75,158 @@
 
 namespace ShellScratchpad::Git
 {
+class ImagePreviewLabel final : public QLabel
+{
+public:
+    explicit ImagePreviewLabel(QWidget *parent = nullptr)
+        : QLabel(parent)
+    {
+        setAlignment(Qt::AlignCenter);
+        setMinimumSize(100, 100);
+        setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
+        setWordWrap(true);
+        renderTimer.setSingleShot(true);
+        renderTimer.setInterval(100);
+        QObject::connect(&renderTimer, &QTimer::timeout, this, [this] { updatePreview(); });
+        spinnerTimer.setInterval(180);
+        QObject::connect(&spinnerTimer, &QTimer::timeout, this, [this] {
+            spinnerFrame = (spinnerFrame + 1) % 4;
+            setText(QStringLiteral("Rendering SVG%1").arg(QString(spinnerFrame, QLatin1Char('.'))));
+        });
+    }
+
+    void setImage(const QImage &image, const QString &fallbackText)
+    {
+        sourceImage = image;
+        svgBytes.clear();
+        svgPath.clear();
+        emptyText = fallbackText;
+        cancelSvgRender();
+        updatePreview();
+    }
+
+    void setSvgData(const QByteArray &bytes, const QString &path, const QString &fallbackText)
+    {
+        sourceImage = {};
+        svgBytes = bytes;
+        svgPath = path;
+        emptyText = fallbackText;
+        updatePreview();
+    }
+
+protected:
+    void resizeEvent(QResizeEvent *event) override
+    {
+        QLabel::resizeEvent(event);
+        if (!svgBytes.isEmpty()) renderTimer.start();
+        else updatePreview();
+    }
+
+private:
+    QImage sourceImage;
+    QString emptyText;
+    QByteArray svgBytes;
+    QString svgPath;
+    QTimer renderTimer;
+    QTimer spinnerTimer;
+    int spinnerFrame = 0;
+    QProcess *activeProcess = nullptr;
+    QTemporaryFile *activeSvgFile = nullptr;
+
+    void cancelSvgRender()
+    {
+        renderTimer.stop();
+        spinnerTimer.stop();
+        if (activeProcess) {
+            disconnect(activeProcess, nullptr, this, nullptr);
+            activeProcess->kill();
+            activeProcess->deleteLater();
+            activeProcess = nullptr;
+        }
+        if (activeSvgFile) {
+            activeSvgFile->deleteLater();
+            activeSvgFile = nullptr;
+        }
+    }
+
+    void startSvgRender(const QSize &size)
+    {
+        cancelSvgRender();
+        if (size.isEmpty() || svgBytes.isEmpty()) return;
+        auto *svgFile = new QTemporaryFile(this);
+        if (!svgFile->open() || svgFile->write(svgBytes) != svgBytes.size() || !svgFile->flush()) {
+            delete svgFile;
+            setText(QStringLiteral("The SVG data could not be prepared for rendering."));
+            return;
+        }
+        const QString magick = QStandardPaths::findExecutable(QStringLiteral("magick"));
+        const QString convert = magick.isEmpty() ? QStandardPaths::findExecutable(QStringLiteral("convert")) : magick;
+        if (convert.isEmpty()) {
+            delete svgFile;
+            setText(QStringLiteral("SVG rendering is unavailable because no SVG image reader is installed."));
+            return;
+        }
+        // ImageMagick's SVG delegate rasterizes at density 96 as only a quarter
+        // of the requested pixel dimensions. Supersampling keeps enlargement crisp.
+        const int density = std::clamp(std::max(size.width(), size.height()) * 16, 96, 32768);
+        auto *process = new QProcess(this);
+        process->setProgram(convert);
+        process->setArguments({QStringLiteral("-background"), QStringLiteral("none"),
+            QStringLiteral("-density"), QString::number(density),
+            QStringLiteral("svg:") + svgFile->fileName(), QStringLiteral("png:-")});
+        activeProcess = process;
+        activeSvgFile = svgFile;
+        spinnerFrame = 0;
+        setPixmap(QPixmap());
+        setText(QStringLiteral("Rendering SVG"));
+        spinnerTimer.start();
+        connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+            [this, process, svgFile](int exitCode, QProcess::ExitStatus) {
+                if (activeProcess != process) return;
+                activeProcess = nullptr;
+                activeSvgFile = nullptr;
+                spinnerTimer.stop();
+                if (exitCode == 0) {
+                    const QImage image = QImage::fromData(process->readAllStandardOutput(), "PNG");
+                    if (!image.isNull()) {
+                        setText(QString());
+                        setPixmap(QPixmap::fromImage(image).scaled(contentsRect().size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+                    } else setText(QStringLiteral("The SVG renderer returned no image."));
+                } else {
+                    setText(QStringLiteral("SVG rendering failed: %1").arg(QString::fromLocal8Bit(process->readAllStandardError()).trimmed()));
+                }
+                process->deleteLater();
+                svgFile->deleteLater();
+            });
+        connect(process, &QProcess::errorOccurred, this, [this, process, svgFile](QProcess::ProcessError error) {
+            if (error != QProcess::FailedToStart || activeProcess != process) return;
+            activeProcess = nullptr;
+            activeSvgFile = nullptr;
+            spinnerTimer.stop();
+            setText(QStringLiteral("Could not start the SVG renderer."));
+            process->deleteLater();
+            svgFile->deleteLater();
+        });
+        process->start();
+    }
+
+    void updatePreview()
+    {
+        if (!svgBytes.isEmpty()) {
+            startSvgRender(contentsRect().size());
+            return;
+        }
+        const QImage image = sourceImage;
+        if (image.isNull()) {
+            clear();
+            setText(emptyText);
+            return;
+        }
+        setText(QString());
+        setPixmap(QPixmap::fromImage(image).scaled(contentsRect().size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    }
+};
+
 namespace
 {
 enum class DiffLineKind { Unchanged, Added, Removed };
@@ -572,6 +731,64 @@ QIcon gitIcon(const QString &name)
     return QIcon(QStringLiteral(":/git/icons/%1.svg").arg(name));
 }
 
+bool isSvgDocument(const QByteArray &bytes)
+{
+    return bytes.left(8192).toLower().contains("<svg");
+}
+
+bool isImageFilePath(const QString &path, const QByteArray &contents = {})
+{
+    const QByteArray suffix = QFileInfo(path).suffix().toLatin1().toLower();
+    if (suffix == "svg" || suffix == "svgz" || isSvgDocument(contents)) return true;
+    const QList<QByteArray> supportedFormats = QImageReader::supportedImageFormats();
+    if (std::any_of(supportedFormats.cbegin(), supportedFormats.cend(), [&suffix](const QByteArray &format) {
+        return format.toLower() == suffix;
+    })) return true;
+    QBuffer buffer;
+    buffer.setData(contents);
+    return buffer.open(QIODevice::ReadOnly) && !QImageReader::imageFormat(&buffer).isEmpty();
+}
+
+QImage decodeImage(const QByteArray &bytes, const QString &path, QString *errorMessage = nullptr)
+{
+    QBuffer buffer;
+    buffer.setData(bytes);
+    if (buffer.open(QIODevice::ReadOnly)) {
+        QImageReader reader(&buffer);
+        reader.setAutoTransform(true);
+        const QImage image = reader.read();
+        if (!image.isNull()) return image;
+    }
+
+    if (QFileInfo(path).suffix().compare(QStringLiteral("svg"), Qt::CaseInsensitive) != 0 && !isSvgDocument(bytes)) {
+        if (errorMessage) *errorMessage = QStringLiteral("This image format could not be decoded.");
+        return {};
+    }
+
+    QTemporaryFile svgFile;
+    if (!svgFile.open() || svgFile.write(bytes) != bytes.size() || !svgFile.flush()) {
+        if (errorMessage) *errorMessage = QStringLiteral("The SVG data could not be prepared for rendering.");
+        return {};
+    }
+    const QString magick = QStandardPaths::findExecutable(QStringLiteral("magick"));
+    const QString convert = magick.isEmpty() ? QStandardPaths::findExecutable(QStringLiteral("convert")) : magick;
+    if (convert.isEmpty()) {
+        if (errorMessage) *errorMessage = QStringLiteral("SVG rendering is unavailable because no SVG image reader is installed.");
+        return {};
+    }
+    QProcess renderer;
+    renderer.setProgram(convert);
+    renderer.setArguments({QStringLiteral("svg:") + svgFile.fileName(), QStringLiteral("png:-")});
+    renderer.start();
+    if (!renderer.waitForFinished(15000) || renderer.exitCode() != 0) {
+        if (errorMessage) *errorMessage = QStringLiteral("SVG rendering failed: %1").arg(QString::fromLocal8Bit(renderer.readAllStandardError()).trimmed());
+        return {};
+    }
+    const QImage image = QImage::fromData(renderer.readAllStandardOutput(), "PNG");
+    if (image.isNull() && errorMessage) *errorMessage = QStringLiteral("The SVG renderer returned no image.");
+    return image;
+}
+
 class GitCloneDialog final : public QDialog
 {
 public:
@@ -901,6 +1118,8 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
         else showBatchOperations(QStringLiteral("commit"));
     });
     stageAllButton = new QToolButton(root);
+    stageAllButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    stageAllButton->setIcon(gitIcon(QStringLiteral("stage")));
     stageAllButton->setText(QStringLiteral("Stage All"));
     stageAllButton->setToolTip(QStringLiteral("Stage all modified, deleted, and untracked files"));
     stageAllButton->setVisible(false);
@@ -994,13 +1213,48 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
         });
         moreMenu->addSeparator();
         QAction *stash = moreMenu->addAction(QStringLiteral("Stash Changes"));
+        stash->setIcon(gitIcon(QStringLiteral("stash")));
         stash->setEnabled(hasStagedChanges || hasUnstagedChanges);
         connect(stash, &QAction::triggered, this, [this] {
             runGit({QStringLiteral("stash"), QStringLiteral("push")});
         });
-        QAction *popStash = moreMenu->addAction(QStringLiteral("Apply Latest Stash"));
-        popStash->setEnabled(hasStashes);
-        connect(popStash, &QAction::triggered, this, [this] { runGit({QStringLiteral("stash"), QStringLiteral("pop")}); });
+        QAction *applyStash = moreMenu->addAction(gitIcon(QStringLiteral("stash-apply")), QStringLiteral("Apply Stash Options…"));
+        applyStash->setEnabled(hasStashes);
+        connect(applyStash, &QAction::triggered, this, [this] { if (applyStashButton) applyStashButton->showMenu(); });
+    });
+    applyStashButton = new QToolButton(root);
+    applyStashButton->setObjectName(QStringLiteral("applyStashButton"));
+    applyStashButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    applyStashButton->setText(QStringLiteral("Apply Stash"));
+    applyStashButton->setIcon(gitIcon(QStringLiteral("stash-apply")));
+    applyStashButton->setToolTip(QStringLiteral("Apply or pop a stash in the active repository"));
+    applyStashButton->setPopupMode(QToolButton::InstantPopup);
+    auto *applyStashMenu = new QMenu(applyStashButton);
+    applyStashButton->setMenu(applyStashMenu);
+    connect(applyStashMenu, &QMenu::aboutToShow, this, [this, applyStashMenu] {
+        applyStashMenu->clear();
+        const QStringList stashLines = gitOutput({QStringLiteral("stash"), QStringLiteral("list"),
+            QStringLiteral("--format=%gd%x09%gs")}).split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+        if (stashLines.isEmpty()) {
+            QAction *empty = applyStashMenu->addAction(QStringLiteral("No stashes in this repository"));
+            empty->setEnabled(false);
+            return;
+        }
+        for (const QString &line : stashLines) {
+            const QStringList fields = line.split(QLatin1Char('\t'), Qt::KeepEmptyParts);
+            if (fields.isEmpty()) continue;
+            const QString reference = fields.first();
+            const QString description = fields.size() > 1 ? fields.mid(1).join(QLatin1Char('\t')) : QString();
+            QMenu *stashOptions = applyStashMenu->addMenu(QStringLiteral("%1 — %2").arg(reference, description));
+            QAction *apply = stashOptions->addAction(QStringLiteral("Apply (keep stash)"));
+            connect(apply, &QAction::triggered, this, [this, reference] {
+                runGit({QStringLiteral("stash"), QStringLiteral("apply"), reference});
+            });
+            QAction *pop = stashOptions->addAction(QStringLiteral("Pop (apply and remove)"));
+            connect(pop, &QAction::triggered, this, [this, reference] {
+                runGit({QStringLiteral("stash"), QStringLiteral("pop"), reference});
+            });
+        }
     });
     conflictsButton = new QToolButton(root);
     conflictsButton->setText(QStringLiteral("Resolve Conflicts"));
@@ -1067,6 +1321,7 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     toolbar->addWidget(pullButton);
     toolbar->addWidget(pushButton);
     toolbar->addWidget(moreButton);
+    toolbar->addWidget(applyStashButton);
     toolbar->addWidget(conflictsButton);
     toolbar->addWidget(refreshButton);
     toolbar->addWidget(actionRepositoriesButton);
@@ -1145,6 +1400,12 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     auto *diffContent = new QWidget(diffPanel);
     auto *diffContentLayout = new QVBoxLayout(diffContent);
     diffContentLayout->setContentsMargins(0, 0, 0, 0);
+    commitMessageView = new QPlainTextEdit(diffContent);
+    commitMessageView->setReadOnly(true);
+    commitMessageView->setLineWrapMode(QPlainTextEdit::WidgetWidth);
+    commitMessageView->setMaximumHeight(150);
+    commitMessageView->hide();
+    diffContentLayout->addWidget(commitMessageView);
     diffSummaryLabel = new QLabel(diffContent);
     diffContentLayout->addWidget(diffSummaryLabel);
     changeGroupsList = new QListWidget;
@@ -1168,16 +1429,39 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     diffLabels->addWidget(originalDiffLabel);
     diffLabels->addWidget(changedDiffLabel);
     diffContentLayout->addLayout(diffLabels);
+    svgViewModePanel = new QWidget(diffContent);
+    auto *svgViewModeLayout = new QHBoxLayout(svgViewModePanel);
+    svgViewModeLayout->setContentsMargins(0, 0, 0, 0);
+    svgViewModeLayout->addWidget(new QLabel(QStringLiteral("SVG view:"), svgViewModePanel));
+    svgViewModeCombo = new QComboBox(svgViewModePanel);
+    svgViewModeCombo->setObjectName(QStringLiteral("svgViewModeCombo"));
+    svgViewModeCombo->addItem(QStringLiteral("Rendered image"));
+    svgViewModeCombo->addItem(QStringLiteral("Source code"));
+    svgViewModeLayout->addWidget(svgViewModeCombo);
+    svgViewModeLayout->addStretch(1);
+    svgViewModePanel->hide();
+    diffContentLayout->addWidget(svgViewModePanel);
+    connect(svgViewModeCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] {
+        if (currentDiffIsSvg) displayImageDiff();
+    });
     auto *diffColumns = new QSplitter(Qt::Horizontal, diffContent);
-    originalFileView = new QTextEdit(diffColumns);
-    workingFileView = new QTextEdit(diffColumns);
+    originalViewStack = new QStackedWidget(diffColumns);
+    workingViewStack = new QStackedWidget(diffColumns);
+    originalFileView = new QTextEdit(originalViewStack);
+    workingFileView = new QTextEdit(workingViewStack);
+    originalImageView = new ImagePreviewLabel(originalViewStack);
+    workingImageView = new ImagePreviewLabel(workingViewStack);
+    originalViewStack->addWidget(originalFileView);
+    originalViewStack->addWidget(originalImageView);
+    workingViewStack->addWidget(workingFileView);
+    workingViewStack->addWidget(workingImageView);
     for (QTextEdit *view : {originalFileView, workingFileView}) {
         view->setReadOnly(true);
         view->setLineWrapMode(QTextEdit::NoWrap);
         view->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
     }
-    diffColumns->addWidget(originalFileView);
-    diffColumns->addWidget(workingFileView);
+    diffColumns->addWidget(originalViewStack);
+    diffColumns->addWidget(workingViewStack);
     synchronizeDiffViews(originalFileView, workingFileView);
     diffContentLayout->addWidget(diffColumns, 1);
     auto *diffNavigation = new QWidget(diffPanel);
@@ -1370,9 +1654,11 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     stashShortcutAction = addGitAction(QStringLiteral("Stash Changes"), QStringLiteral("Ctrl+G, Ctrl+S"), [this] {
         runGit({QStringLiteral("stash"), QStringLiteral("push")});
     });
-    addGitAction(QStringLiteral("Apply Latest Stash"), QStringLiteral("Ctrl+G, Ctrl+U"), [this] {
-        runGit({QStringLiteral("stash"), QStringLiteral("pop")});
+    stashShortcutAction->setIcon(gitIcon(QStringLiteral("stash")));
+    QAction *applyStashShortcutAction = addGitAction(QStringLiteral("Apply Stash Options…"), QStringLiteral("Ctrl+G, Ctrl+U"), [this] {
+        if (applyStashButton && hasStashes) applyStashButton->showMenu();
     });
+    applyStashShortcutAction->setIcon(gitIcon(QStringLiteral("stash-apply")));
     addGitAction(QStringLiteral("Refresh Status"), QStringLiteral("Ctrl+Alt+R"), [this] { refreshAll(); });
     resolveShortcutAction = addGitAction(QStringLiteral("Resolve Conflicts"), QStringLiteral("Ctrl+G, Ctrl+X"), [this] {
         if (conflictsButton->isEnabled()) conflictsButton->click();
@@ -2665,6 +2951,14 @@ void GitWorkspaceWindow::showDiff(const QString &path)
 {
     if (path.isEmpty()) return;
     currentDiffCommitHash.clear();
+    currentDiffIsImage = false;
+    currentDiffIsSvg = false;
+    svgViewModePanel->hide();
+    changeGroupsList->show();
+    originalViewStack->setCurrentWidget(originalFileView);
+    workingViewStack->setCurrentWidget(workingFileView);
+    commitMessageView->clear();
+    commitMessageView->hide();
     QFile snapshotFile(QDir(repoPath).filePath(path));
     lastObservedDiffFile = snapshotFile.open(QIODevice::ReadOnly)
         ? QString::fromLatin1(QCryptographicHash::hash(snapshotFile.readAll(), QCryptographicHash::Sha256).toHex())
@@ -2678,18 +2972,28 @@ void GitWorkspaceWindow::showDiff(const QString &path)
     originalDiffLabel->setText(QStringLiteral("Latest in repository (HEAD)"));
     changedDiffLabel->setText(QStringLiteral("Working file"));
     QByteArray originalBytes;
+    bool originalMissing = true;
     QProcess originalProcess;
     originalProcess.setProgram(gitExecutable());
     originalProcess.setArguments({QStringLiteral("show"), QStringLiteral("HEAD:") + path});
     originalProcess.setWorkingDirectory(repoPath);
     originalProcess.start();
-    if (originalProcess.waitForFinished(10000) && originalProcess.exitCode() == 0)
+    if (originalProcess.waitForFinished(10000) && originalProcess.exitCode() == 0) {
         originalBytes = originalProcess.readAllStandardOutput();
+        originalMissing = false;
+    }
 
     QByteArray workingBytes;
+    bool workingMissing = true;
     QFile workingFile(QDir(repoPath).filePath(path));
-    if (workingFile.open(QIODevice::ReadOnly))
+    if (workingFile.open(QIODevice::ReadOnly)) {
         workingBytes = workingFile.readAll();
+        workingMissing = false;
+    }
+    if (isImageFilePath(path, originalBytes) || isImageFilePath(path, workingBytes)) {
+        showImageDiff(path, originalBytes, workingBytes, originalMissing, workingMissing);
+        return;
+    }
     if (originalBytes.contains('\0') || workingBytes.contains('\0')) {
         detailsView->setPlainText(QStringLiteral("This file contains binary data and cannot be shown as a text diff."));
         detailsStack->setCurrentWidget(detailsView);
@@ -2707,10 +3011,71 @@ void GitWorkspaceWindow::showDiff(const QString &path)
     detailsStack->setCurrentWidget(detailsStack->widget(1));
 }
 
+void GitWorkspaceWindow::showImageDiff(const QString &path, const QByteArray &originalBytes,
+                                       const QByteArray &workingBytes, bool originalMissing, bool workingMissing)
+{
+    currentDiffIsImage = true;
+    currentDiffIsSvg = QFileInfo(path).suffix().compare(QStringLiteral("svg"), Qt::CaseInsensitive) == 0
+        || isSvgDocument(originalBytes) || isSvgDocument(workingBytes);
+    currentImageDiffPath = path;
+    originalImageDiffBytes = originalBytes;
+    workingImageDiffBytes = workingBytes;
+    originalImageMissing = originalMissing;
+    workingImageMissing = workingMissing;
+    svgViewModePanel->setVisible(currentDiffIsSvg);
+    changeGroupsList->hide();
+    svgViewModeCombo->blockSignals(true);
+    svgViewModeCombo->setCurrentIndex(0);
+    svgViewModeCombo->blockSignals(false);
+    diffSummaryLabel->setText(path);
+    displayImageDiff();
+}
+
+void GitWorkspaceWindow::displayImageDiff()
+{
+    if (!currentDiffIsImage) return;
+    if (currentDiffIsSvg && svgViewModeCombo->currentIndex() == 1) {
+        originalFileView->setPlainText(originalImageMissing ? QStringLiteral("No previous SVG version.")
+            : QString::fromUtf8(originalImageDiffBytes));
+        workingFileView->setPlainText(workingImageMissing ? QStringLiteral("SVG removed from this version.")
+            : QString::fromUtf8(workingImageDiffBytes));
+        originalViewStack->setCurrentWidget(originalFileView);
+        workingViewStack->setCurrentWidget(workingFileView);
+    } else {
+        if (currentDiffIsSvg) {
+            if (originalImageMissing) originalImageView->setImage({}, QStringLiteral("No previous SVG version"));
+            else originalImageView->setSvgData(originalImageDiffBytes, currentImageDiffPath,
+                QStringLiteral("Could not render original SVG"));
+            if (workingImageMissing) workingImageView->setImage({}, QStringLiteral("SVG removed in this version"));
+            else workingImageView->setSvgData(workingImageDiffBytes, currentImageDiffPath,
+                QStringLiteral("Could not render changed SVG"));
+        } else {
+            QString originalError;
+            QString workingError;
+            const QImage originalImage = originalImageMissing ? QImage()
+                : decodeImage(originalImageDiffBytes, currentImageDiffPath, &originalError);
+            const QImage workingImage = workingImageMissing ? QImage()
+                : decodeImage(workingImageDiffBytes, currentImageDiffPath, &workingError);
+            originalImageView->setImage(originalImage, originalImageMissing
+                ? QStringLiteral("No previous image version")
+                : (originalError.isEmpty() ? QStringLiteral("Could not render original image") : originalError));
+            workingImageView->setImage(workingImage, workingImageMissing
+                ? QStringLiteral("Image removed in this version")
+                : (workingError.isEmpty() ? QStringLiteral("Could not render changed image") : workingError));
+        }
+        originalViewStack->setCurrentWidget(originalImageView);
+        workingViewStack->setCurrentWidget(workingImageView);
+    }
+    detailsStack->setCurrentWidget(detailsStack->widget(1));
+}
+
 void GitWorkspaceWindow::showCommit(const QString &hash)
 {
     if (hash.isEmpty()) return;
     currentDiffCommitHash = hash;
+    commitMessageView->setPlainText(gitOutput({QStringLiteral("show"), QStringLiteral("-s"),
+        QStringLiteral("--format=%B"), hash}));
+    commitMessageView->setVisible(!commitMessageView->toPlainText().isEmpty());
     diffFilesList->clear();
     changeGroupsList->clear();
     int parentCode = -1;
@@ -2765,6 +3130,12 @@ void GitWorkspaceWindow::showCommit(const QString &hash)
 void GitWorkspaceWindow::showCommitFile(const QString &path, const QString &oldPath)
 {
     if (currentDiffCommitHash.isEmpty() || path.isEmpty()) return;
+    currentDiffIsImage = false;
+    currentDiffIsSvg = false;
+    svgViewModePanel->hide();
+    changeGroupsList->show();
+    originalViewStack->setCurrentWidget(originalFileView);
+    workingViewStack->setCurrentWidget(workingFileView);
     int parentCode = -1;
     const QString parent = gitOutput({QStringLiteral("rev-parse"), QStringLiteral("--verify"),
         currentDiffCommitHash + QLatin1Char('^')}, &parentCode);
@@ -2783,6 +3154,11 @@ void GitWorkspaceWindow::showCommitFile(const QString &path, const QString &oldP
     diffSummaryLabel->setText(QStringLiteral("Commit %1 — %2").arg(currentDiffCommitHash.left(10), path));
     originalDiffLabel->setText(QStringLiteral("Parent commit"));
     changedDiffLabel->setText(QStringLiteral("Selected commit"));
+    if (isImageFilePath(path, originalBytes) || isImageFilePath(path, modifiedBytes)) {
+        showImageDiff(path, originalBytes, modifiedBytes,
+            parentCode != 0 || originalBytes.isEmpty(), modifiedBytes.isEmpty());
+        return;
+    }
     if (originalBytes.contains('\0') || modifiedBytes.contains('\0')) {
         detailsView->setPlainText(QStringLiteral("This file contains binary data and cannot be shown as a text diff."));
         detailsStack->setCurrentWidget(detailsView);
@@ -2927,6 +3303,10 @@ void GitWorkspaceWindow::updateToolbarState()
         pushButton->setVisible(groupedWorkspace || canPush);
         pushButton->setEnabled(groupedWorkspace || canPush);
         pushButton->setToolTip(QStringLiteral("Push local commits to the configured remote"));
+    }
+    if (applyStashButton) {
+        applyStashButton->setVisible(hasStashes);
+        applyStashButton->setEnabled(hasStashes);
     }
     if (branchButton) branchButton->setEnabled(true);
 }

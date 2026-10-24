@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QMainWindow>
+#include <QByteArray>
 #include <QPointer>
 #include <QStringList>
 #include <QVector>
@@ -35,6 +36,7 @@ namespace ShellScratchpad::Output { class TerminalOutput; }
 
 namespace ShellScratchpad::Git
 {
+class ImagePreviewLabel;
 class GitWorkspaceWindow final : public QMainWindow
 {
 public:
@@ -55,6 +57,7 @@ private:
     QToolButton *pullButton = nullptr;
     QToolButton *pushButton = nullptr;
     QToolButton *moreButton = nullptr;
+    QToolButton *applyStashButton = nullptr;
     QToolButton *conflictsButton = nullptr;
     QToolButton *actionRepositoriesButton = nullptr;
     QAction *stageAllShortcutAction = nullptr;
@@ -83,9 +86,16 @@ private:
     QWidget *previousRightPage = nullptr;
     QListWidget *changeGroupsList = nullptr;
     QPlainTextEdit *detailsView = nullptr;
+    QPlainTextEdit *commitMessageView = nullptr;
     QStackedWidget *detailsStack = nullptr;
     QTextEdit *originalFileView = nullptr;
     QTextEdit *workingFileView = nullptr;
+    ImagePreviewLabel *originalImageView = nullptr;
+    ImagePreviewLabel *workingImageView = nullptr;
+    QStackedWidget *originalViewStack = nullptr;
+    QStackedWidget *workingViewStack = nullptr;
+    QWidget *svgViewModePanel = nullptr;
+    QComboBox *svgViewModeCombo = nullptr;
     QListWidget *diffFilesList = nullptr;
     QLabel *diffSummaryLabel = nullptr;
     QLabel *originalDiffLabel = nullptr;
@@ -118,6 +128,13 @@ private:
     QString lastObservedStatus;
     QString lastObservedDiffFile;
     QString currentDiffCommitHash;
+    QString currentImageDiffPath;
+    QByteArray originalImageDiffBytes;
+    QByteArray workingImageDiffBytes;
+    bool currentDiffIsImage = false;
+    bool currentDiffIsSvg = false;
+    bool originalImageMissing = false;
+    bool workingImageMissing = false;
     QStringList conflictedFiles;
 
     void refreshAll();
@@ -144,6 +161,9 @@ private:
     QString gitOutput(const QStringList &arguments, int *exitCode = nullptr) const;
     QString selectedPath() const;
     void showDiff(const QString &path);
+    void showImageDiff(const QString &path, const QByteArray &originalBytes, const QByteArray &workingBytes,
+                       bool originalMissing, bool workingMissing);
+    void displayImageDiff();
     void showCommit(const QString &hash);
     void showCommitFile(const QString &path, const QString &oldPath = QString());
     void addCredential();
