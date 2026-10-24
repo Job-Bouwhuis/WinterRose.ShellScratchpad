@@ -12,6 +12,7 @@
 #include <QContextMenuEvent>
 #include <QAction>
 #include <QApplication>
+#include <QCoreApplication>
 #include <QBuffer>
 #include <QClipboard>
 #include <QDialog>
@@ -67,6 +68,9 @@
 #include <QTimer>
 #include <QCryptographicHash>
 #include <QSettings>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QCloseEvent>
 #include <QEvent>
 #include <QTimer>
@@ -293,6 +297,16 @@ bool isCuratedRepositorySetting(const QString &key)
 {
     return std::any_of(repositorySettingDefinitions().cbegin(), repositorySettingDefinitions().cend(),
         [&key](const RepositorySettingDefinition &setting) { return setting.key.compare(key, Qt::CaseInsensitive) == 0; });
+}
+
+QString kwalletCredentialHelperPath()
+{
+    QString path = QStandardPaths::findExecutable(QStringLiteral("git-credential-kwallet"));
+    if (path.isEmpty()) {
+        const QString adjacent = QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("git-credential-kwallet"));
+        if (QFileInfo(adjacent).isExecutable()) path = adjacent;
+    }
+    return path;
 }
 
 enum class DiffLineKind { Unchanged, Added, Removed };
@@ -1651,17 +1665,37 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     credentialHelperCombo->addItem(QStringLiteral("Keep current helper"), QString());
     credentialHelperCombo->addItem(QStringLiteral("Git Credential Manager"), QStringLiteral("manager"));
     credentialHelperCombo->addItem(QStringLiteral("GNOME Keyring / libsecret"), QStringLiteral("/usr/lib/git-core/git-credential-libsecret"));
+    credentialHelperCombo->addItem(QStringLiteral("KWallet"), QStringLiteral("kwallet"));
     credentialHelperCombo->addItem(QStringLiteral("Temporary in-memory cache"), QStringLiteral("cache --timeout=3600"));
     credentialHelperCombo->addItem(QStringLiteral("Plain-text store (not recommended)"), QStringLiteral("store"));
+    credentialWalletEdit = new QLineEdit(QStringLiteral("git-credentials"), credentialsPanel);
+    credentialWalletEdit->setPlaceholderText(QStringLiteral("git-credentials"));
+    credentialFolderEdit = new QLineEdit(QStringLiteral("Git Credentials"), credentialsPanel);
+    credentialFolderEdit->setPlaceholderText(QStringLiteral("Git Credentials"));
+    createCredentialWalletButton = new QPushButton(QStringLiteral("Create / Open Wallet…"), credentialsPanel);
     credentialsForm->addRow(QStringLiteral("Commit name (global)"), userNameEdit);
     credentialsForm->addRow(QStringLiteral("Commit email (global)"), emailEdit);
     credentialsForm->addRow(QStringLiteral("Credential storage (global)"), credentialHelperCombo);
+    credentialsForm->addRow(QStringLiteral("KWallet wallet"), credentialWalletEdit);
+    credentialsForm->addRow(QStringLiteral("KWallet folder"), credentialFolderEdit);
+    credentialsForm->addRow(createCredentialWalletButton);
     auto *saveIdentityButton = new QPushButton(QStringLiteral("Save Git Identity"), credentialsPanel);
     auto *configureHelperButton = new QPushButton(QStringLiteral("Configure Helper"), credentialsPanel);
-    auto *addCredentialButton = new QPushButton(QStringLiteral("Add / Update Credential…"), credentialsPanel);
+    auto *addCredentialButton = new QPushButton(QStringLiteral("Manage Access Tokens…"), credentialsPanel);
+    auto *manageSshKeysButton = new QPushButton(QStringLiteral("Manage SSH Keys…"), credentialsPanel);
     credentialsForm->addRow(saveIdentityButton, configureHelperButton);
     credentialsForm->addRow(addCredentialButton);
+    credentialsForm->addRow(manageSshKeysButton);
     credentialsForm->addRow(new QLabel(QStringLiteral("Credentials are passed to Git’s configured credential helper. The app does not save passwords in its own settings."), credentialsPanel));
+    const auto updateWalletControls = [this] {
+        const bool visible = credentialHelperCombo->currentData().toString() == QLatin1String("kwallet");
+        credentialWalletEdit->setVisible(visible);
+        credentialFolderEdit->setVisible(visible);
+        createCredentialWalletButton->setVisible(visible);
+    };
+    connect(credentialHelperCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, [updateWalletControls] { updateWalletControls(); });
+    connect(createCredentialWalletButton, &QPushButton::clicked, this, [this] { createCredentialWallet(); });
+    updateWalletControls();
     repositorySettingsPanel = new QWidget(rightTabs);
     repositorySettingsPanel->hide();
     auto *settingsLayout = new QVBoxLayout(repositorySettingsPanel);
@@ -1991,6 +2025,7 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     connect(saveIdentityButton, &QPushButton::clicked, this, [this] { saveIdentity(); });
     connect(configureHelperButton, &QPushButton::clicked, this, [this] { configureCredentialHelper(); });
     connect(addCredentialButton, &QPushButton::clicked, this, [this] { addCredential(); });
+    connect(manageSshKeysButton, &QPushButton::clicked, this, [this] { manageSshKeys(); });
     changesTree->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(changesTree, &QTreeWidget::customContextMenuRequested, this, [this](const QPoint &position) {
         QTreeWidgetItem *item = changesTree->itemAt(position);
@@ -2918,6 +2953,16 @@ void GitWorkspaceWindow::refreshIdentity()
 {
     userNameEdit->setText(gitOutput({QStringLiteral("config"), QStringLiteral("--get"), QStringLiteral("user.name")}));
     emailEdit->setText(gitOutput({QStringLiteral("config"), QStringLiteral("--get"), QStringLiteral("user.email")}));
+    const QString helper = gitOutput({QStringLiteral("config"), QStringLiteral("--global"), QStringLiteral("--get"), QStringLiteral("credential.helper")});
+    if (helper.contains(QStringLiteral("git-credential-kwallet"))) {
+        credentialHelperCombo->setCurrentIndex(credentialHelperCombo->findData(QStringLiteral("kwallet")));
+        const QRegularExpression walletExpression(QStringLiteral("--wallet\\s+'([^']*)'\\s+--folder\\s+'([^']*)'"));
+        const QRegularExpressionMatch match = walletExpression.match(helper);
+        if (match.hasMatch()) {
+            credentialWalletEdit->setText(match.captured(1));
+            credentialFolderEdit->setText(match.captured(2));
+        }
+    }
 }
 
 void GitWorkspaceWindow::runGit(const QStringList &arguments)
@@ -3326,15 +3371,72 @@ void GitWorkspaceWindow::saveIdentity()
 
 void GitWorkspaceWindow::configureCredentialHelper()
 {
-    const QString helper = credentialHelperCombo->currentData().toString();
+    QString helper = credentialHelperCombo->currentData().toString();
     if (helper.isEmpty()) {
         QMessageBox::information(this, QStringLiteral("Credential helper"),
             gitOutput({QStringLiteral("config"), QStringLiteral("--show-origin"), QStringLiteral("--get-all"), QStringLiteral("credential.helper")}));
         return;
     }
+    if (helper == QLatin1String("kwallet")) {
+        const QString helperPath = kwalletCredentialHelperPath();
+        if (helperPath.isEmpty()) {
+            QMessageBox::warning(this, QStringLiteral("KWallet helper unavailable"),
+                QStringLiteral("The KWallet Git credential helper was not found. Rebuild or reinstall Shell Scratchpad to install it."));
+            return;
+        }
+        const QString wallet = credentialWalletEdit->text().trimmed();
+        const QString folder = credentialFolderEdit->text().trimmed();
+        if (wallet.isEmpty() || folder.isEmpty()) {
+            QMessageBox::warning(this, QStringLiteral("KWallet location required"), QStringLiteral("Enter both a wallet and folder name."));
+            return;
+        }
+        const auto quote = [](QString value) {
+            value.replace(QLatin1Char('\''), QStringLiteral("'\\''"));
+            return QLatin1Char('\'') + value + QLatin1Char('\'');
+        };
+        helper = QStringLiteral("!") + quote(helperPath) + QStringLiteral(" --wallet ") + quote(wallet)
+            + QStringLiteral(" --folder ") + quote(folder);
+    }
     int code = -1;
-    const QString output = gitOutput({QStringLiteral("config"), QStringLiteral("--global"), QStringLiteral("credential.helper"), helper}, &code);
+    const QString output = gitOutput({QStringLiteral("config"), QStringLiteral("--global"), QStringLiteral("--replace-all"),
+        QStringLiteral("credential.helper"), helper}, &code);
     statusBar()->showMessage(code == 0 ? QStringLiteral("Credential helper configured") : output, 5000);
+}
+
+void GitWorkspaceWindow::createCredentialWallet()
+{
+    const QString wallet = credentialWalletEdit->text().trimmed();
+    const QString folder = credentialFolderEdit->text().trimmed();
+    if (wallet.isEmpty() || folder.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("KWallet location required"), QStringLiteral("Enter both a wallet and folder name."));
+        return;
+    }
+    const QString helperPath = kwalletCredentialHelperPath();
+    if (helperPath.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("KWallet helper unavailable"),
+            QStringLiteral("The KWallet Git credential helper was not found. Rebuild or reinstall Shell Scratchpad to install it."));
+        return;
+    }
+    auto *process = new QProcess(this);
+    process->setProgram(helperPath);
+    process->setArguments({QStringLiteral("--create-wallet"), QStringLiteral("--wallet"), wallet,
+        QStringLiteral("--folder"), folder});
+    connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+        [this, process, wallet](int exitCode, QProcess::ExitStatus) {
+            const QString error = QString::fromLocal8Bit(process->readAllStandardError()).trimmed();
+            if (exitCode == 0)
+                statusBar()->showMessage(QStringLiteral("KWallet “%1” is ready. Configure KWallet as the credential helper to use it.").arg(wallet), 6000);
+            else QMessageBox::warning(this, QStringLiteral("Could not create or open KWallet"),
+                error.isEmpty() ? QStringLiteral("KWallet could not open the requested wallet.") : error);
+            process->deleteLater();
+        });
+    connect(process, &QProcess::errorOccurred, this, [this, process](QProcess::ProcessError error) {
+        if (error != QProcess::FailedToStart) return;
+        QMessageBox::warning(this, QStringLiteral("Could not start KWallet helper"), process->errorString());
+        process->deleteLater();
+    });
+    process->start();
+    statusBar()->showMessage(QStringLiteral("Opening KWallet; enter a new password if prompted…"), 5000);
 }
 
 void GitWorkspaceWindow::addCredential()
@@ -3347,45 +3449,301 @@ void GitWorkspaceWindow::addCredential()
         return;
     }
     QDialog dialog(this);
-    dialog.setWindowTitle(QStringLiteral("Add Git credential"));
-    dialog.setMinimumWidth(640);
-    dialog.resize(680, dialog.sizeHint().height());
-    auto *form = new QFormLayout(&dialog);
+    dialog.setWindowTitle(QStringLiteral("Manage Git Access Tokens"));
+    dialog.setMinimumSize(620, 480);
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *form = new QFormLayout;
+    auto *protocol = new QComboBox(&dialog);
+    protocol->addItem(QStringLiteral("HTTPS"), QStringLiteral("https"));
+    protocol->addItem(QStringLiteral("HTTP"), QStringLiteral("http"));
     auto *host = new QLineEdit(&dialog);
+    host->setPlaceholderText(QStringLiteral("github.com"));
+    auto *path = new QLineEdit(&dialog);
+    path->setPlaceholderText(QStringLiteral("Optional; use for repository-specific tokens"));
     auto *username = new QLineEdit(&dialog);
     auto *password = new QLineEdit(&dialog);
     password->setEchoMode(QLineEdit::Password);
-    form->addRow(QStringLiteral("Host (e.g. github.com)"), host);
+    password->setPlaceholderText(QStringLiteral("Enter a token to add or replace it"));
+    form->addRow(QStringLiteral("Service"), protocol);
+    form->addRow(QStringLiteral("Host"), host);
+    form->addRow(QStringLiteral("Repository path (optional)"), path);
     form->addRow(QStringLiteral("Username"), username);
-    form->addRow(QStringLiteral("Token / password"), password);
-    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel, &dialog);
-    form->addRow(buttons);
-    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    if (dialog.exec() != QDialog::Accepted) return;
-    if (host->text().trimmed().isEmpty() || username->text().isEmpty() || password->text().isEmpty()) {
-        QMessageBox::warning(this, QStringLiteral("Credential incomplete"), QStringLiteral("Enter host, username, and token."));
-        return;
-    }
-    QProcess process;
-    process.setProgram(gitExecutable());
-    process.setArguments({QStringLiteral("credential"), QStringLiteral("approve")});
-    process.setWorkingDirectory(repoPath);
-    process.start();
-    if (!process.waitForStarted()) {
-        QMessageBox::warning(this, QStringLiteral("Git unavailable"), process.errorString());
-        return;
-    }
-    const QByteArray input = QByteArray("protocol=https\nhost=") + host->text().trimmed().toUtf8()
-        + QByteArray("\nusername=") + username->text().toUtf8()
-        + QByteArray("\npassword=") + password->text().toUtf8() + QByteArray("\n\n");
-    process.write(input);
-    process.closeWriteChannel();
-    password->clear();
-    if (!process.waitForFinished(10000) || process.exitCode() != 0)
-        QMessageBox::warning(this, QStringLiteral("Credential was not stored"), QString::fromLocal8Bit(process.readAllStandardError()));
-    else
-        statusBar()->showMessage(QStringLiteral("Credential passed to Git’s configured helper"), 5000);
+    form->addRow(QStringLiteral("Access token"), password);
+    layout->addLayout(form);
+    layout->addWidget(new QLabel(QStringLiteral("Saved token contexts (token values stay in Git’s configured credential helper):"), &dialog));
+    auto *savedContexts = new QListWidget(&dialog);
+    layout->addWidget(savedContexts, 1);
+    auto *actions = new QHBoxLayout;
+    auto *saveButton = new QPushButton(QStringLiteral("Add / Replace Token"), &dialog);
+    auto *removeButton = new QPushButton(QStringLiteral("Remove Selected Token"), &dialog);
+    auto *closeButton = new QPushButton(QStringLiteral("Close"), &dialog);
+    actions->addWidget(saveButton);
+    actions->addWidget(removeButton);
+    actions->addStretch(1);
+    actions->addWidget(closeButton);
+    layout->addLayout(actions);
+
+    const auto contextText = [](const QStringList &parts) {
+        const QString service = parts.value(0) + QStringLiteral("://") + parts.value(1);
+        const QString pathPart = parts.value(2).isEmpty() ? QString() : QStringLiteral("/") + parts.value(2);
+        const QString userPart = parts.value(3).isEmpty() ? QString() : QStringLiteral(" — ") + parts.value(3);
+        return service + pathPart + userPart;
+    };
+    const auto loadContexts = [savedContexts, contextText] {
+        savedContexts->clear();
+        const QStringList records = QSettings().value(QStringLiteral("gitWorkspace/savedAccessTokenContexts")).toStringList();
+        for (const QString &record : records) {
+            const QStringList parts = record.split(QLatin1Char('\t'), Qt::KeepEmptyParts);
+            if (parts.size() != 4) continue;
+            auto *item = new QListWidgetItem(contextText(parts), savedContexts);
+            item->setData(Qt::UserRole, parts);
+        }
+    };
+    loadContexts();
+    connect(savedContexts, &QListWidget::currentItemChanged, &dialog, [=](QListWidgetItem *item) {
+        if (!item) return;
+        const QStringList parts = item->data(Qt::UserRole).toStringList();
+        protocol->setCurrentIndex(protocol->findData(parts.value(0)));
+        host->setText(parts.value(1));
+        path->setText(parts.value(2));
+        username->setText(parts.value(3));
+        password->clear();
+    });
+    const auto runCredential = [this](const QString &operation, const QStringList &context, const QString &secret, QString *error) {
+        QProcess process;
+        process.setProgram(gitExecutable());
+        process.setArguments({QStringLiteral("credential"), operation});
+        process.setWorkingDirectory(repoPath);
+        process.start();
+        if (!process.waitForStarted()) { if (error) *error = process.errorString(); return false; }
+        QByteArray input = QByteArray("protocol=") + context.value(0).toUtf8()
+            + QByteArray("\nhost=") + context.value(1).toUtf8();
+        if (!context.value(2).isEmpty()) input += QByteArray("\npath=") + context.value(2).toUtf8();
+        if (!context.value(3).isEmpty()) input += QByteArray("\nusername=") + context.value(3).toUtf8();
+        if (operation == QLatin1String("approve")) input += QByteArray("\npassword=") + secret.toUtf8();
+        input += QByteArray("\n\n");
+        process.write(input);
+        process.closeWriteChannel();
+        if (!process.waitForFinished(30000) || process.exitCode() != 0) {
+            if (error) *error = QString::fromLocal8Bit(process.readAllStandardError()).trimmed();
+            return false;
+        }
+        return true;
+    };
+    connect(saveButton, &QPushButton::clicked, &dialog, [&, this] {
+        const QStringList context{protocol->currentData().toString(), host->text().trimmed(), path->text().trimmed(), username->text().trimmed()};
+        const QString secret = password->text();
+        if (context.value(1).isEmpty() || context.value(3).isEmpty() || secret.isEmpty()
+            || secret.contains(QLatin1Char('\n')) || secret.contains(QLatin1Char('\r'))) {
+            QMessageBox::warning(&dialog, QStringLiteral("Token details required"),
+                QStringLiteral("Enter a host, username, and a single-line access token."));
+            return;
+        }
+        QString error;
+        if (!runCredential(QStringLiteral("approve"), context, secret, &error)) {
+            QMessageBox::warning(&dialog, QStringLiteral("Token was not stored"), error);
+            return;
+        }
+        QStringList records = QSettings().value(QStringLiteral("gitWorkspace/savedAccessTokenContexts")).toStringList();
+        const QString record = context.join(QLatin1Char('\t'));
+        records.removeAll(record);
+        records.append(record);
+        QSettings().setValue(QStringLiteral("gitWorkspace/savedAccessTokenContexts"), records);
+        password->clear();
+        loadContexts();
+        statusBar()->showMessage(QStringLiteral("Access token stored by Git’s configured credential helper."), 4000);
+    });
+    connect(removeButton, &QPushButton::clicked, &dialog, [&, this] {
+        QListWidgetItem *item = savedContexts->currentItem();
+        if (!item) return;
+        const QStringList context = item->data(Qt::UserRole).toStringList();
+        if (QMessageBox::question(&dialog, QStringLiteral("Remove access token"),
+                QStringLiteral("Remove the stored token for %1?").arg(contextText(context))) != QMessageBox::Yes) return;
+        QString error;
+        if (!runCredential(QStringLiteral("reject"), context, QString(), &error)) {
+            QMessageBox::warning(&dialog, QStringLiteral("Token was not removed"), error);
+            return;
+        }
+        QStringList records = QSettings().value(QStringLiteral("gitWorkspace/savedAccessTokenContexts")).toStringList();
+        records.removeAll(context.join(QLatin1Char('\t')));
+        QSettings().setValue(QStringLiteral("gitWorkspace/savedAccessTokenContexts"), records);
+        loadContexts();
+    });
+    connect(closeButton, &QPushButton::clicked, &dialog, &QDialog::accept);
+    dialog.exec();
+}
+
+void GitWorkspaceWindow::manageSshKeys()
+{
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("Manage SSH Keys"));
+    dialog.resize(780, 520);
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *keys = new QListWidget(&dialog);
+    auto *publicKey = new QPlainTextEdit(&dialog);
+    publicKey->setReadOnly(true);
+    publicKey->setPlaceholderText(QStringLiteral("Select a key to view its public key."));
+    layout->addWidget(new QLabel(QStringLiteral("SSH public keys found in ~/.ssh and keys added here:"), &dialog));
+    layout->addWidget(keys, 1);
+    layout->addWidget(publicKey, 1);
+    auto *actions = new QHBoxLayout;
+    auto *generateButton = new QPushButton(QStringLiteral("Generate Key Pair…"), &dialog);
+    auto *addExistingButton = new QPushButton(QStringLiteral("Add Existing Public Key…"), &dialog);
+    auto *copyButton = new QPushButton(QStringLiteral("Copy Public Key"), &dialog);
+    auto *agentButton = new QPushButton(QStringLiteral("Add Private Key to ssh-agent"), &dialog);
+    auto *deleteButton = new QPushButton(QStringLiteral("Delete Key Pair…"), &dialog);
+    auto *closeButton = new QPushButton(QStringLiteral("Close"), &dialog);
+    actions->addWidget(generateButton);
+    actions->addWidget(addExistingButton);
+    actions->addWidget(copyButton);
+    actions->addWidget(agentButton);
+    actions->addWidget(deleteButton);
+    actions->addStretch(1);
+    actions->addWidget(closeButton);
+    layout->addLayout(actions);
+
+    const QString homeSsh = QDir::home().filePath(QStringLiteral(".ssh"));
+    const auto refresh = [keys, publicKey, homeSsh] {
+        keys->clear();
+        QSet<QString> paths;
+        const QDir sshDirectory(homeSsh);
+        for (const QString &name : sshDirectory.entryList({QStringLiteral("*.pub")}, QDir::Files, QDir::Name))
+            paths.insert(sshDirectory.absoluteFilePath(name));
+        for (const QString &path : QSettings().value(QStringLiteral("gitWorkspace/managedSshPublicKeys")).toStringList())
+            if (QFileInfo::exists(path)) paths.insert(QFileInfo(path).absoluteFilePath());
+        QStringList sortedPaths = paths.values();
+        std::sort(sortedPaths.begin(), sortedPaths.end());
+        for (const QString &path : sortedPaths) {
+            auto *item = new QListWidgetItem(QStringLiteral("%1 — %2").arg(QFileInfo(path).fileName(), path), keys);
+            item->setData(Qt::UserRole, path);
+        }
+        publicKey->clear();
+    };
+    refresh();
+    connect(keys, &QListWidget::currentItemChanged, &dialog, [keys, publicKey](QListWidgetItem *item) {
+        if (!item) { publicKey->clear(); return; }
+        QFile file(item->data(Qt::UserRole).toString());
+        publicKey->setPlainText(file.open(QIODevice::ReadOnly) ? QString::fromUtf8(file.readAll()).trimmed()
+            : QStringLiteral("Could not read the selected public key."));
+    });
+    connect(generateButton, &QPushButton::clicked, &dialog, [this, &dialog, refresh, homeSsh] {
+        QDialog generate(&dialog);
+        generate.setWindowTitle(QStringLiteral("Generate SSH Key Pair"));
+        auto *form = new QFormLayout(&generate);
+        auto *type = new QComboBox(&generate);
+        type->addItem(QStringLiteral("Ed25519 (recommended)"), QStringLiteral("ed25519"));
+        type->addItem(QStringLiteral("RSA 4096-bit"), QStringLiteral("rsa"));
+        auto *comment = new QLineEdit(emailEdit->text().trimmed(), &generate);
+        auto *pathEdit = new QLineEdit(QDir(homeSsh).filePath(QStringLiteral("id_ed25519")), &generate);
+        auto *passphrase = new QLineEdit(&generate);
+        passphrase->setEchoMode(QLineEdit::Password);
+        passphrase->setPlaceholderText(QStringLiteral("Optional passphrase"));
+        form->addRow(QStringLiteral("Key type"), type);
+        form->addRow(QStringLiteral("Comment"), comment);
+        form->addRow(QStringLiteral("Save private key as"), pathEdit);
+        form->addRow(QStringLiteral("Passphrase"), passphrase);
+        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &generate);
+        buttons->button(QDialogButtonBox::Ok)->setText(QStringLiteral("Generate"));
+        form->addRow(buttons);
+        connect(type, qOverload<int>(&QComboBox::currentIndexChanged), &generate, [type, pathEdit, homeSsh](int index) {
+            const QString leaf = index == 0 ? QStringLiteral("id_ed25519") : QStringLiteral("id_rsa");
+            if (pathEdit->text() == QDir(homeSsh).filePath(QStringLiteral("id_ed25519"))
+                || pathEdit->text() == QDir(homeSsh).filePath(QStringLiteral("id_rsa")))
+                pathEdit->setText(QDir(homeSsh).filePath(leaf));
+        });
+        connect(buttons, &QDialogButtonBox::accepted, &generate, &QDialog::accept);
+        connect(buttons, &QDialogButtonBox::rejected, &generate, &QDialog::reject);
+        if (generate.exec() != QDialog::Accepted) return;
+        QString privatePath = pathEdit->text().trimmed();
+        if (privatePath == QStringLiteral("~")) privatePath = QDir::homePath();
+        else if (privatePath.startsWith(QStringLiteral("~/"))) privatePath = QDir::home().filePath(privatePath.mid(2));
+        privatePath = QFileInfo(privatePath).absoluteFilePath();
+        if (privatePath.isEmpty() || comment->text().contains(QLatin1Char('\n'))
+            || passphrase->text().contains(QLatin1Char('\n'))) {
+            QMessageBox::warning(&generate, QStringLiteral("Invalid key details"), QStringLiteral("Enter a valid key path and single-line comment/passphrase."));
+            return;
+        }
+        const QString publicPath = privatePath + QStringLiteral(".pub");
+        if (QFileInfo::exists(privatePath) || QFileInfo::exists(publicPath)) {
+            if (QMessageBox::question(&generate, QStringLiteral("Overwrite SSH key?"),
+                    QStringLiteral("A key file already exists at this path. Replace the existing key pair?")) != QMessageBox::Yes) return;
+            QFile::remove(privatePath);
+            QFile::remove(publicPath);
+        }
+        QDir().mkpath(QFileInfo(privatePath).absolutePath());
+        QProcess process;
+        process.setProgram(QStringLiteral("ssh-keygen"));
+        QStringList arguments{QStringLiteral("-t"), type->currentData().toString(), QStringLiteral("-C"), comment->text().trimmed(),
+            QStringLiteral("-f"), privatePath, QStringLiteral("-N"), passphrase->text()};
+        if (type->currentData().toString() == QLatin1String("rsa")) arguments << QStringLiteral("-b") << QStringLiteral("4096");
+        process.setArguments(arguments);
+        process.start();
+        if (!process.waitForStarted() || !process.waitForFinished(60000) || process.exitCode() != 0) {
+            const QString processError = process.errorString();
+            const QString standardError = QString::fromLocal8Bit(process.readAllStandardError()).trimmed();
+            QFile::remove(privatePath);
+            QFile::remove(publicPath);
+            QMessageBox::warning(&generate, QStringLiteral("SSH key generation failed"),
+                standardError.isEmpty() ? processError : standardError);
+            return;
+        }
+        passphrase->clear();
+        refresh();
+    });
+    connect(addExistingButton, &QPushButton::clicked, &dialog, [this, &dialog, refresh] {
+        const QString path = QFileDialog::getOpenFileName(&dialog, QStringLiteral("Add SSH Public Key"),
+            QDir::home().filePath(QStringLiteral(".ssh")), QStringLiteral("SSH public keys (*.pub);;All files (*)"));
+        if (path.isEmpty()) return;
+        const QString privatePath = path.endsWith(QStringLiteral(".pub")) ? path.left(path.size() - 4) : path;
+        if (!QFileInfo::exists(privatePath)) {
+            QMessageBox::warning(&dialog, QStringLiteral("Private key missing"), QStringLiteral("The matching private key file was not found."));
+            return;
+        }
+        QStringList paths = QSettings().value(QStringLiteral("gitWorkspace/managedSshPublicKeys")).toStringList();
+        const QString absolutePath = QFileInfo(path).absoluteFilePath();
+        if (!paths.contains(absolutePath)) paths.append(absolutePath);
+        QSettings().setValue(QStringLiteral("gitWorkspace/managedSshPublicKeys"), paths);
+        refresh();
+    });
+    connect(copyButton, &QPushButton::clicked, &dialog, [this, keys] {
+        if (!keys->currentItem()) return;
+        QFile file(keys->currentItem()->data(Qt::UserRole).toString());
+        if (file.open(QIODevice::ReadOnly)) {
+            QApplication::clipboard()->setText(QString::fromUtf8(file.readAll()).trimmed());
+            statusBar()->showMessage(QStringLiteral("Public key copied to clipboard."), 3000);
+        }
+    });
+    connect(agentButton, &QPushButton::clicked, &dialog, [this, &dialog, keys] {
+        if (!keys->currentItem()) return;
+        QString privatePath = keys->currentItem()->data(Qt::UserRole).toString();
+        if (privatePath.endsWith(QStringLiteral(".pub"))) privatePath.chop(4);
+        QProcess process;
+        process.setProgram(QStringLiteral("ssh-add"));
+        process.setArguments({privatePath});
+        process.start();
+        if (!process.waitForStarted() || !process.waitForFinished(15000) || process.exitCode() != 0)
+            QMessageBox::warning(&dialog, QStringLiteral("Could not add key to ssh-agent"),
+                QString::fromLocal8Bit(process.readAllStandardError()).trimmed());
+        else statusBar()->showMessage(QStringLiteral("SSH private key added to ssh-agent."), 4000);
+    });
+    connect(deleteButton, &QPushButton::clicked, &dialog, [this, &dialog, keys, refresh] {
+        if (!keys->currentItem()) return;
+        const QString publicPath = keys->currentItem()->data(Qt::UserRole).toString();
+        QString privatePath = publicPath;
+        if (privatePath.endsWith(QStringLiteral(".pub"))) privatePath.chop(4);
+        if (QMessageBox::question(&dialog, QStringLiteral("Delete SSH key pair?"),
+                QStringLiteral("Permanently delete both key files?\n%1\n%2").arg(privatePath, publicPath)) != QMessageBox::Yes) return;
+        const bool privateRemoved = !QFileInfo::exists(privatePath) || QFile::remove(privatePath);
+        const bool publicRemoved = !QFileInfo::exists(publicPath) || QFile::remove(publicPath);
+        QStringList paths = QSettings().value(QStringLiteral("gitWorkspace/managedSshPublicKeys")).toStringList();
+        paths.removeAll(publicPath);
+        QSettings().setValue(QStringLiteral("gitWorkspace/managedSshPublicKeys"), paths);
+        if (!privateRemoved || !publicRemoved)
+            QMessageBox::warning(&dialog, QStringLiteral("Could not delete key pair"), QStringLiteral("One or both key files could not be removed."));
+        refresh();
+    });
+    connect(closeButton, &QPushButton::clicked, &dialog, &QDialog::accept);
+    dialog.exec();
 }
 
 void GitWorkspaceWindow::appendOutput(const QString &text)

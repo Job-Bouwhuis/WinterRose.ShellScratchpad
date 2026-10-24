@@ -7,7 +7,7 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
-find_package(Qt6 6.12 REQUIRED COMPONENTS Core Widgets)
+find_package(Qt6 6.12 REQUIRED COMPONENTS Core Widgets DBus)
 
 add_library(shell-scratchpad-syntax STATIC
     src/syntax/SyntaxToken.h
@@ -57,6 +57,12 @@ add_executable(shell-scratchpad
 target_link_libraries(shell-scratchpad PRIVATE Qt6::Widgets shell-scratchpad-syntax)
 target_compile_options(shell-scratchpad PRIVATE -Wall -Wextra -Wpedantic)
 
+add_executable(git-credential-kwallet
+    src/git/KWalletCredentialHelper.cpp
+)
+target_link_libraries(git-credential-kwallet PRIVATE Qt6::Core Qt6::DBus)
+target_compile_options(git-credential-kwallet PRIVATE -Wall -Wextra -Wpedantic)
+
 include(CTest)
 if(BUILD_TESTING)
     add_executable(shell-scratchpad-syntax-tests
@@ -95,6 +101,7 @@ endif()
 
 include(GNUInstallDirs)
 install(TARGETS shell-scratchpad RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS git-credential-kwallet RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES packaging/org.winterrose.shellscratchpad.desktop
         packaging/org.winterrose.shellscratchpad-git.desktop
         DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)

@@ -108,6 +108,9 @@ private:
     QLineEdit *userNameEdit = nullptr;
     QLineEdit *emailEdit = nullptr;
     QComboBox *credentialHelperCombo = nullptr;
+    QLineEdit *credentialWalletEdit = nullptr;
+    QLineEdit *credentialFolderEdit = nullptr;
+    QPushButton *createCredentialWalletButton = nullptr;
     QPlainTextEdit *commandOutput = nullptr;
     QLineEdit *commandInput = nullptr;
     QTextDocument *commandOutputDocument = nullptr;
@@ -171,8 +174,10 @@ private:
     void showCommit(const QString &hash);
     void showCommitFile(const QString &path, const QString &oldPath = QString());
     void addCredential();
+    void manageSshKeys();
     void saveIdentity();
     void configureCredentialHelper();
+    void createCredentialWallet();
     void refreshRepositorySettings();
     void applyRepositorySettings();
     void editRepositorySetting(QTreeWidgetItem *item);
