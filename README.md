@@ -56,6 +56,16 @@ For an existing WSL 2 distribution with WSLg enabled, run `./setup-wsl2.sh` from
 
 For a new WSL setup, keep `setup-from-scratch-wsl2.ps1`, `setup-wsl2.sh`, and `clone-and-setup.sh` together and run the PowerShell script as Administrator. It installs or updates WSL2, then lets you choose an installed WSL distribution or create a clean Ubuntu 24.04 instance named `shell-scratchpad-host`. It copies both Bash scripts into the chosen distribution and runs `setup-wsl2.sh`. That script calls its adjacent `clone-and-setup.sh`, which installs Git if needed, clones the app repository, installs build prerequisites, builds and installs the app, and then configures its Windows Desktop and Start menu shortcuts. If Windows requires a restart to enable WSL, restart and rerun the PowerShell script.
 
+### Native Windows Git client
+
+The native Windows build is a Git-only app. It reuses the same Git workspace source as the Linux application and starts directly in the Git workspace; the Bash scratchpad window and script execution flow are not included. It runs directly on Windows and does not require WSL. Install Git for Windows and a Qt 6.12+ MSVC build, then open a Visual Studio developer PowerShell and run:
+
+```powershell
+./package-windows.ps1 -QtRoot 'C:/Qt/6.12.0/msvc2022_64'
+```
+
+The script builds `shell-scratchpad-git.exe` and deploys the Qt runtime beside it in `build/windows-release`. The Git client expects Git for Windows on `PATH`; Git Credential Manager is recommended for HTTPS authentication. Git for Windows supplies `ssh`, `ssh-keygen`, and `ssh-add` for SSH operations.
+
 ## Manual build
 
 Install a C++ compiler, CMake, and Qt 6.12 or newer Core and Widgets development files from your distribution's package manager. Then run:

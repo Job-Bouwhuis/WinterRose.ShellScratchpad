@@ -1664,9 +1664,11 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     credentialHelperCombo = new QComboBox(credentialsPanel);
     credentialHelperCombo->addItem(QStringLiteral("Keep current helper"), QString());
     credentialHelperCombo->addItem(QStringLiteral("Git Credential Manager"), QStringLiteral("manager"));
+#ifndef Q_OS_WIN
     credentialHelperCombo->addItem(QStringLiteral("GNOME Keyring / libsecret"), QStringLiteral("/usr/lib/git-core/git-credential-libsecret"));
     credentialHelperCombo->addItem(QStringLiteral("KWallet"), QStringLiteral("kwallet"));
     credentialHelperCombo->addItem(QStringLiteral("Temporary in-memory cache"), QStringLiteral("cache --timeout=3600"));
+#endif
     credentialHelperCombo->addItem(QStringLiteral("Plain-text store (not recommended)"), QStringLiteral("store"));
     credentialWalletEdit = new QLineEdit(QStringLiteral("git-credentials"), credentialsPanel);
     credentialWalletEdit->setPlaceholderText(QStringLiteral("git-credentials"));
@@ -1676,9 +1678,11 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     credentialsForm->addRow(QStringLiteral("Commit name (global)"), userNameEdit);
     credentialsForm->addRow(QStringLiteral("Commit email (global)"), emailEdit);
     credentialsForm->addRow(QStringLiteral("Credential storage (global)"), credentialHelperCombo);
+#ifndef Q_OS_WIN
     credentialsForm->addRow(QStringLiteral("KWallet wallet"), credentialWalletEdit);
     credentialsForm->addRow(QStringLiteral("KWallet folder"), credentialFolderEdit);
     credentialsForm->addRow(createCredentialWalletButton);
+#endif
     auto *saveIdentityButton = new QPushButton(QStringLiteral("Save Git Identity"), credentialsPanel);
     auto *configureHelperButton = new QPushButton(QStringLiteral("Configure Helper"), credentialsPanel);
     auto *addCredentialButton = new QPushButton(QStringLiteral("Manage Access Tokens…"), credentialsPanel);
@@ -1688,7 +1692,11 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     credentialsForm->addRow(manageSshKeysButton);
     credentialsForm->addRow(new QLabel(QStringLiteral("Credentials are passed to Git’s configured credential helper. The app does not save passwords in its own settings."), credentialsPanel));
     const auto updateWalletControls = [this] {
+#ifdef Q_OS_WIN
+        const bool visible = false;
+#else
         const bool visible = credentialHelperCombo->currentData().toString() == QLatin1String("kwallet");
+#endif
         credentialWalletEdit->setVisible(visible);
         credentialFolderEdit->setVisible(visible);
         createCredentialWalletButton->setVisible(visible);
