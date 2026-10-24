@@ -39,6 +39,7 @@
 #include <QProcess>
 #include <QRegularExpression>
 #include <QPushButton>
+#include <QKeyEvent>
 #include <QRegularExpression>
 #include <QStatusBar>
 #include <QProgressBar>
@@ -53,6 +54,7 @@
 #include <QGridLayout>
 #include <QVBoxLayout>
 #include <functional>
+#include <utility>
 #include <QFileInfo>
 #include <QHash>
 #include <QFileDialog>
@@ -79,6 +81,46 @@
 
 namespace ShellScratchpad::Git
 {
+namespace
+{
+class CommitMessageShortcutFilter final : public QObject
+{
+public:
+    CommitMessageShortcutFilter(QObject *parent, std::function<void()> commit,
+                                std::function<void()> commitAndPush)
+        : QObject(parent), commit(std::move(commit)), commitAndPush(std::move(commitAndPush))
+    {
+    }
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        Q_UNUSED(watched);
+        if (event->type() != QEvent::KeyPress) return false;
+        auto *keyEvent = static_cast<QKeyEvent *>(event);
+        if (keyEvent->key() != Qt::Key_Return && keyEvent->key() != Qt::Key_Enter) return false;
+
+        const Qt::KeyboardModifiers shortcutModifiers = keyEvent->modifiers()
+            & (Qt::ControlModifier | Qt::ShiftModifier | Qt::AltModifier | Qt::MetaModifier);
+        if (shortcutModifiers == Qt::ControlModifier) {
+            commit();
+            keyEvent->accept();
+            return true;
+        }
+        if (shortcutModifiers == (Qt::ControlModifier | Qt::ShiftModifier)) {
+            commitAndPush();
+            keyEvent->accept();
+            return true;
+        }
+        return false;
+    }
+
+private:
+    std::function<void()> commit;
+    std::function<void()> commitAndPush;
+};
+}
+
 class ImagePreviewLabel final : public QLabel
 {
 public:
@@ -2950,6 +2992,12 @@ void GitWorkspaceWindow::showCommitDialog()
     connect(commitPush, &QPushButton::clicked, &dialog, [&acceptCommit] { acceptCommit(true); });
     connect(commitOnly, &QPushButton::clicked, &dialog, [&acceptCommit] { acceptCommit(false); });
     connect(cancel, &QPushButton::clicked, &dialog, &QDialog::reject);
+    messageEdit->installEventFilter(new CommitMessageShortcutFilter(messageEdit,
+        [&acceptCommit] { acceptCommit(false); }, [&acceptCommit] { acceptCommit(true); }));
+    commitOnly->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Return));
+    commitOnly->setToolTip(QStringLiteral("Ctrl+Enter"));
+    commitPush->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Return));
+    commitPush->setToolTip(QStringLiteral("Ctrl+Shift+Enter"));
     messageEdit->setFocus();
     if (dialog.exec() != QDialog::Accepted) return;
     pushAfterCommit = dialog.property("pushAfterCommit").toBool();
