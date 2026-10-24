@@ -61,10 +61,10 @@ For a new WSL setup, keep `setup-from-scratch-wsl2.ps1`, `setup-wsl2.sh`, and `c
 The native Windows build is a Git-only app. It reuses the same Git workspace source as the Linux application and starts directly in the Git workspace; the Bash scratchpad window and script execution flow are not included. It runs directly on Windows and does not require WSL. Install Git for Windows and a Qt 6.12+ MSVC build, then open a Visual Studio developer PowerShell and run:
 
 ```powershell
-./package-windows.ps1 -QtRoot 'C:/Qt/6.12.0/msvc2022_64'
+./package-windows.ps1
 ```
 
-The script builds `shell-scratchpad-git.exe` and deploys the Qt runtime beside it in `build/windows-release`. The Git client expects Git for Windows on `PATH`; Git Credential Manager is recommended for HTTPS authentication. Git for Windows supplies `ssh`, `ssh-keygen`, and `ssh-add` for SSH operations.
+The script checks for Git for Windows, CMake, Python, and Qt. When Git, CMake, or Python is missing, it installs them with `winget`; when Qt is missing, it installs Qt 6.12.0 for MSVC 2022 using `aqtinstall`. You can pass `-QtRoot 'C:/Qt/6.12.0/msvc2022_64'` to use an existing Qt installation. The script builds `shell-scratchpad-git.exe` and deploys the Qt runtime beside it in `build/windows-release`. Visual Studio 2022 or Build Tools with the C++ workload must be installed, and the script must run from a Developer PowerShell. Git Credential Manager is recommended for HTTPS authentication. Git for Windows supplies `ssh`, `ssh-keygen`, and `ssh-add` for SSH operations.
 
 ## Manual build
 
