@@ -5,6 +5,7 @@
 #include <QPointer>
 #include <QStringList>
 #include <QVector>
+#include <QHash>
 #include "RepositoryWorkspace.h"
 
 class QComboBox;
@@ -19,6 +20,7 @@ class QMenu;
 class QPlainTextEdit;
 class QProcess;
 class QProgressBar;
+class QPushButton;
 class QWidget;
 class QTimer;
 class QPoint;
@@ -79,6 +81,8 @@ private:
     QListWidget *historyList = nullptr;
     QListWidget *remotesList = nullptr;
     QTreeWidget *repositorySettingsTree = nullptr;
+    QHash<QString, QComboBox *> repositorySettingControls;
+    QPushButton *applyRepositorySettingsButton = nullptr;
     QWidget *commandPanel = nullptr;
     QWidget *remotesPanel = nullptr;
     QWidget *credentialsPanel = nullptr;
@@ -170,6 +174,7 @@ private:
     void saveIdentity();
     void configureCredentialHelper();
     void refreshRepositorySettings();
+    void applyRepositorySettings();
     void editRepositorySetting(QTreeWidgetItem *item);
     void addRepositorySetting();
     void removeRepositorySetting(QTreeWidgetItem *item);

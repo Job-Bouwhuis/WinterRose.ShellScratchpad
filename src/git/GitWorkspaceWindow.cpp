@@ -229,6 +229,72 @@ private:
 
 namespace
 {
+struct RepositorySettingDefinition
+{
+    QString key;
+    QString label;
+    QStringList labels;
+    QStringList values;
+};
+
+const QVector<RepositorySettingDefinition> &repositorySettingDefinitions()
+{
+    static const QVector<RepositorySettingDefinition> definitions{
+        {QStringLiteral("core.autocrlf"), QStringLiteral("Line ending conversion"),
+            {QStringLiteral("Use inherited setting"), QStringLiteral("Off"), QStringLiteral("Convert on commit"), QStringLiteral("Convert on checkout and commit")},
+            {QStringLiteral("__inherit__"), QStringLiteral("false"), QStringLiteral("input"), QStringLiteral("true")}},
+        {QStringLiteral("core.filemode"), QStringLiteral("Track executable bit changes"),
+            {QStringLiteral("Use inherited setting"), QStringLiteral("On"), QStringLiteral("Off")},
+            {QStringLiteral("__inherit__"), QStringLiteral("true"), QStringLiteral("false")}},
+        {QStringLiteral("pull.rebase"), QStringLiteral("Pull strategy"),
+            {QStringLiteral("Use inherited setting"), QStringLiteral("Merge commits"), QStringLiteral("Rebase local commits"), QStringLiteral("Rebase and preserve merges"), QStringLiteral("Interactive rebase")},
+            {QStringLiteral("__inherit__"), QStringLiteral("false"), QStringLiteral("true"), QStringLiteral("merges"), QStringLiteral("interactive")}},
+        {QStringLiteral("pull.ff"), QStringLiteral("Allow pull fast-forward"),
+            {QStringLiteral("Use inherited setting"), QStringLiteral("When possible"), QStringLiteral("Never"), QStringLiteral("Only fast-forward")},
+            {QStringLiteral("__inherit__"), QStringLiteral("true"), QStringLiteral("false"), QStringLiteral("only")}},
+        {QStringLiteral("fetch.prune"), QStringLiteral("Prune deleted remote branches on fetch"),
+            {QStringLiteral("Use inherited setting"), QStringLiteral("On"), QStringLiteral("Off")},
+            {QStringLiteral("__inherit__"), QStringLiteral("true"), QStringLiteral("false")}},
+        {QStringLiteral("push.autoSetupRemote"), QStringLiteral("Set upstream on first push"),
+            {QStringLiteral("Use inherited setting"), QStringLiteral("On"), QStringLiteral("Off")},
+            {QStringLiteral("__inherit__"), QStringLiteral("true"), QStringLiteral("false")}},
+        {QStringLiteral("push.default"), QStringLiteral("Default push target"),
+            {QStringLiteral("Use inherited setting"), QStringLiteral("Current branch"), QStringLiteral("Upstream branch"), QStringLiteral("Same named branches"), QStringLiteral("Matching branches"), QStringLiteral("Nothing")},
+            {QStringLiteral("__inherit__"), QStringLiteral("current"), QStringLiteral("upstream"), QStringLiteral("simple"), QStringLiteral("matching"), QStringLiteral("nothing")}},
+        {QStringLiteral("merge.ff"), QStringLiteral("Merge fast-forward behavior"),
+            {QStringLiteral("Use inherited setting"), QStringLiteral("When possible"), QStringLiteral("Never"), QStringLiteral("Only fast-forward")},
+            {QStringLiteral("__inherit__"), QStringLiteral("true"), QStringLiteral("false"), QStringLiteral("only")}},
+        {QStringLiteral("commit.gpgsign"), QStringLiteral("Sign commits"),
+            {QStringLiteral("Use inherited setting"), QStringLiteral("On"), QStringLiteral("Off")},
+            {QStringLiteral("__inherit__"), QStringLiteral("true"), QStringLiteral("false")}},
+        {QStringLiteral("rebase.autoStash"), QStringLiteral("Automatically stash before rebase"),
+            {QStringLiteral("Use inherited setting"), QStringLiteral("On"), QStringLiteral("Off")},
+            {QStringLiteral("__inherit__"), QStringLiteral("true"), QStringLiteral("false")}},
+        {QStringLiteral("rebase.autosquash"), QStringLiteral("Autosquash fixup commits"),
+            {QStringLiteral("Use inherited setting"), QStringLiteral("On"), QStringLiteral("Off")},
+            {QStringLiteral("__inherit__"), QStringLiteral("true"), QStringLiteral("false")}},
+        {QStringLiteral("rerere.enabled"), QStringLiteral("Reuse recorded conflict resolutions"),
+            {QStringLiteral("Use inherited setting"), QStringLiteral("On"), QStringLiteral("Off")},
+            {QStringLiteral("__inherit__"), QStringLiteral("true"), QStringLiteral("false")}}
+    };
+    return definitions;
+}
+
+bool isManagedRepositorySetting(const QString &key)
+{
+    return key.startsWith(QStringLiteral("remote."), Qt::CaseInsensitive)
+        || key.startsWith(QStringLiteral("branch."), Qt::CaseInsensitive)
+        || key.compare(QStringLiteral("user.name"), Qt::CaseInsensitive) == 0
+        || key.compare(QStringLiteral("user.email"), Qt::CaseInsensitive) == 0
+        || key.compare(QStringLiteral("credential.helper"), Qt::CaseInsensitive) == 0;
+}
+
+bool isCuratedRepositorySetting(const QString &key)
+{
+    return std::any_of(repositorySettingDefinitions().cbegin(), repositorySettingDefinitions().cend(),
+        [&key](const RepositorySettingDefinition &setting) { return setting.key.compare(key, Qt::CaseInsensitive) == 0; });
+}
+
 enum class DiffLineKind { Unchanged, Added, Removed };
 struct DiffLine
 {
@@ -1599,7 +1665,20 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     repositorySettingsPanel = new QWidget(rightTabs);
     repositorySettingsPanel->hide();
     auto *settingsLayout = new QVBoxLayout(repositorySettingsPanel);
-    settingsLayout->addWidget(new QLabel(QStringLiteral("Repository-specific Git configuration. Changes apply only to this repository."), repositorySettingsPanel));
+    settingsLayout->addWidget(new QLabel(QStringLiteral("Common repository behavior settings. “Use inherited setting” removes this repository’s override. Git has many additional options; less common options remain available under Advanced."), repositorySettingsPanel));
+    auto *curatedSettingsForm = new QFormLayout;
+    for (const RepositorySettingDefinition &setting : repositorySettingDefinitions()) {
+        auto *control = new QComboBox(repositorySettingsPanel);
+        for (qsizetype i = 0; i < setting.labels.size(); ++i)
+            control->addItem(setting.labels.at(i), setting.values.at(i));
+        repositorySettingControls.insert(setting.key, control);
+        curatedSettingsForm->addRow(setting.label, control);
+    }
+    settingsLayout->addLayout(curatedSettingsForm);
+    applyRepositorySettingsButton = new QPushButton(QStringLiteral("Apply Repository Settings"), repositorySettingsPanel);
+    settingsLayout->addWidget(applyRepositorySettingsButton, 0, Qt::AlignLeft);
+    connect(applyRepositorySettingsButton, &QPushButton::clicked, this, [this] { applyRepositorySettings(); });
+    settingsLayout->addWidget(new QLabel(QStringLiteral("Advanced repository settings"), repositorySettingsPanel));
     repositorySettingsTree = new QTreeWidget(repositorySettingsPanel);
     repositorySettingsTree->setHeaderLabels({QStringLiteral("Setting"), QStringLiteral("Value")});
     repositorySettingsTree->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
@@ -2047,11 +2126,58 @@ void GitWorkspaceWindow::refreshRepositorySettings()
     for (const QString &line : output.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
         const qsizetype equals = line.indexOf(QLatin1Char('='));
         if (equals <= 0) continue;
+        const QString key = line.left(equals);
+        if (isManagedRepositorySetting(key) || isCuratedRepositorySetting(key)) continue;
         auto *item = new QTreeWidgetItem(repositorySettingsTree);
-        item->setText(0, line.left(equals));
+        item->setText(0, key);
         item->setText(1, line.mid(equals + 1));
         item->setToolTip(1, line.mid(equals + 1));
     }
+    for (const RepositorySettingDefinition &setting : repositorySettingDefinitions()) {
+        int code = -1;
+        const QString value = gitOutput({QStringLiteral("config"), QStringLiteral("--local"), QStringLiteral("--get"), setting.key}, &code);
+        QComboBox *control = repositorySettingControls.value(setting.key);
+        if (!control) continue;
+        while (control->count() > setting.labels.size()) control->removeItem(control->count() - 1);
+        const int valueIndex = code == 0 ? setting.values.indexOf(value) : 0;
+        if (valueIndex < 0) {
+            control->addItem(QStringLiteral("Other value: %1").arg(value), value);
+            control->setCurrentIndex(control->count() - 1);
+        } else control->setCurrentIndex(valueIndex);
+    }
+}
+
+void GitWorkspaceWindow::applyRepositorySettings()
+{
+    if (commandProcess->state() != QProcess::NotRunning || RepositoryOperationCoordinator::isBusy(repoPath)) {
+        statusBar()->showMessage(QStringLiteral("Wait for Git to finish before applying repository settings."), 4000);
+        return;
+    }
+    for (const RepositorySettingDefinition &setting : repositorySettingDefinitions()) {
+        QComboBox *control = repositorySettingControls.value(setting.key);
+        if (!control) continue;
+        const QString value = control->currentData().toString();
+        const bool inherited = value == QLatin1String("__inherit__");
+        int existingCode = -1;
+        const QString existing = gitOutput({QStringLiteral("config"), QStringLiteral("--local"), QStringLiteral("--get"), setting.key}, &existingCode);
+        if ((inherited && existingCode != 0) || (!inherited && existingCode == 0 && existing == value)) continue;
+
+        QProcess process;
+        process.setProgram(gitExecutable());
+        QStringList arguments{QStringLiteral("-C"), repoPath, QStringLiteral("config"), QStringLiteral("--local")};
+        if (inherited) arguments << QStringLiteral("--unset-all") << setting.key;
+        else arguments << QStringLiteral("--replace-all") << setting.key << value;
+        process.setArguments(arguments);
+        process.start();
+        if (!process.waitForFinished(5000) || process.exitCode() != 0) {
+            QMessageBox::warning(this, QStringLiteral("Could not apply repository setting"),
+                QStringLiteral("Git could not update %1:\n%2").arg(setting.key, QString::fromLocal8Bit(process.readAllStandardError()).trimmed()));
+            refreshRepositorySettings();
+            return;
+        }
+    }
+    refreshRepositorySettings();
+    statusBar()->showMessage(QStringLiteral("Repository settings applied."), 3000);
 }
 
 void GitWorkspaceWindow::addRepositorySetting()
@@ -2059,6 +2185,11 @@ void GitWorkspaceWindow::addRepositorySetting()
     bool accepted = false;
     const QString key = QInputDialog::getText(this, QStringLiteral("Add repository setting"), QStringLiteral("Git config key:"), QLineEdit::Normal, QString(), &accepted).trimmed();
     if (!accepted || key.isEmpty()) return;
+    if (isManagedRepositorySetting(key) || isCuratedRepositorySetting(key)) {
+        QMessageBox::information(this, QStringLiteral("Setting has a dedicated control"),
+            QStringLiteral("%1 is managed in its dedicated repository settings control or manager.").arg(key));
+        return;
+    }
     const QString value = QInputDialog::getText(this, QStringLiteral("Add repository setting"), QStringLiteral("Value:"), QLineEdit::Normal, QString(), &accepted);
     if (accepted) runGit({QStringLiteral("config"), QStringLiteral("--local"), QStringLiteral("--replace-all"), key, value});
 }
@@ -2066,6 +2197,7 @@ void GitWorkspaceWindow::addRepositorySetting()
 void GitWorkspaceWindow::editRepositorySetting(QTreeWidgetItem *item)
 {
     if (!item) return;
+    if (isManagedRepositorySetting(item->text(0)) || isCuratedRepositorySetting(item->text(0))) return;
     bool accepted = false;
     const QString value = QInputDialog::getText(this, QStringLiteral("Edit repository setting"), item->text(0), QLineEdit::Normal, item->text(1), &accepted);
     if (accepted) runGit({QStringLiteral("config"), QStringLiteral("--local"), QStringLiteral("--replace-all"), item->text(0), value});
@@ -2075,6 +2207,7 @@ void GitWorkspaceWindow::removeRepositorySetting(QTreeWidgetItem *item)
 {
     if (!item) return;
     const QString key = item->text(0);
+    if (isManagedRepositorySetting(key) || isCuratedRepositorySetting(key)) return;
     if (QMessageBox::question(this, QStringLiteral("Remove repository setting"), QStringLiteral("Remove all repository values for %1?").arg(key)) == QMessageBox::Yes)
         runGit({QStringLiteral("config"), QStringLiteral("--local"), QStringLiteral("--unset-all"), key});
 }
