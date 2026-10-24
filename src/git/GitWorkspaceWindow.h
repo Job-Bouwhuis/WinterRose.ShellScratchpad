@@ -4,6 +4,7 @@
 #include <QPointer>
 #include <QStringList>
 #include <QVector>
+#include "RepositoryWorkspace.h"
 
 class QComboBox;
 class QAction;
@@ -43,6 +44,8 @@ public:
 
 private:
     QString repoPath;
+    QString operationLockPath;
+    bool operationLockHeld = false;
     QTreeWidget *changesTree = nullptr;
     QTabWidget *rightTabs = nullptr;
     QToolButton *branchButton = nullptr;
@@ -53,6 +56,7 @@ private:
     QToolButton *pushButton = nullptr;
     QToolButton *moreButton = nullptr;
     QToolButton *conflictsButton = nullptr;
+    QToolButton *actionRepositoriesButton = nullptr;
     QAction *stageAllShortcutAction = nullptr;
     QAction *commitShortcutAction = nullptr;
     QAction *pushShortcutAction = nullptr;
@@ -66,6 +70,9 @@ private:
     QMenu *gitActionsMenu = nullptr;
     QVector<QPointer<QWidget>> busyDisabledWidgets;
     QTreeWidget *branchesList = nullptr;
+    QTreeWidget *workspaceRepositoryList = nullptr;
+    RepositoryWorkspace workspace;
+    bool workspaceAmbiguous = false;
     QListWidget *historyList = nullptr;
     QListWidget *remotesList = nullptr;
     QTreeWidget *repositorySettingsTree = nullptr;
@@ -146,6 +153,15 @@ private:
     void editRepositorySetting(QTreeWidgetItem *item);
     void addRepositorySetting();
     void removeRepositorySetting(QTreeWidgetItem *item);
+    void refreshWorkspaceRepositoryList();
+    void addWorkspaceRepository();
+    void removeWorkspaceRepository();
+    void locateWorkspaceRepository();
+    void switchRepository(const QString &repositoryId);
+    void showBatchOperations(const QString &initialOperation = QString());
+    QVector<WorkspaceRepository> actionRepositories() const;
+    bool actionsTargetOnlyActiveRepository() const;
+    void updateActionRepositoriesButton();
     void appendOutput(const QString &text);
     void sendCommandInput();
     void updateToolbarState();

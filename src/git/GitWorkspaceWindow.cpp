@@ -1,4 +1,6 @@
 #include "GitWorkspaceWindow.h"
+#include "BatchOperationsDialog.h"
+#include "RepositoryOperationCoordinator.h"
 
 #include "completion/CompletionController.h"
 #include "editor/CodeEditor.h"
@@ -42,14 +44,18 @@
 #include <QTextDocument>
 #include <QToolButton>
 #include <QTreeWidget>
+#include <QGridLayout>
 #include <QVBoxLayout>
 #include <functional>
 #include <QFileInfo>
+#include <QHash>
+#include <QFileDialog>
 #include <QFile>
 #include <QSaveFile>
 #include <QTextEdit>
 #include <QStackedWidget>
 #include <QScrollBar>
+#include <algorithm>
 
 #include <QTimer>
 #include <QCryptographicHash>
@@ -785,8 +791,35 @@ bool GitWorkspaceWindow::showCloneDialog(const QString &directory, QWidget *pare
 }
 
 GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *parent)
-    : QMainWindow(parent), repoPath(QDir(repositoryPath).absolutePath())
+    : QMainWindow(parent), repoPath(RepositoryWorkspaceStore::repositoryRoot(repositoryPath))
 {
+    if (repoPath.isEmpty()) repoPath = QDir(repositoryPath).absolutePath();
+    const QVector<RepositoryWorkspace> workspaceMatches = RepositoryWorkspaceStore::workspacesForRepository(repoPath);
+    if (workspaceMatches.size() == 1) {
+        workspace = workspaceMatches.first();
+    } else if (workspaceMatches.size() > 1) {
+        QStringList choices;
+        for (const RepositoryWorkspace &candidate : workspaceMatches) {
+            QStringList memberNames;
+            for (const WorkspaceRepository &entry : candidate.repositories)
+                memberNames.append(QFileInfo(entry.path).fileName());
+            choices.append(QStringLiteral("%1 — %2").arg(candidate.id, memberNames.join(QStringLiteral(", "))));
+        }
+        bool accepted = false;
+        const QString selected = QInputDialog::getItem(this, QStringLiteral("Choose Repository Workspace"),
+            QStringLiteral("This repository appears in more than one configured workspace:"), choices, 0, false, &accepted);
+        const int selectedIndex = accepted ? choices.indexOf(selected) : -1;
+        if (selectedIndex >= 0) workspace = workspaceMatches.at(selectedIndex);
+        else workspaceAmbiguous = true;
+    } else {
+        workspace = RepositoryWorkspaceStore::workspaceForRepository(repoPath, true);
+    }
+    for (const WorkspaceRepository &repository : workspace.repositories) {
+        if (QFileInfo(repository.path).canonicalFilePath() == QFileInfo(repoPath).canonicalFilePath()) {
+            repoPath = repository.path;
+            break;
+        }
+    }
     lastRepositoryFocusTimer = new QTimer(this);
     lastRepositoryFocusTimer->setSingleShot(true);
     lastRepositoryFocusTimer->setInterval(5000);
@@ -864,14 +897,16 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     commitButton->setText(QStringLiteral("Commit…"));
     commitButton->setToolTip(QStringLiteral("Commit staged changes"));
     connect(commitButton, &QToolButton::clicked, this, [this] {
-        showCommitDialog();
+        if (actionsTargetOnlyActiveRepository()) showCommitDialog();
+        else showBatchOperations(QStringLiteral("commit"));
     });
     stageAllButton = new QToolButton(root);
     stageAllButton->setText(QStringLiteral("Stage All"));
     stageAllButton->setToolTip(QStringLiteral("Stage all modified, deleted, and untracked files"));
     stageAllButton->setVisible(false);
     connect(stageAllButton, &QToolButton::clicked, this, [this] {
-        runGit({QStringLiteral("add"), QStringLiteral("-A")});
+        if (actionsTargetOnlyActiveRepository()) runGit({QStringLiteral("add"), QStringLiteral("-A")});
+        else showBatchOperations(QStringLiteral("stage"));
     });
     syncButton = new QToolButton(root);
     syncButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
@@ -883,6 +918,11 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     syncButton->setMenu(syncMenu);
     connect(syncMenu, &QMenu::aboutToShow, this, [this, syncMenu] {
         syncMenu->clear();
+        if (workspace.repositories.size() > 1 && !workspaceAmbiguous) {
+            QAction *workspaceSync = syncMenu->addAction(QStringLiteral("Synchronize selected repositories…"));
+            connect(workspaceSync, &QAction::triggered, this, [this] { showBatchOperations(QStringLiteral("sync")); });
+            syncMenu->addSeparator();
+        }
         if (hasRemote) {
             QAction *fetchAction = syncMenu->addAction(QStringLiteral("Fetch all remotes"));
             connect(fetchAction, &QAction::triggered, this, [this] {
@@ -907,13 +947,19 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     pullButton->setIcon(gitIcon(QStringLiteral("pull")));
     pullButton->setText(QStringLiteral("Pull"));
     pullButton->setToolTip(QStringLiteral("Pull changes from a remote branch"));
-    connect(pullButton, &QToolButton::clicked, this, [this] { pullCurrentBranch(); });
+    connect(pullButton, &QToolButton::clicked, this, [this] {
+        if (actionsTargetOnlyActiveRepository()) pullCurrentBranch();
+        else showBatchOperations(QStringLiteral("pull"));
+    });
     pushButton = new QToolButton(root);
     pushButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
     pushButton->setIcon(gitIcon(QStringLiteral("push")));
     pushButton->setText(QStringLiteral("Push"));
     pushButton->setToolTip(QStringLiteral("Push local commits to a remote branch"));
-    connect(pushButton, &QToolButton::clicked, this, [this] { pushCurrentBranch(); });
+    connect(pushButton, &QToolButton::clicked, this, [this] {
+        if (actionsTargetOnlyActiveRepository()) pushCurrentBranch();
+        else showBatchOperations(QStringLiteral("push"));
+    });
     moreButton = new QToolButton(root);
     moreButton->setIcon(gitIcon(QStringLiteral("more")));
     moreButton->setToolTip(QStringLiteral("More repository actions"));
@@ -979,6 +1025,41 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
         if (hasRemote) runGit({QStringLiteral("fetch"), QStringLiteral("--all"), QStringLiteral("--prune")});
         else refreshAll();
     });
+    actionRepositoriesButton = new QToolButton(root);
+    actionRepositoriesButton->setObjectName(QStringLiteral("actionRepositoriesButton"));
+    actionRepositoriesButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    actionRepositoriesButton->setPopupMode(QToolButton::InstantPopup);
+    actionRepositoriesButton->setText(QStringLiteral("Action Repositories"));
+    actionRepositoriesButton->setToolTip(QStringLiteral("Choose which repositories workspace actions target"));
+    auto *actionRepositoriesMenu = new QMenu(actionRepositoriesButton);
+    actionRepositoriesButton->setMenu(actionRepositoriesMenu);
+    connect(actionRepositoriesMenu, &QMenu::aboutToShow, this, [this, actionRepositoriesMenu] {
+        actionRepositoriesMenu->clear();
+        QStringList selectedIds = workspace.actionRepositoryIds;
+        if (selectedIds.isEmpty())
+            for (const WorkspaceRepository &repository : workspace.repositories) selectedIds.append(repository.id);
+        for (const WorkspaceRepository &repository : workspace.repositories) {
+            QAction *action = actionRepositoriesMenu->addAction(QFileInfo(repository.path).fileName());
+            action->setCheckable(true);
+            action->setChecked(selectedIds.contains(repository.id));
+            action->setData(repository.id);
+            action->setToolTip(repository.path);
+            connect(action, &QAction::triggered, this, [this, actionRepositoriesMenu, action] {
+                QStringList selected;
+                for (QAction *candidate : actionRepositoriesMenu->actions())
+                    if (candidate->isCheckable() && candidate->isChecked()) selected.append(candidate->data().toString());
+                if (selected.isEmpty()) {
+                    action->setChecked(true);
+                    statusBar()->showMessage(QStringLiteral("Select at least one repository for actions."), 4000);
+                    return;
+                }
+                workspace.actionRepositoryIds = selected;
+                RepositoryWorkspaceStore::saveWorkspace(workspace);
+                updateActionRepositoriesButton();
+            });
+        }
+    });
+    updateActionRepositoriesButton();
     toolbar->addWidget(branchButton);
     toolbar->addWidget(commitButton);
     toolbar->addWidget(stageAllButton);
@@ -988,6 +1069,7 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     toolbar->addWidget(moreButton);
     toolbar->addWidget(conflictsButton);
     toolbar->addWidget(refreshButton);
+    toolbar->addWidget(actionRepositoriesButton);
     toolbar->addStretch(1);
     toolbar->addWidget(new QLabel(QDir(repoPath).dirName(), root));
     layout->addLayout(toolbar);
@@ -997,7 +1079,47 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     branchesList = new QTreeWidget(branchTabs);
     branchesList->setHeaderHidden(true);
     branchTabs->addTab(branchesList, QStringLiteral("Branches"));
-    branchTabs->setMinimumWidth(165);
+    auto *workspaceRepositoryPanel = new QWidget(branchTabs);
+    auto *workspaceRepositoryLayout = new QVBoxLayout(workspaceRepositoryPanel);
+    workspaceRepositoryLayout->setContentsMargins(4, 4, 4, 4);
+    workspaceRepositoryLayout->addWidget(new QLabel(QStringLiteral("Repositories in this workspace"), workspaceRepositoryPanel));
+    workspaceRepositoryList = new QTreeWidget(workspaceRepositoryPanel);
+    workspaceRepositoryList->setHeaderLabels({QStringLiteral("Repository"), QStringLiteral("Status")});
+    workspaceRepositoryList->header()->setSectionResizeMode(0, QHeaderView::Stretch);
+    workspaceRepositoryList->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    workspaceRepositoryLayout->addWidget(workspaceRepositoryList, 1);
+    auto *workspaceButtons = new QGridLayout;
+    auto *addWorkspaceRepositoryButton = new QPushButton(QStringLiteral("Add…"), workspaceRepositoryPanel);
+    auto *removeWorkspaceRepositoryButton = new QPushButton(QStringLiteral("Remove"), workspaceRepositoryPanel);
+    auto *locateWorkspaceRepositoryButton = new QPushButton(QStringLiteral("Locate…"), workspaceRepositoryPanel);
+    auto *batchOperationsButton = new QPushButton(QStringLiteral("Batch Operations…"), workspaceRepositoryPanel);
+    workspaceButtons->addWidget(addWorkspaceRepositoryButton, 0, 0);
+    workspaceButtons->addWidget(removeWorkspaceRepositoryButton, 0, 1);
+    workspaceButtons->addWidget(locateWorkspaceRepositoryButton, 1, 0);
+    workspaceButtons->addWidget(batchOperationsButton, 1, 1);
+    workspaceRepositoryLayout->addLayout(workspaceButtons);
+    branchTabs->addTab(workspaceRepositoryPanel, QStringLiteral("Repositories"));
+    connect(addWorkspaceRepositoryButton, &QPushButton::clicked, this, [this] { addWorkspaceRepository(); });
+    connect(removeWorkspaceRepositoryButton, &QPushButton::clicked, this, [this] { removeWorkspaceRepository(); });
+    connect(locateWorkspaceRepositoryButton, &QPushButton::clicked, this, [this] { locateWorkspaceRepository(); });
+    connect(batchOperationsButton, &QPushButton::clicked, this, [this] { showBatchOperations(); });
+    connect(workspaceRepositoryList, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem *item, int) {
+        if (item) switchRepository(item->data(0, Qt::UserRole).toString());
+    });
+    refreshWorkspaceRepositoryList();
+    if (workspaceAmbiguous) {
+        addWorkspaceRepositoryButton->setEnabled(false);
+        removeWorkspaceRepositoryButton->setEnabled(false);
+        locateWorkspaceRepositoryButton->setEnabled(false);
+        batchOperationsButton->setEnabled(false);
+    }
+    connect(workspaceRepositoryList, &QTreeWidget::currentItemChanged, this, [this](QTreeWidgetItem *item) {
+        if (item) switchRepository(item->data(0, Qt::UserRole).toString());
+    });
+    connect(branchTabs, &QTabWidget::currentChanged, this, [this, branchTabs](int index) {
+        if (branchTabs->widget(index) == workspaceRepositoryList->parentWidget()) refreshWorkspaceRepositoryList();
+    });
+    branchTabs->setMinimumWidth(220);
 
     auto *leftTabs = new QTabWidget(mainSplitter);
     changesTree = new QTreeWidget(leftTabs);
@@ -1007,7 +1129,7 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     leftTabs->addTab(changesTree, QStringLiteral("Changes"));
     historyList = new QListWidget(leftTabs);
     leftTabs->addTab(historyList, QStringLiteral("History"));
-    leftTabs->setMinimumWidth(210);
+    leftTabs->setMinimumWidth(280);
 
     rightTabs = new QTabWidget(mainSplitter);
     detailsStack = new QStackedWidget(rightTabs);
@@ -1358,7 +1480,7 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     mainSplitter->setStretchFactor(0, 0);
     mainSplitter->setStretchFactor(1, 0);
     mainSplitter->setStretchFactor(2, 2);
-    mainSplitter->setSizes({175, 245, 680});
+    mainSplitter->setSizes({250, 350, 500});
     layout->addWidget(mainSplitter, 1);
     setCentralWidget(root);
     setStyleSheet(QStringLiteral(
@@ -1372,6 +1494,8 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     gitProgressBar->setMinimumWidth(190);
     gitProgressBar->hide();
     statusBar()->addPermanentWidget(gitProgressBar);
+    if (workspaceAmbiguous)
+        statusBar()->showMessage(QStringLiteral("Workspace selection was cancelled. Repository workspace controls are disabled until an association is selected."), 10000);
     updateStatusBar();
 
     commandProcess = new QProcess(this);
@@ -1390,6 +1514,10 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     connect(commandProcess, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
             [this](int code, QProcess::ExitStatus) {
         setGitBusy(false);
+        if (operationLockHeld) {
+            RepositoryOperationCoordinator::release(operationLockPath);
+            operationLockHeld = false;
+        }
         const bool conflictsExistedBeforeCommand = hadConflictsBeforeCommand;
         const bool pushAfterCommit = commitPushPending;
         const bool pushAfterSync = pushAfterSyncPending;
@@ -1436,6 +1564,10 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     connect(commandProcess, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
         if (error != QProcess::FailedToStart) return;
         setGitBusy(false);
+        if (operationLockHeld) {
+            RepositoryOperationCoordinator::release(operationLockPath);
+            operationLockHeld = false;
+        }
         const QString message = commandProcess->errorString();
         if (actionCommandActive) {
             actionCommandActive = false;
@@ -1500,7 +1632,8 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
         if (!item) return;
         changesTree->setCurrentItem(item);
         const QString path = item->data(0, Qt::UserRole).toString();
-        const QString status = item->text(1);
+        if (path.isEmpty()) return;
+        const QString status = item->data(0, Qt::UserRole + 2).toString();
         QMenu menu(this);
         if (item->data(0, Qt::UserRole + 1).toBool()) {
             QAction *resolve = menu.addAction(QStringLiteral("Resolve Merge Conflict…"));
@@ -1551,6 +1684,12 @@ bool GitWorkspaceWindow::event(QEvent *event)
 
 void GitWorkspaceWindow::closeEvent(QCloseEvent *event)
 {
+    if (commandProcess && commandProcess->state() != QProcess::NotRunning) {
+        QMessageBox::information(this, QStringLiteral("Git operation still running"),
+            QStringLiteral("Wait for the active Git operation to finish before closing this workspace."));
+        event->ignore();
+        return;
+    }
     lastRepositoryFocusTimer->stop();
     QMainWindow::closeEvent(event);
 }
@@ -1590,12 +1729,18 @@ void GitWorkspaceWindow::refreshAll()
     lastObservedStatus = readStatusSnapshot();
     if (showingWorkingDiff) {
         QTreeWidgetItem *matchingItem = nullptr;
-        for (int index = 0; index < changesTree->topLevelItemCount(); ++index) {
-            QTreeWidgetItem *item = changesTree->topLevelItem(index);
-            if (item->data(0, Qt::UserRole).toString() == selectedDiffPath) {
-                matchingItem = item;
-                break;
+        const auto findPath = [&selectedDiffPath](QTreeWidgetItem *parent, auto &&self) -> QTreeWidgetItem * {
+            for (int index = 0; index < parent->childCount(); ++index) {
+                QTreeWidgetItem *item = parent->child(index);
+                if (item->data(0, Qt::UserRole).toString() == selectedDiffPath) return item;
+                if (QTreeWidgetItem *nested = self(item, self)) return nested;
             }
+            return nullptr;
+        };
+        for (int index = 0; index < changesTree->topLevelItemCount() && !matchingItem; ++index) {
+            QTreeWidgetItem *item = changesTree->topLevelItem(index);
+            if (item->data(0, Qt::UserRole).toString() == selectedDiffPath) matchingItem = item;
+            else matchingItem = findPath(item, findPath);
         }
         if (matchingItem) {
             changesTree->setCurrentItem(matchingItem);
@@ -1646,6 +1791,173 @@ void GitWorkspaceWindow::removeRepositorySetting(QTreeWidgetItem *item)
     const QString key = item->text(0);
     if (QMessageBox::question(this, QStringLiteral("Remove repository setting"), QStringLiteral("Remove all repository values for %1?").arg(key)) == QMessageBox::Yes)
         runGit({QStringLiteral("config"), QStringLiteral("--local"), QStringLiteral("--unset-all"), key});
+}
+
+void GitWorkspaceWindow::refreshWorkspaceRepositoryList()
+{
+    QStringList validActionIds;
+    for (const QString &id : workspace.actionRepositoryIds)
+        if (std::any_of(workspace.repositories.cbegin(), workspace.repositories.cend(), [&id](const WorkspaceRepository &repository) { return repository.id == id; }))
+            validActionIds.append(id);
+    if (validActionIds != workspace.actionRepositoryIds) {
+        workspace.actionRepositoryIds = validActionIds;
+        RepositoryWorkspaceStore::saveWorkspace(workspace);
+    }
+    updateActionRepositoriesButton();
+    if (!workspaceRepositoryList) return;
+    const bool wasBlocked = workspaceRepositoryList->blockSignals(true);
+    workspaceRepositoryList->clear();
+    for (const WorkspaceRepository &repository : workspace.repositories) {
+        const bool available = QFileInfo(repository.path).isDir() && isGitRepository(repository.path);
+        auto *item = new QTreeWidgetItem(workspaceRepositoryList);
+        const QString name = QFileInfo(repository.path).fileName().isEmpty() ? repository.path : QFileInfo(repository.path).fileName();
+        item->setText(0, name);
+        item->setText(1, available ? (repository.path == repoPath ? QStringLiteral("Active") : QStringLiteral("Available")) : QStringLiteral("Missing"));
+        item->setData(0, Qt::UserRole, repository.id);
+        item->setToolTip(0, repository.path);
+        if (!available) item->setToolTip(1, QStringLiteral("Last known path: %1").arg(repository.path));
+        if (repository.path == repoPath) workspaceRepositoryList->setCurrentItem(item);
+    }
+    workspaceRepositoryList->blockSignals(wasBlocked);
+}
+
+void GitWorkspaceWindow::addWorkspaceRepository()
+{
+    const QString path = QFileDialog::getExistingDirectory(this, QStringLiteral("Add Existing Git Repository"),
+        QDir::homePath(), QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks);
+    if (path.isEmpty()) return;
+    QString error;
+    if (!RepositoryWorkspaceStore::addRepository(workspace, path, &error)) {
+        QMessageBox::information(this, QStringLiteral("Repository Not Added"), error);
+        return;
+    }
+    refreshWorkspaceRepositoryList();
+}
+
+void GitWorkspaceWindow::removeWorkspaceRepository()
+{
+    QTreeWidgetItem *item = workspaceRepositoryList ? workspaceRepositoryList->currentItem() : nullptr;
+    if (!item) return;
+    const QString repositoryId = item->data(0, Qt::UserRole).toString();
+    if (workspace.repositories.size() <= 1) {
+        QMessageBox::information(this, QStringLiteral("Workspace Requires a Repository"),
+            QStringLiteral("The last repository stays as the normal single-repository workspace."));
+        return;
+    }
+    const auto found = std::find_if(workspace.repositories.cbegin(), workspace.repositories.cend(), [&repositoryId](const WorkspaceRepository &repository) { return repository.id == repositoryId; });
+    if (found == workspace.repositories.cend()) return;
+    const bool removingActive = found->path == repoPath;
+    if (!RepositoryWorkspaceStore::removeRepository(workspace, repositoryId)) return;
+    if (removingActive) switchRepository(workspace.primaryRepositoryId);
+    refreshWorkspaceRepositoryList();
+}
+
+void GitWorkspaceWindow::locateWorkspaceRepository()
+{
+    QTreeWidgetItem *item = workspaceRepositoryList ? workspaceRepositoryList->currentItem() : nullptr;
+    if (!item) return;
+    const QString repositoryId = item->data(0, Qt::UserRole).toString();
+    const auto found = std::find_if(workspace.repositories.cbegin(), workspace.repositories.cend(), [&repositoryId](const WorkspaceRepository &repository) { return repository.id == repositoryId; });
+    if (found == workspace.repositories.cend()) return;
+    const QString path = QFileDialog::getExistingDirectory(this, QStringLiteral("Locate Git Repository"), QDir::homePath(), QFileDialog::ShowDirsOnly);
+    if (path.isEmpty()) return;
+    const QString root = RepositoryWorkspaceStore::repositoryRoot(path);
+    if (root.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("Not a Git Repository"), QStringLiteral("The selected folder is not inside a Git working tree."));
+        return;
+    }
+    const bool replacingActive = found->path == repoPath;
+    const QString commonDirectory = RepositoryWorkspaceStore::gitDirectory(root, true);
+    if (!found->commonGitDirectory.isEmpty() && commonDirectory != found->commonGitDirectory) {
+        if (QMessageBox::question(this, QStringLiteral("Repository Identity Changed"),
+                QStringLiteral("The Git metadata does not match the last known identity for this repository. Replace the workspace entry with %1?").arg(root),
+                QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Yes) return;
+    }
+    QString error;
+    if (!RepositoryWorkspaceStore::updateRepositoryPath(workspace, repositoryId, root, &error)) {
+        QMessageBox::warning(this, QStringLiteral("Repository Not Located"), error.isEmpty() ? QStringLiteral("The workspace entry could not be updated.") : error);
+        return;
+    }
+    if (replacingActive) switchRepository(repositoryId);
+    refreshWorkspaceRepositoryList();
+}
+
+void GitWorkspaceWindow::switchRepository(const QString &repositoryId)
+{
+    const auto found = std::find_if(workspace.repositories.cbegin(), workspace.repositories.cend(), [&repositoryId](const WorkspaceRepository &repository) { return repository.id == repositoryId; });
+    if (found == workspace.repositories.cend()) return;
+    if (found->path == repoPath) return;
+    if (!QFileInfo(found->path).isDir() || !isGitRepository(found->path)) {
+        QMessageBox::information(this, QStringLiteral("Repository Missing"),
+            QStringLiteral("This repository is unavailable at its last known path. Use Locate to find it."));
+        refreshWorkspaceRepositoryList();
+        return;
+    }
+    if (commandProcess && commandProcess->state() != QProcess::NotRunning) {
+        QMessageBox::information(this, QStringLiteral("Git Operation Running"),
+            QStringLiteral("Wait for the current Git operation to finish before switching repositories."));
+        refreshWorkspaceRepositoryList();
+        return;
+    }
+    repoPath = found->path;
+    setWindowTitle(QStringLiteral("Git Workspace — %1").arg(QDir(repoPath).dirName()));
+    if (completionController) completionController->setWorkingDirectory(repoPath);
+    currentDiffCommitHash.clear();
+    lastObservedDiffFile.clear();
+    changesTree->clearSelection();
+    changesTree->clear();
+    diffFilesList->clear();
+    commandOutput->clear();
+    detailsStack->setCurrentWidget(detailsView);
+    detailsView->setPlainText(QStringLiteral("Select a changed file, branch, or commit to inspect it."));
+    refreshWorkspaceRepositoryList();
+    refreshAll();
+    statusBar()->showMessage(QStringLiteral("Switched to %1").arg(QDir(repoPath).dirName()), 3000);
+}
+
+QVector<WorkspaceRepository> GitWorkspaceWindow::actionRepositories() const
+{
+    QVector<WorkspaceRepository> selected;
+    if (workspace.actionRepositoryIds.isEmpty()) return workspace.repositories;
+    for (const WorkspaceRepository &repository : workspace.repositories)
+        if (workspace.actionRepositoryIds.contains(repository.id)) selected.append(repository);
+    if (selected.isEmpty()) return workspace.repositories;
+    return selected;
+}
+
+bool GitWorkspaceWindow::actionsTargetOnlyActiveRepository() const
+{
+    const QVector<WorkspaceRepository> selected = actionRepositories();
+    return selected.size() == 1
+        && QFileInfo(selected.first().path).canonicalFilePath() == QFileInfo(repoPath).canonicalFilePath();
+}
+
+void GitWorkspaceWindow::updateActionRepositoriesButton()
+{
+    if (!actionRepositoriesButton) return;
+    const QVector<WorkspaceRepository> selected = actionRepositories();
+    actionRepositoriesButton->setVisible(workspace.repositories.size() > 1 && !workspaceAmbiguous);
+    if (workspace.actionRepositoryIds.isEmpty())
+        actionRepositoriesButton->setText(QStringLiteral("Actions: All repositories"));
+    else if (selected.size() == 1)
+        actionRepositoriesButton->setText(QStringLiteral("Actions: %1").arg(QFileInfo(selected.first().path).fileName()));
+    else
+        actionRepositoriesButton->setText(QStringLiteral("Actions: %1 repositories").arg(selected.size()));
+    QStringList names;
+    for (const WorkspaceRepository &repository : selected) names.append(QFileInfo(repository.path).fileName());
+    actionRepositoriesButton->setToolTip(QStringLiteral("Actions apply to: %1").arg(names.join(QStringLiteral(", "))));
+}
+
+void GitWorkspaceWindow::showBatchOperations(const QString &initialOperation)
+{
+    if (commandProcess && commandProcess->state() != QProcess::NotRunning
+        && RepositoryOperationCoordinator::isBusy(repoPath)) {
+        statusBar()->showMessage(QStringLiteral("The active repository is busy; busy repositories will be unavailable to batch operations."), 5000);
+    }
+    BatchOperationsDialog dialog(actionRepositories(), this, initialOperation);
+    dialog.exec();
+    refreshWorkspaceRepositoryList();
+    refreshAll();
 }
 
 QString GitWorkspaceWindow::readStatusSnapshot() const
@@ -1705,6 +2017,7 @@ void GitWorkspaceWindow::refreshStatus()
     hasUnstagedChanges = false;
     stagedPathCount = 0;
     unstagedPathCount = 0;
+    QHash<QString, QTreeWidgetItem *> directories;
     for (qsizetype recordIndex = 0; recordIndex < records.size(); ++recordIndex) {
         const QByteArray &record = records.at(recordIndex);
         if (record.size() < 4) continue;
@@ -1722,18 +2035,41 @@ void GitWorkspaceWindow::refreshStatus()
         }
         const QString path = QString::fromLocal8Bit(record.mid(3));
         const bool hasSecondaryRenamePath = xy.contains(QLatin1Char('R')) || xy.contains(QLatin1Char('C'));
-        const QString label = hasSecondaryRenamePath ? QStringLiteral("%1 (from %2)").arg(
-            path, recordIndex + 1 < records.size() ? QString::fromLocal8Bit(records.at(recordIndex + 1)) : QString()) : path;
-        auto *item = new QTreeWidgetItem({label, xy});
+        const QString oldPath = hasSecondaryRenamePath && recordIndex + 1 < records.size()
+            ? QString::fromLocal8Bit(records.at(recordIndex + 1)) : QString();
+        const QStringList pathParts = path.split(QLatin1Char('/'), Qt::SkipEmptyParts);
+        QTreeWidgetItem *parentItem = nullptr;
+        QString directoryPath;
+        for (qsizetype partIndex = 0; partIndex + 1 < pathParts.size(); ++partIndex) {
+            directoryPath = directoryPath.isEmpty() ? pathParts.at(partIndex)
+                : directoryPath + QLatin1Char('/') + pathParts.at(partIndex);
+            if (directories.contains(directoryPath)) {
+                parentItem = directories.value(directoryPath);
+                continue;
+            }
+            auto *directoryItem = parentItem
+                ? new QTreeWidgetItem(parentItem, {pathParts.at(partIndex), QString()})
+                : new QTreeWidgetItem(changesTree, {pathParts.at(partIndex), QString()});
+            directoryItem->setToolTip(0, directoryPath);
+            directories.insert(directoryPath, directoryItem);
+            parentItem = directoryItem;
+        }
+        const QString fileName = pathParts.isEmpty() ? path : pathParts.last();
+        const QString label = hasSecondaryRenamePath ? QStringLiteral("%1 (from %2)").arg(fileName, oldPath) : fileName;
+        const QString displayedStatus = xy == QStringLiteral("??") ? QStringLiteral("A") : xy;
+        auto *item = parentItem ? new QTreeWidgetItem(parentItem, {label, displayedStatus})
+                                : new QTreeWidgetItem(changesTree, {label, displayedStatus});
         item->setData(0, Qt::UserRole, path);
         item->setData(0, Qt::UserRole + 1, conflicted);
+        item->setData(0, Qt::UserRole + 2, xy);
+        item->setToolTip(0, path);
         if (conflicted) conflictedFiles.append(path);
-        changesTree->addTopLevelItem(item);
         if (hasSecondaryRenamePath)
             ++recordIndex;
     }
     if (changesTree->topLevelItemCount() == 0)
         changesTree->addTopLevelItem(new QTreeWidgetItem({QStringLiteral("Working tree clean"), QString()}));
+    changesTree->expandAll();
     hasConflicts = !conflictedFiles.isEmpty();
     conflictsButton->setEnabled(hasConflicts);
     conflictsButton->setToolTip(hasConflicts
@@ -2171,6 +2507,10 @@ void GitWorkspaceWindow::runGit(const QStringList &arguments)
         QMessageBox::information(this, QStringLiteral("Git is busy"), QStringLiteral("Wait for the current Git command to finish."));
         return;
     }
+    if (RepositoryOperationCoordinator::isBusy(repoPath)) {
+        QMessageBox::information(this, QStringLiteral("Repository is busy"), QStringLiteral("Another Git operation is running in this repository."));
+        return;
+    }
     if (!arguments.isEmpty() && arguments.first() == QLatin1String("push") && !arguments.contains(QStringLiteral("--delete"))) {
         const QString currentBranch = gitOutput({QStringLiteral("branch"), QStringLiteral("--show-current")});
         const QStringList remoteNames = gitOutput({QStringLiteral("remote")}).split(QLatin1Char('\n'), Qt::SkipEmptyParts);
@@ -2216,6 +2556,12 @@ void GitWorkspaceWindow::runGit(const QStringList &arguments)
     if (showsProgress && (operation == QLatin1String("fetch") || operation == QLatin1String("pull")
         || operation == QLatin1String("push")) && !arguments.contains(QStringLiteral("--progress")))
         commandProcess->setArguments(fullArguments + QStringList{QStringLiteral("--progress")});
+    if (!RepositoryOperationCoordinator::tryAcquire(repoPath)) {
+        QMessageBox::information(this, QStringLiteral("Repository is busy"), QStringLiteral("Another Git operation started in this repository."));
+        return;
+    }
+    operationLockPath = repoPath;
+    operationLockHeld = true;
     setGitBusy(true, showsProgress);
     commandProcess->start();
 }
@@ -2233,6 +2579,13 @@ void GitWorkspaceWindow::runRawCommand()
         runGit(args);
         return;
     }
+    if (RepositoryOperationCoordinator::isBusy(repoPath)
+        || !RepositoryOperationCoordinator::tryAcquire(repoPath)) {
+        statusBar()->showMessage(QStringLiteral("Another Git operation is running in this repository."), 4000);
+        return;
+    }
+    operationLockPath = repoPath;
+    operationLockHeld = true;
     appendOutput(QStringLiteral("$ git %1\n").arg(args.join(QLatin1Char(' '))));
     actionCommandActive = false;
     commandProcess->setProgram(gitExecutable());
@@ -2548,6 +2901,7 @@ void GitWorkspaceWindow::sendCommandInput()
 
 void GitWorkspaceWindow::updateToolbarState()
 {
+    const bool groupedWorkspace = workspace.repositories.size() > 1 && !workspaceAmbiguous;
     if (stageAllShortcutAction) stageAllShortcutAction->setEnabled(hasUnstagedChanges);
     if (commitShortcutAction) commitShortcutAction->setEnabled(hasStagedChanges);
     if (pushShortcutAction) pushShortcutAction->setEnabled(hasRemote && hasUnpushedCommits);
@@ -2556,19 +2910,22 @@ void GitWorkspaceWindow::updateToolbarState()
     if (stashShortcutAction) stashShortcutAction->setEnabled(hasStagedChanges || hasUnstagedChanges);
     if (resolveShortcutAction) resolveShortcutAction->setEnabled(hasConflicts);
     if (commitButton) {
-        commitButton->setVisible(hasStagedChanges);
-        commitButton->setEnabled(hasStagedChanges);
+        commitButton->setVisible(hasStagedChanges || groupedWorkspace);
+        commitButton->setEnabled(hasStagedChanges || groupedWorkspace);
     }
     if (stageAllButton) {
-        stageAllButton->setVisible(hasUnstagedChanges);
-        stageAllButton->setEnabled(hasUnstagedChanges);
+        stageAllButton->setVisible(hasUnstagedChanges || groupedWorkspace);
+        stageAllButton->setEnabled(hasUnstagedChanges || groupedWorkspace);
     }
-    if (syncButton) syncButton->setVisible(hasRemote && (hasUpstream || hasUnpushedCommits));
-    if (pullButton) pullButton->setVisible(hasRemote);
+    if (syncButton) syncButton->setVisible(groupedWorkspace || (hasRemote && (hasUpstream || hasUnpushedCommits)));
+    if (pullButton) {
+        pullButton->setVisible(groupedWorkspace || hasRemote);
+        pullButton->setEnabled(groupedWorkspace || hasRemote);
+    }
     if (pushButton) {
         const bool canPush = hasRemote && hasUnpushedCommits && !gitOutput({QStringLiteral("branch"), QStringLiteral("--show-current")}).isEmpty();
-        pushButton->setVisible(canPush);
-        pushButton->setEnabled(canPush);
+        pushButton->setVisible(groupedWorkspace || canPush);
+        pushButton->setEnabled(groupedWorkspace || canPush);
         pushButton->setToolTip(QStringLiteral("Push local commits to the configured remote"));
     }
     if (branchButton) branchButton->setEnabled(true);

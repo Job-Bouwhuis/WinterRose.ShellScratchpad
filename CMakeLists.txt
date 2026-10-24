@@ -23,6 +23,12 @@ add_executable(shell-scratchpad
     src/language/BashExecutionHandler.cpp
     src/git/GitWorkspaceWindow.h
     src/git/GitWorkspaceWindow.cpp
+    src/git/RepositoryWorkspace.h
+    src/git/RepositoryWorkspace.cpp
+    src/git/RepositoryOperationCoordinator.h
+    src/git/RepositoryOperationCoordinator.cpp
+    src/git/BatchOperationsDialog.h
+    src/git/BatchOperationsDialog.cpp
     packaging/git-icons.qrc
     src/main.cpp
     src/output/TerminalOutput.h
@@ -70,6 +76,21 @@ if(BUILD_TESTING)
     target_compile_options(shell-scratchpad-terminal-output-tests PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME terminal-output-tests COMMAND shell-scratchpad-terminal-output-tests)
     set_tests_properties(terminal-output-tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    add_executable(shell-scratchpad-repository-workspace-tests
+        tests/repository_workspace_tests.cpp
+        src/git/RepositoryWorkspace.h
+        src/git/RepositoryWorkspace.cpp
+        src/git/RepositoryOperationCoordinator.h
+        src/git/RepositoryOperationCoordinator.cpp
+        src/git/BatchOperationsDialog.h
+        src/git/BatchOperationsDialog.cpp
+    )
+    target_include_directories(shell-scratchpad-repository-workspace-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(shell-scratchpad-repository-workspace-tests PRIVATE Qt6::Widgets)
+    target_compile_options(shell-scratchpad-repository-workspace-tests PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME repository-workspace-tests COMMAND shell-scratchpad-repository-workspace-tests)
+    set_tests_properties(repository-workspace-tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 endif()
 
 include(GNUInstallDirs)
