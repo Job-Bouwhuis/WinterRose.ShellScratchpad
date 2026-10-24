@@ -39,6 +39,7 @@ namespace ShellScratchpad::Output { class TerminalOutput; }
 namespace ShellScratchpad::Git
 {
 class ImagePreviewLabel;
+class HistoryGraphWidget;
 class GitWorkspaceWindow final : public QMainWindow
 {
 public:
@@ -73,12 +74,16 @@ private:
     QProgressBar *gitProgressBar = nullptr;
     QTimer *lastRepositoryFocusTimer = nullptr;
     QMenu *gitActionsMenu = nullptr;
+    QMenu *recentRepositoriesMenu = nullptr;
     QVector<QPointer<QWidget>> busyDisabledWidgets;
     QTreeWidget *branchesList = nullptr;
     QTreeWidget *workspaceRepositoryList = nullptr;
     RepositoryWorkspace workspace;
     bool workspaceAmbiguous = false;
     QListWidget *historyList = nullptr;
+    QStackedWidget *historyViews = nullptr;
+    QPushButton *historyOverviewButton = nullptr;
+    HistoryGraphWidget *historyGraph = nullptr;
     QListWidget *remotesList = nullptr;
     QTreeWidget *repositorySettingsTree = nullptr;
     QHash<QString, QComboBox *> repositorySettingControls;
@@ -150,6 +155,8 @@ private:
     void refreshStatus();
     void refreshBranches();
     void refreshHistory();
+    void refreshHistoryGraph();
+    void showHistoryOverview();
     void refreshRemotes();
     void refreshIdentity();
     void switchToBranch(const QString &branch, bool remote);
@@ -184,6 +191,8 @@ private:
     void addRepositorySetting();
     void removeRepositorySetting(QTreeWidgetItem *item);
     void refreshWorkspaceRepositoryList();
+    void recordRecentWorkspace();
+    void refreshRecentRepositoriesMenu();
     void addWorkspaceRepository();
     void removeWorkspaceRepository();
     void locateWorkspaceRepository();
