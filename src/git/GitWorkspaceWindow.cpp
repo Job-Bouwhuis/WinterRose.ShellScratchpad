@@ -822,11 +822,12 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
             [this](const QString &branch, bool remote, const QPoint &position) { showBranchContextMenu(branch, remote, position); });
         bool haveLocal = false;
         bool haveRemote = false;
-        for (int index = 0; index < branchesList->count(); ++index) {
-            QListWidgetItem *item = branchesList->item(index);
-            const QString name = item->data(Qt::UserRole).toString();
-            const bool remote = item->data(Qt::UserRole + 1).toBool();
-            const bool current = item->data(Qt::UserRole + 2).toBool();
+        const auto branchLeaves = branchesList->findItems(QString(), Qt::MatchContains | Qt::MatchRecursive, 0);
+        for (QTreeWidgetItem *item : branchLeaves) {
+            if (!item->data(0, Qt::UserRole + 3).toBool()) continue;
+            const QString name = item->data(0, Qt::UserRole).toString();
+            const bool remote = item->data(0, Qt::UserRole + 1).toBool();
+            const bool current = item->data(0, Qt::UserRole + 2).toBool();
             if (name.isEmpty()) continue;
             (remote ? haveRemote : haveLocal) = true;
             addBranchPath(remote ? static_cast<QMenu *>(remoteMenu) : static_cast<QMenu *>(localMenu),
@@ -993,7 +994,8 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
 
     auto *mainSplitter = new QSplitter(Qt::Horizontal, root);
     auto *branchTabs = new QTabWidget(mainSplitter);
-    branchesList = new QListWidget(branchTabs);
+    branchesList = new QTreeWidget(branchTabs);
+    branchesList->setHeaderHidden(true);
     branchTabs->addTab(branchesList, QStringLiteral("Branches"));
     branchTabs->setMinimumWidth(165);
 
@@ -1076,7 +1078,7 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     detailsStack->addWidget(diffPanel);
     rightTabs->addTab(detailsStack, QStringLiteral("Details / Diff"));
 
-    auto *commandPanel = new QWidget(rightTabs);
+    commandPanel = new QWidget(rightTabs);
     auto *commandLayout = new QVBoxLayout(commandPanel);
     commandLayout->setContentsMargins(4, 4, 4, 4);
     commandLayout->addWidget(new QLabel(QStringLiteral("Run a Git command in this repository. Suggestions include subcommands and common options."), commandPanel));
@@ -1125,9 +1127,8 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     commandInputRow->addWidget(commandInput, 1);
     commandInputRow->addWidget(sendInputButton);
     commandLayout->addLayout(commandInputRow);
-    rightTabs->addTab(commandPanel, QStringLiteral("Git Command"));
 
-    auto *remotesPanel = new QWidget(rightTabs);
+    remotesPanel = new QWidget(rightTabs);
     auto *remotesLayout = new QVBoxLayout(remotesPanel);
     remotesLayout->addWidget(new QLabel(QStringLiteral("Manage any number of Git remotes for this repository."), remotesPanel));
     remotesList = new QListWidget(remotesPanel);
@@ -1142,6 +1143,7 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     remoteActions->addWidget(removeRemoteButton);
     remoteActions->addStretch(1);
     remotesLayout->addLayout(remoteActions);
+    rightTabs->addTab(commandPanel, QStringLiteral("Git Command"));
     rightTabs->addTab(remotesPanel, QStringLiteral("Remotes"));
     connect(addRemoteButton, &QPushButton::clicked, this, [this] { addRemote(); });
     connect(editRemoteButton, &QPushButton::clicked, this, [this] {
@@ -1168,7 +1170,8 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
         menu.exec(remotesList->viewport()->mapToGlobal(position));
     });
 
-    auto *credentialsPanel = new QWidget(rightTabs);
+    credentialsPanel = new QWidget(rightTabs);
+    credentialsPanel->hide();
     auto *credentialsForm = new QFormLayout(credentialsPanel);
     userNameEdit = new QLineEdit(credentialsPanel);
     emailEdit = new QLineEdit(credentialsPanel);
@@ -1187,7 +1190,32 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     credentialsForm->addRow(saveIdentityButton, configureHelperButton);
     credentialsForm->addRow(addCredentialButton);
     credentialsForm->addRow(new QLabel(QStringLiteral("Credentials are passed to Git’s configured credential helper. The app does not save passwords in its own settings."), credentialsPanel));
-    rightTabs->addTab(credentialsPanel, QStringLiteral("Identity & Credentials"));
+    repositorySettingsPanel = new QWidget(rightTabs);
+    repositorySettingsPanel->hide();
+    auto *settingsLayout = new QVBoxLayout(repositorySettingsPanel);
+    settingsLayout->addWidget(new QLabel(QStringLiteral("Repository-specific Git configuration. Changes apply only to this repository."), repositorySettingsPanel));
+    repositorySettingsTree = new QTreeWidget(repositorySettingsPanel);
+    repositorySettingsTree->setHeaderLabels({QStringLiteral("Setting"), QStringLiteral("Value")});
+    repositorySettingsTree->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    repositorySettingsTree->header()->setSectionResizeMode(1, QHeaderView::Stretch);
+    settingsLayout->addWidget(repositorySettingsTree, 1);
+    auto *settingsActions = new QHBoxLayout;
+    auto *addSettingButton = new QPushButton(QStringLiteral("Add Setting…"), repositorySettingsPanel);
+    auto *editSettingButton = new QPushButton(QStringLiteral("Edit…"), repositorySettingsPanel);
+    auto *removeSettingButton = new QPushButton(QStringLiteral("Remove"), repositorySettingsPanel);
+    auto *refreshSettingsButton = new QPushButton(QStringLiteral("Refresh"), repositorySettingsPanel);
+    settingsActions->addWidget(addSettingButton);
+    settingsActions->addWidget(editSettingButton);
+    settingsActions->addWidget(removeSettingButton);
+    settingsActions->addStretch(1);
+    settingsActions->addWidget(refreshSettingsButton);
+    settingsLayout->addLayout(settingsActions);
+    connect(addSettingButton, &QPushButton::clicked, this, [this] { addRepositorySetting(); });
+    connect(editSettingButton, &QPushButton::clicked, this, [this] { editRepositorySetting(repositorySettingsTree->currentItem()); });
+    connect(removeSettingButton, &QPushButton::clicked, this, [this] { removeRepositorySetting(repositorySettingsTree->currentItem()); });
+    connect(refreshSettingsButton, &QPushButton::clicked, this, [this] { refreshRepositorySettings(); });
+    connect(repositorySettingsTree, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem *item) { editRepositorySetting(item); });
+    refreshRepositorySettings();
 
     QMenu *fileMenu = menuBar()->addMenu(QStringLiteral("&File"));
     QAction *closeWorkspaceAction = fileMenu->addAction(QStringLiteral("Close Git Workspace"));
@@ -1229,6 +1257,27 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     });
 
     QMenu *navigateMenu = menuBar()->addMenu(QStringLiteral("&Navigate"));
+    previousRightPage = detailsStack;
+    const auto showRightPage = [this](QWidget *page, const QString &title, QWidget *focusWidget = nullptr) {
+        if (rightTabs->indexOf(page) < 0) rightTabs->addTab(page, title);
+        rightTabs->setCurrentWidget(page);
+        page->show();
+        previousRightPage = page;
+        if (focusWidget) focusWidget->setFocus();
+    };
+    rightTabs->setTabsClosable(false);
+    connect(rightTabs, &QTabWidget::currentChanged, this, [this](int index) {
+        QWidget *newPage = index >= 0 ? rightTabs->widget(index) : nullptr;
+        QWidget *oldPage = previousRightPage;
+        previousRightPage = newPage;
+        if (oldPage && oldPage != detailsStack && oldPage != commandPanel && oldPage != remotesPanel && oldPage != newPage) {
+            const int oldIndex = rightTabs->indexOf(oldPage);
+            if (oldIndex >= 0) {
+                rightTabs->removeTab(oldIndex);
+                oldPage->hide();
+            }
+        }
+    });
     const auto addNavigationAction = [this, navigateMenu](const QString &label, const QString &shortcut,
                                                            const std::function<void()> &callback) {
         QAction *action = navigateMenu->addAction(label);
@@ -1252,18 +1301,28 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
         rightTabs->setCurrentWidget(detailsStack);
         detailsStack->setFocus();
     });
-    addNavigationAction(QStringLiteral("Git Command"), QStringLiteral("Ctrl+G, Ctrl+T"), [this] {
-        rightTabs->setCurrentIndex(1);
-        commandEditor->setFocus();
+    addNavigationAction(QStringLiteral("Git Command"), QStringLiteral("Ctrl+G, Ctrl+T"), [this, showRightPage] {
+        showRightPage(commandPanel, QStringLiteral("Git Command"), commandEditor);
     });
-    addNavigationAction(QStringLiteral("Remotes"), QStringLiteral("Ctrl+G, Ctrl+R"), [this] {
-        rightTabs->setCurrentIndex(2);
-        remotesList->setFocus();
+    addNavigationAction(QStringLiteral("Remotes"), QStringLiteral("Ctrl+G, Ctrl+R"), [this, showRightPage] {
+        showRightPage(remotesPanel, QStringLiteral("Remotes"), remotesList);
     });
-    addNavigationAction(QStringLiteral("Identity & Credentials"), QStringLiteral("Ctrl+G, Ctrl+I"), [this] {
-        rightTabs->setCurrentIndex(3);
-        userNameEdit->setFocus();
+    addNavigationAction(QStringLiteral("Identity && Credentials"), QStringLiteral("Ctrl+G, Ctrl+I"), [this, showRightPage] {
+        showRightPage(credentialsPanel, QStringLiteral("Identity && Credentials"), userNameEdit);
     });
+    addNavigationAction(QStringLiteral("Repository Settings…"), QStringLiteral("Ctrl+G, Ctrl+E"), [this, showRightPage] {
+        showRightPage(repositorySettingsPanel, QStringLiteral("Repository Settings"), repositorySettingsTree);
+    });
+    QMenu *workspaceMenu = menuBar()->addMenu(QStringLiteral("&Workspace"));
+    QAction *commandMenuAction = workspaceMenu->addAction(QStringLiteral("Git Command"));
+    connect(commandMenuAction, &QAction::triggered, this, [this] { rightTabs->setCurrentWidget(commandPanel); commandEditor->setFocus(); });
+    QAction *remotesMenuAction = workspaceMenu->addAction(QStringLiteral("Remotes"));
+    connect(remotesMenuAction, &QAction::triggered, this, [this] { rightTabs->setCurrentWidget(remotesPanel); remotesList->setFocus(); });
+    workspaceMenu->addSeparator();
+    QAction *identityMenuAction = workspaceMenu->addAction(QStringLiteral("Identity && Credentials"));
+    connect(identityMenuAction, &QAction::triggered, this, [showRightPage, this] { showRightPage(credentialsPanel, QStringLiteral("Identity && Credentials"), userNameEdit); });
+    QAction *settingsMenuAction = workspaceMenu->addAction(QStringLiteral("Repository Settings…"));
+    connect(settingsMenuAction, &QAction::triggered, this, [showRightPage, this] { showRightPage(repositorySettingsPanel, QStringLiteral("Repository Settings"), repositorySettingsTree); });
 
     QMenu *helpMenu = menuBar()->addMenu(QStringLiteral("&Help"));
     QAction *shortcutsAction = helpMenu->addAction(QStringLiteral("Keyboard Shortcuts"));
@@ -1413,19 +1472,19 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
         if (item && (item->data(0, Qt::UserRole + 1).toBool()))
             resolveConflictFile(item->data(0, Qt::UserRole).toString());
     });
-    connect(branchesList, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem *item) {
-        if (!item) return;
-        switchToBranch(item->data(Qt::UserRole).toString(), item->data(Qt::UserRole + 1).toBool());
+    connect(branchesList, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem *item, int) {
+        if (!item || !item->data(0, Qt::UserRole + 3).toBool()) return;
+        switchToBranch(item->data(0, Qt::UserRole).toString(), item->data(0, Qt::UserRole + 1).toBool());
     });
     connect(historyList, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem *item) {
         if (item) showCommit(item->data(Qt::UserRole).toString());
     });
     branchesList->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(branchesList, &QListWidget::customContextMenuRequested, this, [this](const QPoint &position) {
-        QListWidgetItem *item = branchesList->itemAt(position);
-        if (!item) return;
+        QTreeWidgetItem *item = branchesList->itemAt(position);
+        if (!item || !item->data(0, Qt::UserRole + 3).toBool()) return;
         branchesList->setCurrentItem(item);
-        showBranchContextMenu(item->data(Qt::UserRole).toString(), item->data(Qt::UserRole + 1).toBool(), branchesList->viewport()->mapToGlobal(position));
+        showBranchContextMenu(item->data(0, Qt::UserRole).toString(), item->data(0, Qt::UserRole + 1).toBool(), branchesList->viewport()->mapToGlobal(position));
     });
     historyList->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(historyList, &QListWidget::customContextMenuRequested, this, [this](const QPoint &position) {
@@ -1524,6 +1583,7 @@ void GitWorkspaceWindow::refreshAll()
     refreshRemotes();
     refreshHistory();
     refreshIdentity();
+    refreshRepositorySettings();
     hasStashes = !gitOutput({QStringLiteral("stash"), QStringLiteral("list")}).isEmpty();
     updateToolbarState();
     updateStatusBar();
@@ -1546,6 +1606,46 @@ void GitWorkspaceWindow::refreshAll()
             lastObservedDiffFile.clear();
         }
     }
+}
+
+void GitWorkspaceWindow::refreshRepositorySettings()
+{
+    if (!repositorySettingsTree) return;
+    repositorySettingsTree->clear();
+    const QString output = gitOutput({QStringLiteral("config"), QStringLiteral("--local"), QStringLiteral("--list")});
+    for (const QString &line : output.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
+        const qsizetype equals = line.indexOf(QLatin1Char('='));
+        if (equals <= 0) continue;
+        auto *item = new QTreeWidgetItem(repositorySettingsTree);
+        item->setText(0, line.left(equals));
+        item->setText(1, line.mid(equals + 1));
+        item->setToolTip(1, line.mid(equals + 1));
+    }
+}
+
+void GitWorkspaceWindow::addRepositorySetting()
+{
+    bool accepted = false;
+    const QString key = QInputDialog::getText(this, QStringLiteral("Add repository setting"), QStringLiteral("Git config key:"), QLineEdit::Normal, QString(), &accepted).trimmed();
+    if (!accepted || key.isEmpty()) return;
+    const QString value = QInputDialog::getText(this, QStringLiteral("Add repository setting"), QStringLiteral("Value:"), QLineEdit::Normal, QString(), &accepted);
+    if (accepted) runGit({QStringLiteral("config"), QStringLiteral("--local"), QStringLiteral("--replace-all"), key, value});
+}
+
+void GitWorkspaceWindow::editRepositorySetting(QTreeWidgetItem *item)
+{
+    if (!item) return;
+    bool accepted = false;
+    const QString value = QInputDialog::getText(this, QStringLiteral("Edit repository setting"), item->text(0), QLineEdit::Normal, item->text(1), &accepted);
+    if (accepted) runGit({QStringLiteral("config"), QStringLiteral("--local"), QStringLiteral("--replace-all"), item->text(0), value});
+}
+
+void GitWorkspaceWindow::removeRepositorySetting(QTreeWidgetItem *item)
+{
+    if (!item) return;
+    const QString key = item->text(0);
+    if (QMessageBox::question(this, QStringLiteral("Remove repository setting"), QStringLiteral("Remove all repository values for %1?").arg(key)) == QMessageBox::Yes)
+        runGit({QStringLiteral("config"), QStringLiteral("--local"), QStringLiteral("--unset-all"), key});
 }
 
 QString GitWorkspaceWindow::readStatusSnapshot() const
@@ -1644,6 +1744,27 @@ void GitWorkspaceWindow::refreshStatus()
 void GitWorkspaceWindow::refreshBranches()
 {
     branchesList->clear();
+    QTreeWidgetItem *localRoot = new QTreeWidgetItem(branchesList, {QStringLiteral("Local")});
+    QTreeWidgetItem *remoteRoot = new QTreeWidgetItem(branchesList, {QStringLiteral("Remotes")});
+    const auto insertBranch = [](QTreeWidgetItem *root, const QString &path, const QString &fullName, bool remote, bool current) {
+        const QStringList parts = path.split(QLatin1Char('/'), Qt::SkipEmptyParts);
+        QTreeWidgetItem *parent = root;
+        for (qsizetype i = 0; i < parts.size(); ++i) {
+            QTreeWidgetItem *child = nullptr;
+            for (int j = 0; j < parent->childCount(); ++j) {
+                if (parent->child(j)->text(0) == parts.at(i)) { child = parent->child(j); break; }
+            }
+            if (!child) child = new QTreeWidgetItem(parent, {parts.at(i)});
+            if (i + 1 == parts.size()) {
+                child->setData(0, Qt::UserRole, fullName);
+                child->setData(0, Qt::UserRole + 1, remote);
+                child->setData(0, Qt::UserRole + 2, current);
+                child->setData(0, Qt::UserRole + 3, true);
+                if (current) child->setText(0, QStringLiteral("● %1").arg(parts.at(i)));
+            }
+            parent = child;
+        }
+    };
     const QString text = gitOutput({QStringLiteral("branch"), QStringLiteral("--all"), QStringLiteral("--no-color")});
     for (const QString &line : text.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
         QString name = line.trimmed();
@@ -1652,11 +1773,10 @@ void GitWorkspaceWindow::refreshBranches()
         const bool remote = name.startsWith(QStringLiteral("remotes/"));
         if (remote) name.remove(0, QStringLiteral("remotes/").size());
         if (name.contains(QStringLiteral(" -> "))) continue;
-        auto *item = new QListWidgetItem((remote ? QStringLiteral("remotes/") : QString()) + name, branchesList);
-        item->setData(Qt::UserRole, name);
-        item->setData(Qt::UserRole + 1, remote);
-        item->setData(Qt::UserRole + 2, current);
+        insertBranch(remote ? remoteRoot : localRoot, name, name, remote, current);
     }
+    localRoot->setExpanded(true);
+    remoteRoot->setExpanded(true);
     hasRemote = !gitOutput({QStringLiteral("remote")}).isEmpty();
     const QString branch = gitOutput({QStringLiteral("branch"), QStringLiteral("--show-current")});
     const QString upstream = gitOutput({QStringLiteral("rev-parse"), QStringLiteral("--abbrev-ref"), QStringLiteral("@{upstream}")});
@@ -2127,7 +2247,9 @@ void GitWorkspaceWindow::runRawCommand()
         args.append(QStringLiteral("--progress"));
     commandProcess->setArguments(args);
     setGitBusy(true, showsProgress);
-    rightTabs->setCurrentIndex(1);
+    if (rightTabs->indexOf(commandPanel) < 0) rightTabs->addTab(commandPanel, QStringLiteral("Git Command"));
+    rightTabs->setCurrentWidget(commandPanel);
+    commandPanel->show();
     hadConflictsBeforeCommand = hasConflicts;
     commandProcess->start();
 }

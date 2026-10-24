@@ -65,9 +65,15 @@ private:
     QTimer *lastRepositoryFocusTimer = nullptr;
     QMenu *gitActionsMenu = nullptr;
     QVector<QPointer<QWidget>> busyDisabledWidgets;
-    QListWidget *branchesList = nullptr;
+    QTreeWidget *branchesList = nullptr;
     QListWidget *historyList = nullptr;
     QListWidget *remotesList = nullptr;
+    QTreeWidget *repositorySettingsTree = nullptr;
+    QWidget *commandPanel = nullptr;
+    QWidget *remotesPanel = nullptr;
+    QWidget *credentialsPanel = nullptr;
+    QWidget *repositorySettingsPanel = nullptr;
+    QWidget *previousRightPage = nullptr;
     QListWidget *changeGroupsList = nullptr;
     QPlainTextEdit *detailsView = nullptr;
     QStackedWidget *detailsStack = nullptr;
@@ -136,6 +142,10 @@ private:
     void addCredential();
     void saveIdentity();
     void configureCredentialHelper();
+    void refreshRepositorySettings();
+    void editRepositorySetting(QTreeWidgetItem *item);
+    void addRepositorySetting();
+    void removeRepositorySetting(QTreeWidgetItem *item);
     void appendOutput(const QString &text);
     void sendCommandInput();
     void updateToolbarState();
