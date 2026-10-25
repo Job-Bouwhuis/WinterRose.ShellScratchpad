@@ -168,6 +168,7 @@ private:
     void showCommitDialog();
     void addRemote();
     void createRemoteRepository();
+    void openRemoteInBrowser(const QString &name);
     void changeRemoteUrl(const QString &name);
     void removeRemote(const QString &name);
     void pullCurrentBranch();

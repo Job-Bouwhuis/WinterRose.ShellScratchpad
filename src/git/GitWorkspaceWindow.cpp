@@ -13,6 +13,7 @@
 #include <QAction>
 #include <QApplication>
 #include <QCoreApplication>
+#include <QDesktopServices>
 #include <QBuffer>
 #include <QClipboard>
 #include <QDialog>
@@ -37,6 +38,7 @@
 #include <QPlainTextEdit>
 #include <QPlainTextDocumentLayout>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QRegularExpression>
 #include <QPushButton>
 #include <QKeyEvent>
@@ -74,6 +76,7 @@
 #include <algorithm>
 
 #include <QTimer>
+#include <QUrl>
 #include <QCryptographicHash>
 #include <QSettings>
 #include <QJsonArray>
@@ -908,6 +911,158 @@ private:
 QString gitExecutable()
 {
     return QStringLiteral("git");
+}
+
+bool launchGitHubCliSetup(QWidget *parent)
+{
+    QString distroId;
+    QFile osRelease(QStringLiteral("/etc/os-release"));
+    if (osRelease.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        const QString content = QString::fromUtf8(osRelease.readAll());
+        const QRegularExpression idPattern(QStringLiteral("^ID=(?:\"([^\"]+)\"|'([^']+)'|([^\\n]+))$"), QRegularExpression::MultilineOption);
+        const auto match = idPattern.match(content);
+        if (match.hasMatch()) distroId = match.captured(1).isEmpty() ? match.captured(2) : match.captured(1);
+        if (distroId.isEmpty()) distroId = match.captured(3).trimmed();
+    }
+
+    QString installCommands;
+    if (distroId == QLatin1String("ubuntu") || distroId == QLatin1String("debian")
+        || distroId == QLatin1String("linuxmint") || distroId == QLatin1String("pop")) {
+        installCommands = QStringLiteral(
+            "if ! command -v wget >/dev/null 2>&1; then apt-get update && apt-get install -y wget || exit $?; fi\n"
+            "install -d -m 755 /etc/apt/keyrings\n"
+            "tmp_key=$(mktemp) || exit $?\n"
+            "wget -qO \"$tmp_key\" https://cli.github.com/packages/githubcli-archive-keyring.gpg || exit $?\n"
+            "install -m 644 \"$tmp_key\" /etc/apt/keyrings/githubcli-archive-keyring.gpg; result=$?; rm -f \"$tmp_key\"; [ $result -eq 0 ] || exit $result\n"
+            "install -d -m 755 /etc/apt/sources.list.d\n"
+            "echo \"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\" > /etc/apt/sources.list.d/github-cli.list || exit $?\n"
+            "apt-get update && apt-get install -y gh");
+    } else if (distroId == QLatin1String("fedora")) {
+        installCommands = QStringLiteral("dnf install -y gh");
+    } else if (distroId.startsWith(QLatin1String("opensuse")) || distroId == QLatin1String("sles")) {
+        installCommands = QStringLiteral(
+            "zypper addrepo -f https://cli.github.com/packages/rpm/gh-cli.repo github-cli || zypper modifyrepo -e github-cli; "
+            "zypper --gpg-auto-import-keys refresh github-cli && zypper --non-interactive install -y gh");
+    } else if (distroId == QLatin1String("arch") || distroId == QLatin1String("manjaro")
+               || distroId == QLatin1String("endeavouros")) {
+        installCommands = QStringLiteral("pacman -S --needed --noconfirm github-cli");
+    }
+
+    if (installCommands.isEmpty()) {
+        QMessageBox::information(parent, QStringLiteral("Install GitHub CLI"),
+            QStringLiteral("Automatic installation is not configured for this Linux distribution. Open GitHub’s official instructions to install gh, then choose Create Repository on Remote again."));
+        QDesktopServices::openUrl(QUrl(QStringLiteral("https://github.com/cli/cli/blob/trunk/docs/install_linux.md")));
+        return false;
+    }
+
+    const QString pkexec = QStandardPaths::findExecutable(QStringLiteral("pkexec"));
+    if (pkexec.isEmpty()) {
+        QMessageBox::warning(parent, QStringLiteral("Polkit is required"),
+            QStringLiteral("This distribution does not provide pkexec. Install GitHub CLI with your package manager, then try again; the sign-in step can run inside Shell Scratchpad."));
+        QDesktopServices::openUrl(QUrl(QStringLiteral("https://github.com/cli/cli/blob/trunk/docs/install_linux.md")));
+        return false;
+    }
+
+    QDialog dialog(parent);
+    dialog.setWindowTitle(QStringLiteral("Set up GitHub CLI"));
+    dialog.setMinimumSize(620, 390);
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *status = new QLabel(QStringLiteral("Installing GitHub CLI. Your desktop will ask you to authorize package installation."), &dialog);
+    status->setWordWrap(true);
+    layout->addWidget(status);
+    auto *output = new QPlainTextEdit(&dialog);
+    output->setReadOnly(true);
+    output->setMaximumBlockCount(2000);
+    output->setPlaceholderText(QStringLiteral("Package manager and GitHub sign-in output will appear here."));
+    layout->addWidget(output, 1);
+    auto *progress = new QProgressBar(&dialog);
+    progress->setRange(0, 0);
+    layout->addWidget(progress);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Cancel, &dialog);
+    layout->addWidget(buttons);
+    QProcess process(&dialog);
+    int phase = 0;
+    QObject::connect(&process, &QProcess::readyReadStandardOutput, &dialog, [&] {
+        const QString text = QString::fromLocal8Bit(process.readAllStandardOutput());
+        static const QRegularExpression deviceCode(QStringLiteral("\\b([A-Z0-9]{4}-[A-Z0-9]{4})\\b"));
+        const auto code = deviceCode.match(text);
+        if (phase == 1 && code.hasMatch()) QApplication::clipboard()->setText(code.captured(1));
+        output->moveCursor(QTextCursor::End);
+        output->insertPlainText(text);
+        output->ensureCursorVisible();
+    });
+    QObject::connect(&process, &QProcess::readyReadStandardError, &dialog, [&] {
+        const QString text = QString::fromLocal8Bit(process.readAllStandardError());
+        static const QRegularExpression deviceCode(QStringLiteral("\\b([A-Z0-9]{4}-[A-Z0-9]{4})\\b"));
+        const auto code = deviceCode.match(text);
+        if (phase == 1 && code.hasMatch()) QApplication::clipboard()->setText(code.captured(1));
+        output->moveCursor(QTextCursor::End);
+        output->insertPlainText(text);
+        output->ensureCursorVisible();
+    });
+    QObject::connect(&process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), &dialog,
+        [&](int exitCode, QProcess::ExitStatus exitStatus) {
+            if (phase == 0 && exitStatus == QProcess::NormalExit && exitCode == 0) {
+                phase = 1;
+                status->setText(QStringLiteral("GitHub CLI installed. Sign in at github.com/login/device; the one-time code will be copied to your clipboard."));
+                output->appendPlainText(QStringLiteral("\nStarting GitHub browser sign-in…\n"));
+                progress->setFormat(QStringLiteral("Waiting for GitHub sign-in…"));
+                process.setProgram(QStandardPaths::findExecutable(QStringLiteral("gh")));
+                process.setArguments({QStringLiteral("auth"), QStringLiteral("login"), QStringLiteral("--hostname"),
+                    QStringLiteral("github.com"), QStringLiteral("--git-protocol"), QStringLiteral("https"),
+                    QStringLiteral("--web"), QStringLiteral("--clipboard")});
+                QProcessEnvironment authEnvironment = QProcessEnvironment::systemEnvironment();
+                const QString noBrowser = QStandardPaths::findExecutable(QStringLiteral("true"));
+                if (!noBrowser.isEmpty()) authEnvironment.insert(QStringLiteral("GH_BROWSER"), noBrowser);
+                process.setProcessEnvironment(authEnvironment);
+                process.start();
+                const QUrl deviceLoginUrl(QStringLiteral("https://github.com/login/device"));
+                if (!QDesktopServices::openUrl(deviceLoginUrl))
+                    output->appendPlainText(QStringLiteral("Could not open the browser automatically. Open this link to finish sign-in: %1\n")
+                        .arg(deviceLoginUrl.toString()));
+                return;
+            }
+            progress->hide();
+            buttons->clear();
+            buttons->addButton(QDialogButtonBox::Close);
+            if (exitStatus == QProcess::NormalExit && exitCode == 0) {
+                status->setText(QStringLiteral("GitHub sign-in completed. Continuing repository creation…"));
+                output->appendPlainText(QStringLiteral("\nSigned in to GitHub successfully. Continuing in Shell Scratchpad."));
+                if (parent) {
+                    QWidget *appWindow = parent->window();
+                    appWindow->show();
+                    appWindow->raise();
+                    appWindow->activateWindow();
+                }
+                dialog.accept();
+            } else {
+                status->setText(phase == 0 ? QStringLiteral("Installation failed. Review the package-manager output and try again.")
+                                           : QStringLiteral("GitHub sign-in did not complete. Review the output and try again."));
+            }
+        });
+    QObject::connect(&process, &QProcess::errorOccurred, &dialog, [&](QProcess::ProcessError error) {
+        if (error != QProcess::FailedToStart) return;
+        progress->hide();
+        buttons->clear();
+        buttons->addButton(QDialogButtonBox::Close);
+        status->setText(QStringLiteral("Could not start the setup command: %1").arg(process.errorString()));
+    });
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, [&] {
+        if (process.state() != QProcess::NotRunning) process.terminate();
+        dialog.reject();
+    });
+    QObject::connect(buttons, &QDialogButtonBox::clicked, &dialog, [&](QAbstractButton *button) {
+        if (buttons->standardButton(button) == QDialogButtonBox::Close) dialog.accept();
+    });
+    process.setProgram(pkexec);
+    process.setArguments({QStringLiteral("bash"), QStringLiteral("-c"), installCommands});
+    process.start();
+    dialog.exec();
+    if (process.state() != QProcess::NotRunning) {
+        process.kill();
+        process.waitForFinished(1000);
+    }
+    return phase == 1 && process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0;
 }
 
 QIcon gitIcon(const QString &name)
@@ -1782,10 +1937,12 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     remotesLayout->addWidget(remotesList, 1);
     auto *remoteActions = new QHBoxLayout;
     auto *addRemoteButton = new QPushButton(QStringLiteral("Add Remote…"), remotesPanel);
+    auto *openRemoteButton = new QPushButton(QStringLiteral("Open in Browser"), remotesPanel);
     auto *editRemoteButton = new QPushButton(QStringLiteral("Change URL…"), remotesPanel);
     auto *removeRemoteButton = new QPushButton(QStringLiteral("Remove Remote…"), remotesPanel);
     auto *createRepositoryButton = new QPushButton(QStringLiteral("Create Repository on Remote…"), remotesPanel);
     remoteActions->addWidget(addRemoteButton);
+    remoteActions->addWidget(openRemoteButton);
     remoteActions->addWidget(editRemoteButton);
     remoteActions->addWidget(removeRemoteButton);
     remoteActions->addWidget(createRepositoryButton);
@@ -1794,6 +1951,13 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     rightTabs->addTab(commandPanel, QStringLiteral("Git Command"));
     rightTabs->addTab(remotesPanel, QStringLiteral("Remotes"));
     connect(addRemoteButton, &QPushButton::clicked, this, [this] { addRemote(); });
+    openRemoteButton->setEnabled(false);
+    connect(remotesList, &QListWidget::currentItemChanged, this, [openRemoteButton](QListWidgetItem *current) {
+        openRemoteButton->setEnabled(current != nullptr);
+    });
+    connect(openRemoteButton, &QPushButton::clicked, this, [this] {
+        if (remotesList->currentItem()) openRemoteInBrowser(remotesList->currentItem()->data(Qt::UserRole).toString());
+    });
     connect(createRepositoryButton, &QPushButton::clicked, this, [this] { createRemoteRepository(); });
     connect(editRemoteButton, &QPushButton::clicked, this, [this] {
         if (remotesList->currentItem()) changeRemoteUrl(remotesList->currentItem()->data(Qt::UserRole).toString());
@@ -1812,6 +1976,8 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
         QMenu menu(this);
         QAction *fetch = menu.addAction(QStringLiteral("Fetch %1").arg(name));
         connect(fetch, &QAction::triggered, this, [this, name] { runGit({QStringLiteral("fetch"), name, QStringLiteral("--prune")}); });
+        QAction *open = menu.addAction(QStringLiteral("Open in Browser"));
+        connect(open, &QAction::triggered, this, [this, name] { openRemoteInBrowser(name); });
         QAction *edit = menu.addAction(QStringLiteral("Change URL…"));
         connect(edit, &QAction::triggered, this, [this, name] { changeRemoteUrl(name); });
         QAction *remove = menu.addAction(QStringLiteral("Remove Remote…"));
@@ -3023,33 +3189,87 @@ void GitWorkspaceWindow::addRemote()
     if (accepted && !url.isEmpty()) runGit({QStringLiteral("remote"), QStringLiteral("add"), name, url});
 }
 
+void GitWorkspaceWindow::openRemoteInBrowser(const QString &name)
+{
+    const QString remote = gitOutput({QStringLiteral("remote"), QStringLiteral("get-url"), name}).trimmed();
+    if (remote.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("Remote URL unavailable"),
+            QStringLiteral("Could not read the URL for remote %1.").arg(name));
+        return;
+    }
+
+    QUrl webUrl;
+    static const QRegularExpression scpUrlPattern(QStringLiteral("^(?:[^@/]+@)?([^:/]+):(.+)$"));
+    const auto scpMatch = scpUrlPattern.match(remote);
+    if (!remote.contains(QStringLiteral("://")) && scpMatch.hasMatch()) {
+        webUrl.setScheme(QStringLiteral("https"));
+        webUrl.setHost(scpMatch.captured(1));
+        webUrl.setPath(QLatin1Char('/') + scpMatch.captured(2));
+    } else {
+        webUrl = QUrl(remote);
+        const QString scheme = webUrl.scheme().toLower();
+        if (scheme == QStringLiteral("ssh") || scheme == QStringLiteral("git") || scheme == QStringLiteral("git+ssh")) {
+            webUrl.setScheme(QStringLiteral("https"));
+            webUrl.setUserInfo(QString());
+            webUrl.setPort(-1);
+        }
+    }
+
+    QString path = webUrl.path();
+    while (path.endsWith(QLatin1Char('/'))) path.chop(1);
+    if (path.endsWith(QStringLiteral(".git"), Qt::CaseInsensitive)) path.chop(4);
+    webUrl.setPath(path);
+    webUrl.setQuery(QString());
+    webUrl.setFragment(QString());
+    if (!webUrl.isValid() || webUrl.host().isEmpty() || path.isEmpty()
+        || (webUrl.scheme() != QStringLiteral("http") && webUrl.scheme() != QStringLiteral("https"))) {
+        QMessageBox::warning(this, QStringLiteral("Cannot open remote in browser"),
+            QStringLiteral("Remote %1 does not have a web-compatible repository URL:\n%2").arg(name, remote));
+        return;
+    }
+    if (!QDesktopServices::openUrl(webUrl)) {
+        QMessageBox::warning(this, QStringLiteral("Could not open browser"),
+            QStringLiteral("Could not open %1 in the default browser.").arg(webUrl.toString()));
+    }
+}
+
 void GitWorkspaceWindow::createRemoteRepository()
 {
+    int headCheckExitCode = -1;
+    const QString head = gitOutput({QStringLiteral("rev-parse"), QStringLiteral("--verify"),
+        QStringLiteral("--quiet"), QStringLiteral("HEAD")}, &headCheckExitCode);
+    const bool hasCommits = headCheckExitCode == 0 && !head.isEmpty();
+    const int totalSteps = hasCommits ? 5 : 4;
+    const auto stepTitle = [totalSteps](const QString &number, const QString &label) {
+        return QStringLiteral("Step %1 of %2 — %3").arg(number).arg(totalSteps).arg(label);
+    };
     // Keep provider selection explicit so additional Git hosting services can be
     // added here without tying this workflow to GitHub's command line.
     const QStringList providers{QStringLiteral("GitHub")};
     bool accepted = false;
-    const QString provider = QInputDialog::getItem(this, QStringLiteral("Create remote repository"),
+    const QString provider = QInputDialog::getItem(this, stepTitle(QStringLiteral("1"), QStringLiteral("Git service")),
         QStringLiteral("Git service:"), providers, 0, false, &accepted);
     if (!accepted || provider.isEmpty()) return;
-    const QString gh = QStandardPaths::findExecutable(QStringLiteral("gh"));
-    if (gh.isEmpty()) {
-        QMessageBox::warning(this, QStringLiteral("GitHub CLI required"),
-            QStringLiteral("Install the GitHub CLI (gh) and sign in with “gh auth login” to create GitHub repositories."));
-        return;
-    }
+    QString gh = QStandardPaths::findExecutable(QStringLiteral("gh"));
     const QString suggestedName = QFileInfo(repoPath).fileName();
-    const QString repositoryName = QInputDialog::getText(this, QStringLiteral("Create GitHub repository"),
+    const QString repositoryName = QInputDialog::getText(this, stepTitle(QStringLiteral("2"), QStringLiteral("Repository name")),
         QStringLiteral("Repository name (or owner/name):"), QLineEdit::Normal, suggestedName, &accepted).trimmed();
     if (!accepted || repositoryName.isEmpty()) return;
     const QStringList visibilityOptions{QStringLiteral("Private"), QStringLiteral("Public")};
-    const QString visibility = QInputDialog::getItem(this, QStringLiteral("Repository visibility"),
+    const QString visibility = QInputDialog::getItem(this, stepTitle(QStringLiteral("3"), QStringLiteral("Repository visibility")),
         QStringLiteral("Visibility:"), visibilityOptions, 0, false, &accepted);
     if (!accepted) return;
+    QString license;
+    if (visibility == QStringLiteral("Public")) {
+        license = QInputDialog::getText(this, stepTitle(QStringLiteral("3.5"), QStringLiteral("Public repository license")),
+            QStringLiteral("GitHub license identifier (MPL-2.0 by default):"), QLineEdit::Normal,
+            QStringLiteral("MPL-2.0"), &accepted).trimmed();
+        if (!accepted || license.isEmpty()) return;
+    }
     const QStringList existingRemotes = gitOutput({QStringLiteral("remote")}).split(QLatin1Char('\n'), Qt::SkipEmptyParts);
     const QString suggestedRemote = existingRemotes.contains(QStringLiteral("origin"))
         ? QStringLiteral("github") : QStringLiteral("origin");
-    const QString remoteName = QInputDialog::getText(this, QStringLiteral("Add GitHub remote"),
+    const QString remoteName = QInputDialog::getText(this, stepTitle(QStringLiteral("4"), QStringLiteral("Local remote name")),
         QStringLiteral("Local remote name:"), QLineEdit::Normal, suggestedRemote, &accepted).trimmed();
     if (!accepted || remoteName.isEmpty()) return;
     if (existingRemotes.contains(remoteName)) {
@@ -3057,44 +3277,201 @@ void GitWorkspaceWindow::createRemoteRepository()
             QStringLiteral("A remote named %1 already exists. Choose another name or remove that remote first.").arg(remoteName));
         return;
     }
-    const bool pushNow = QMessageBox::question(this, QStringLiteral("Push local branch"),
-        QStringLiteral("Push the current branch to the new GitHub repository after creating it?"),
-        QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes;
-    QStringList arguments{QStringLiteral("repo"), QStringLiteral("create"), repositoryName,
-        visibility == QStringLiteral("Private") ? QStringLiteral("--private") : QStringLiteral("--public"),
-        QStringLiteral("--source"), repoPath, QStringLiteral("--remote"), remoteName};
-    if (pushNow) arguments.append(QStringLiteral("--push"));
-    QProgressDialog progress(QStringLiteral("Creating GitHub repository…"), QStringLiteral("Cancel"), 0, 0, this);
+    bool pushNow = false;
+    if (hasCommits) {
+        QMessageBox pushPrompt(this);
+        pushPrompt.setWindowTitle(stepTitle(QStringLiteral("5"), QStringLiteral("Push local commits")));
+        pushPrompt.setText(QStringLiteral("Push the current branch to the new GitHub repository after creating it?"));
+        pushPrompt.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
+        pushPrompt.setDefaultButton(QMessageBox::No);
+        pushNow = pushPrompt.exec() == QMessageBox::Yes;
+    }
+    if (gh.isEmpty()) {
+        QMessageBox prompt(this);
+        prompt.setIcon(QMessageBox::Information);
+        prompt.setWindowTitle(QStringLiteral("Set up GitHub CLI"));
+        prompt.setText(QStringLiteral("GitHub CLI (gh) is needed to create this repository."));
+        prompt.setInformativeText(QStringLiteral("Shell Scratchpad can install gh, open GitHub’s device sign-in page, copy the one-time code, then continue creating %1 automatically.").arg(repositoryName));
+        auto *installButton = prompt.addButton(QStringLiteral("Install and Continue…"), QMessageBox::AcceptRole);
+        prompt.addButton(QMessageBox::Cancel);
+        prompt.exec();
+        if (prompt.clickedButton() != installButton || !launchGitHubCliSetup(this)) return;
+        gh = QStandardPaths::findExecutable(QStringLiteral("gh"));
+        if (gh.isEmpty()) {
+            QMessageBox::critical(this, QStringLiteral("GitHub CLI unavailable"),
+                QStringLiteral("Sign-in completed, but Shell Scratchpad could not find gh. Restart Shell Scratchpad and try again."));
+            return;
+        }
+    }
+    QProgressDialog progress(QStringLiteral("Preparing GitHub repository…"), QStringLiteral("Cancel"), 0, 0, this);
     progress.setWindowTitle(QStringLiteral("GitHub"));
     progress.setWindowModality(Qt::WindowModal);
     progress.setCancelButton(nullptr);
     progress.show();
-    QProcess process;
-    process.setProgram(gh);
-    process.setArguments(arguments);
-    process.setWorkingDirectory(repoPath);
-    process.start();
-    if (!process.waitForStarted(3000)) {
+    auto runCommand = [this, &progress](const QString &program, const QStringList &arguments,
+                                        QString *standardOutput, QString *standardError) {
+        QProcess command;
+        command.setProgram(program);
+        command.setArguments(arguments);
+        command.setWorkingDirectory(repoPath);
+        command.start();
+        if (!command.waitForStarted(3000)) {
+            if (standardError) *standardError = command.errorString();
+            return false;
+        }
+        QByteArray out;
+        QByteArray err;
+        while (command.state() != QProcess::NotRunning) {
+            command.waitForFinished(100);
+            out += command.readAllStandardOutput();
+            err += command.readAllStandardError();
+            QCoreApplication::processEvents();
+        }
+        out += command.readAllStandardOutput();
+        err += command.readAllStandardError();
+        if (standardOutput) *standardOutput = QString::fromLocal8Bit(out).trimmed();
+        if (standardError) *standardError = QString::fromLocal8Bit(err).trimmed();
+        return command.exitStatus() == QProcess::NormalExit && command.exitCode() == 0;
+    };
+
+    QString repositorySlug = repositoryName;
+    if (!repositoryName.contains(QLatin1Char('/'))) {
+        progress.setLabelText(QStringLiteral("Checking your GitHub account…"));
+        QString login;
+        QString error;
+        if (!runCommand(gh, {QStringLiteral("api"), QStringLiteral("user"), QStringLiteral("--jq"), QStringLiteral(".login")}, &login, &error)
+            || login.isEmpty()) {
+            progress.close();
+            QMessageBox::critical(this, QStringLiteral("Could not determine GitHub account"), error);
+            return;
+        }
+        repositorySlug = login + QLatin1Char('/') + repositoryName;
+    } else if (repositoryName.count(QLatin1Char('/')) != 1
+               || repositoryName.startsWith(QLatin1Char('/')) || repositoryName.endsWith(QLatin1Char('/'))) {
         progress.close();
-        QMessageBox::critical(this, QStringLiteral("Could not start GitHub CLI"), process.errorString());
+        QMessageBox::warning(this, QStringLiteral("Invalid repository name"),
+            QStringLiteral("Use a repository name or owner/repository."));
         return;
     }
-    while (process.state() != QProcess::NotRunning) {
-        process.waitForFinished(100);
-        QCoreApplication::processEvents();
+
+    QString licenseBody;
+    if (!license.isEmpty()) {
+        static const QRegularExpression validLicenseId(QStringLiteral("^[A-Za-z0-9.-]+$"));
+        if (!validLicenseId.match(license).hasMatch()) {
+            progress.close();
+            QMessageBox::warning(this, QStringLiteral("Invalid license identifier"),
+                QStringLiteral("Use a GitHub license identifier such as MPL-2.0."));
+            return;
+        }
+        progress.setLabelText(QStringLiteral("Checking the %1 license template…").arg(license));
+        QString error;
+        if (!runCommand(gh, {QStringLiteral("api"), QStringLiteral("licenses/%1").arg(license.toLower()),
+                             QStringLiteral("--jq"), QStringLiteral(".body")}, &licenseBody, &error)
+            || licenseBody.isEmpty()) {
+            progress.close();
+            QMessageBox::critical(this, QStringLiteral("GitHub license unavailable"),
+                error.isEmpty() ? QStringLiteral("GitHub did not return a license template for %1.").arg(license) : error);
+            return;
+        }
     }
-    progress.close();
-    const QString output = QString::fromLocal8Bit(process.readAllStandardOutput()).trimmed();
-    const QString error = QString::fromLocal8Bit(process.readAllStandardError()).trimmed();
-    if (process.exitCode() != 0) {
+
+    progress.setLabelText(QStringLiteral("Creating GitHub repository…"));
+    QStringList createArguments{QStringLiteral("repo"), QStringLiteral("create"), repositorySlug,
+        visibility == QStringLiteral("Private") ? QStringLiteral("--private") : QStringLiteral("--public")};
+    QString output;
+    QString error;
+    if (!runCommand(gh, createArguments, &output, &error)) {
+        progress.close();
         QMessageBox::critical(this, QStringLiteral("GitHub repository creation failed"),
             error.isEmpty() ? output : error);
         return;
     }
-    appendOutput(output.isEmpty() ? QStringLiteral("Created GitHub repository %1").arg(repositoryName) : output);
+
+    const QString remoteUrl = QStringLiteral("https://github.com/%1.git").arg(repositorySlug);
+    progress.setLabelText(QStringLiteral("Adding remote %1…").arg(remoteName));
+    if (!runCommand(gitExecutable(), {QStringLiteral("remote"), QStringLiteral("add"), remoteName, remoteUrl}, nullptr, &error)) {
+        progress.close();
+        QMessageBox::critical(this, QStringLiteral("Repository created, but remote setup failed"), error);
+        return;
+    }
+
+    const QString trackedLicense = gitOutput({QStringLiteral("ls-files"), QStringLiteral("--"),
+        QStringLiteral("LICENSE"), QStringLiteral("LICENSE.md"), QStringLiteral("LICENSE.txt"),
+        QStringLiteral("LICENCE"), QStringLiteral("LICENCE.md"), QStringLiteral("COPYING")});
+    const bool licenseAlreadyInLocalRepository = !trackedLicense.isEmpty();
+    QString licenseError;
+    QString remoteBranch;
+    if (!licenseBody.isEmpty() && !licenseAlreadyInLocalRepository) {
+        QStringList licenseArguments{QStringLiteral("api"), QStringLiteral("repos/%1/contents/LICENSE").arg(repositorySlug),
+            QStringLiteral("--method"), QStringLiteral("PUT"),
+            QStringLiteral("--field"), QStringLiteral("message=Add %1 license").arg(license),
+            QStringLiteral("--field"), QStringLiteral("content=%1").arg(QString::fromLatin1(licenseBody.toUtf8().toBase64()))};
+        progress.setLabelText(QStringLiteral("Adding the %1 license…").arg(license));
+        if (!runCommand(gh, licenseArguments, nullptr, &licenseError)) {
+            if (licenseError.isEmpty()) licenseError = QStringLiteral("GitHub could not add the selected license file.");
+        } else {
+            if (!runCommand(gh, {QStringLiteral("api"), QStringLiteral("repos/%1").arg(repositorySlug),
+                                 QStringLiteral("--jq"), QStringLiteral(".default_branch")}, &remoteBranch, &licenseError)
+                || remoteBranch.isEmpty()) {
+                if (licenseError.isEmpty()) licenseError = QStringLiteral("GitHub did not return the repository's default branch.");
+            }
+        }
+    }
+
+    // Pull the license commit into the local workspace before pushing any local
+    // history. This also works for an unborn local branch: the pull establishes
+    // its first commit, while a push is intentionally skipped below.
+    QString pullError;
+    if (licenseError.isEmpty()) {
+        QString remoteHeads;
+        if (!runCommand(gitExecutable(), {QStringLiteral("ls-remote"), QStringLiteral("--heads"), remoteName}, &remoteHeads, &pullError)) {
+            if (pullError.isEmpty()) pullError = remoteHeads;
+        } else if (!remoteHeads.trimmed().isEmpty()) {
+            if (remoteBranch.isEmpty()) {
+                const QStringList refs = remoteHeads.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+                const QString ref = refs.isEmpty() ? QString() : refs.first().section(QLatin1Char('\t'), 1).trimmed();
+                remoteBranch = ref.startsWith(QStringLiteral("refs/heads/")) ? ref.mid(11) : QString();
+            }
+            if (remoteBranch.isEmpty()) {
+                pullError = QStringLiteral("The remote has commits, but its branch could not be determined.");
+            } else {
+                progress.setLabelText(QStringLiteral("Pulling remote changes into the local repository…"));
+                QStringList pullArguments{QStringLiteral("pull"), QStringLiteral("--no-edit"), remoteName, remoteBranch};
+                if (hasCommits)
+                    pullArguments.insert(1, QStringLiteral("--allow-unrelated-histories"));
+                else
+                    pullArguments.insert(1, QStringLiteral("--ff-only"));
+                if (!runCommand(gitExecutable(), pullArguments, &output, &pullError))
+                    pullError = QStringLiteral("Could not pull remote changes into the local repository: %1")
+                                    .arg(pullError.isEmpty() ? output : pullError);
+            }
+        }
+    }
+
+    QString pushError;
+    if (pullError.isEmpty() && licenseError.isEmpty() && pushNow && hasCommits) {
+        progress.setLabelText(QStringLiteral("Pushing local commits…"));
+        if (!runCommand(gitExecutable(), {QStringLiteral("push"), QStringLiteral("--set-upstream"), remoteName, QStringLiteral("HEAD")}, &output, &pushError))
+            pushError = pushError.isEmpty() ? output : pushError;
+    }
+
+    progress.close();
     refreshRemotes();
-    QMessageBox::information(this, QStringLiteral("Repository created"),
-        QStringLiteral("Created %1 on GitHub and added it as remote %2.").arg(repositoryName, remoteName));
+    if (!pushError.isEmpty() || !licenseError.isEmpty() || !pullError.isEmpty()) {
+        QStringList details;
+        if (!pushError.isEmpty()) details.append(QStringLiteral("Push failed: %1").arg(pushError));
+        if (!licenseError.isEmpty()) details.append(QStringLiteral("License file could not be added: %1").arg(licenseError));
+        if (!pullError.isEmpty()) details.append(pullError);
+        QMessageBox::warning(this, QStringLiteral("Repository created with follow-up needed"),
+            QStringLiteral("Created %1 on GitHub and added it as remote %2.\n\n%3")
+                .arg(repositorySlug, remoteName, details.join(QStringLiteral("\n"))));
+        return;
+    }
+    QString summary = QStringLiteral("Created %1 on GitHub and added it as remote %2.").arg(repositorySlug, remoteName);
+    if (!license.isEmpty()) summary += QStringLiteral(" Added the %1 license.").arg(license);
+    if (licenseAlreadyInLocalRepository) summary += QStringLiteral(" Kept the existing local license file.");
+    if (!hasCommits) summary += QStringLiteral(" No commits were found, so nothing was pushed. Commit your files before pushing.");
+    QMessageBox::information(this, QStringLiteral("Repository created"), summary);
 }
 
 void GitWorkspaceWindow::changeRemoteUrl(const QString &name)
