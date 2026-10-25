@@ -91,6 +91,33 @@
 
 namespace ShellScratchpad::Git
 {
+namespace
+{
+QString temporaryMergeSettingsKey(const QString &repoPath)
+{
+    const QFileInfo info(repoPath);
+    const QString identity = info.canonicalFilePath().isEmpty() ? info.absoluteFilePath() : info.canonicalFilePath();
+    const QByteArray digest = QCryptographicHash::hash(identity.toUtf8(), QCryptographicHash::Sha256).toHex();
+    return QStringLiteral("gitWorkspace/temporaryMergeBranches/%1").arg(QString::fromLatin1(digest));
+}
+
+QJsonObject readTemporaryMergeBranches(const QString &repoPath)
+{
+    const QByteArray data = QSettings().value(temporaryMergeSettingsKey(repoPath)).toByteArray();
+    return QJsonDocument::fromJson(data).object();
+}
+
+bool writeTemporaryMergeBranches(const QString &repoPath, const QJsonObject &branches)
+{
+    QSettings settings;
+    const QString key = temporaryMergeSettingsKey(repoPath);
+    if (branches.isEmpty()) settings.remove(key);
+    else settings.setValue(key, QJsonDocument(branches).toJson(QJsonDocument::Compact));
+    settings.sync();
+    return settings.status() == QSettings::NoError;
+}
+}
+
 class HistoryGraphWidget final : public QWidget
 {
 public:
@@ -2912,7 +2939,8 @@ void GitWorkspaceWindow::refreshBranches()
     branchesList->clear();
     QTreeWidgetItem *localRoot = new QTreeWidgetItem(branchesList, {QStringLiteral("Local")});
     QTreeWidgetItem *remoteRoot = new QTreeWidgetItem(branchesList, {QStringLiteral("Remotes")});
-    const auto insertBranch = [](QTreeWidgetItem *root, const QString &path, const QString &fullName, bool remote, bool current) {
+    const QJsonObject temporaryBranches = readTemporaryMergeBranches(repoPath);
+    const auto insertBranch = [&temporaryBranches](QTreeWidgetItem *root, const QString &path, const QString &fullName, bool remote, bool current) {
         const QStringList parts = path.split(QLatin1Char('/'), Qt::SkipEmptyParts);
         QTreeWidgetItem *parent = root;
         for (qsizetype i = 0; i < parts.size(); ++i) {
@@ -2926,6 +2954,11 @@ void GitWorkspaceWindow::refreshBranches()
                 child->setData(0, Qt::UserRole + 1, remote);
                 child->setData(0, Qt::UserRole + 2, current);
                 child->setData(0, Qt::UserRole + 3, true);
+                if (!remote && temporaryBranches.contains(fullName)) {
+                    const QJsonObject metadata = temporaryBranches.value(fullName).toObject();
+                    child->setToolTip(0, QStringLiteral("Temporary merge branch for %1. Right-click to accept it as solid.")
+                        .arg(metadata.value(QStringLiteral("targetBranch")).toString()));
+                }
                 if (current) child->setText(0, QStringLiteral("● %1").arg(parts.at(i)));
             }
             parent = child;
@@ -3700,10 +3733,11 @@ void GitWorkspaceWindow::switchToBranch(const QString &branch, bool remote)
         runGit({QStringLiteral("switch"), QStringLiteral("--track"), QStringLiteral("-c"), localName, branch});
 }
 
-void GitWorkspaceWindow::createBranchFromHere(const QString &branch, bool remote)
+void GitWorkspaceWindow::createBranchFromHere(const QString &branch, bool remote, bool temporaryMerge)
 {
     bool accepted = false;
-    const QString name = QInputDialog::getText(this, QStringLiteral("Create Branch from Here"),
+    const QString name = QInputDialog::getText(this, temporaryMerge ? QStringLiteral("Create Temporary Merge Branch")
+                                                                    : QStringLiteral("Create Branch from Here"),
         QStringLiteral("New branch name (starting from %1):").arg(branch),
         QLineEdit::Normal, QString(), &accepted).trimmed();
     if (!accepted || name.isEmpty()) return;
@@ -3838,9 +3872,35 @@ void GitWorkspaceWindow::createBranchFromHere(const QString &branch, bool remote
     }
 
     bool branchCreated = false;
+    QString persistenceError;
     if (failure.isEmpty()) {
-        progress.setLabelText(QStringLiteral("Creating and switching to %1…").arg(name));
+        progress.setLabelText(temporaryMerge
+            ? QStringLiteral("Creating temporary merge branch %1…").arg(name)
+            : QStringLiteral("Creating and switching to %1…").arg(name));
         branchCreated = run({QStringLiteral("switch"), QStringLiteral("--create"), name}, &failure);
+        if (branchCreated && temporaryMerge) {
+            const QString targetBranch = remote ? branch.section(QLatin1Char('/'), 1) : branch;
+            QString remoteName;
+            QString remoteBranch;
+            if (remote) remoteName = branch.section(QLatin1Char('/'), 0, 0);
+            else {
+                remoteName = gitOutput({QStringLiteral("config"), QStringLiteral("--get"),
+                    QStringLiteral("branch.%1.remote").arg(branch)}).trimmed();
+                if (remoteName == QStringLiteral(".")) remoteName.clear();
+                remoteBranch = gitOutput({QStringLiteral("config"), QStringLiteral("--get"),
+                    QStringLiteral("branch.%1.merge").arg(branch)}).trimmed();
+                if (remoteBranch.startsWith(QStringLiteral("refs/heads/"))) remoteBranch.remove(0, 11);
+            }
+            QJsonObject metadata;
+            metadata.insert(QStringLiteral("targetBranch"), targetBranch);
+            metadata.insert(QStringLiteral("targetRemote"), remoteName);
+            metadata.insert(QStringLiteral("targetRemoteBranch"), remoteBranch.isEmpty() ? targetBranch : remoteBranch);
+            metadata.insert(QStringLiteral("targetIsRemote"), remote);
+            QJsonObject temporaryBranches = readTemporaryMergeBranches(repoPath);
+            temporaryBranches.insert(name, metadata);
+            if (!writeTemporaryMergeBranches(repoPath, temporaryBranches))
+                persistenceError = QStringLiteral("The branch was created, but its merge target could not be saved. This workflow may not be recoverable after closing the app.");
+        }
     }
 
     QString stashRestoreError;
@@ -3881,10 +3941,275 @@ void GitWorkspaceWindow::createBranchFromHere(const QString &branch, bool remote
                 .arg(name, stashRestoreError));
         return;
     }
+    if (!persistenceError.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("Temporary branch created without saved workflow"),
+            QStringLiteral("Created and switched to %1.\n\n%2").arg(name, persistenceError));
+        return;
+    }
     if (dirtyAction == DirtyAction::StashKeep)
         statusBar()->showMessage(QStringLiteral("Created and switched to %1. Your changes remain in Git stash.").arg(name), 8000);
+    else if (temporaryMerge)
+        statusBar()->showMessage(QStringLiteral("Created temporary merge branch %1 for %2. Its target is saved for later acceptance.").arg(name, branch), 9000);
     else
         statusBar()->showMessage(QStringLiteral("Created and switched to branch %1.").arg(name), 6000);
+}
+
+void GitWorkspaceWindow::acceptTemporaryMergeBranch(const QString &branch)
+{
+    const QJsonObject temporaryBranches = readTemporaryMergeBranches(repoPath);
+    if (!temporaryBranches.contains(branch)) {
+        QMessageBox::warning(this, QStringLiteral("Temporary branch not found"),
+            QStringLiteral("No saved merge target exists for branch %1.").arg(branch));
+        return;
+    }
+    const QString currentBranch = gitOutput({QStringLiteral("branch"), QStringLiteral("--show-current")}).trimmed();
+    if (currentBranch != branch) {
+        QMessageBox::information(this, QStringLiteral("Switch to the temporary branch"),
+            QStringLiteral("Switch to %1 before accepting it as solid.").arg(branch));
+        return;
+    }
+    const QJsonObject metadata = temporaryBranches.value(branch).toObject();
+    const QString targetBranch = metadata.value(QStringLiteral("targetBranch")).toString();
+    const QString targetRemoteBranch = metadata.value(QStringLiteral("targetRemoteBranch")).toString(targetBranch);
+    QString targetRemote = metadata.value(QStringLiteral("targetRemote")).toString();
+    if (targetBranch.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("Merge target unavailable"),
+            QStringLiteral("The saved target for %1 is incomplete. The temporary branch has been kept.").arg(branch));
+        return;
+    }
+    if (commandProcess->state() != QProcess::NotRunning || RepositoryOperationCoordinator::isBusy(repoPath)) {
+        QMessageBox::information(this, QStringLiteral("Git is busy"),
+            QStringLiteral("Wait for the current repository operation to finish before accepting this branch."));
+        return;
+    }
+
+    enum class DirtyAction { None, StashAndPop, StashKeep, Commit, Cancel };
+    DirtyAction dirtyAction = DirtyAction::None;
+    if (!gitOutput({QStringLiteral("status"), QStringLiteral("--porcelain=v1")}).isEmpty()) {
+        QMessageBox choice(this);
+        choice.setIcon(QMessageBox::Question);
+        choice.setWindowTitle(QStringLiteral("Changes on Temporary Branch"));
+        choice.setText(QStringLiteral("There are staged, unstaged, or untracked changes on %1.").arg(branch));
+        choice.setInformativeText(QStringLiteral("Choose how to handle them before merging into %1.").arg(targetBranch));
+        QPushButton *stashAndPop = choice.addButton(QStringLiteral("Stash and Apply on Target"), QMessageBox::AcceptRole);
+        QPushButton *stashKeep = choice.addButton(QStringLiteral("Stash and Keep Stashed"), QMessageBox::ActionRole);
+        QPushButton *stageCommit = choice.addButton(QStringLiteral("Stage All and Commit…"), QMessageBox::ActionRole);
+        QPushButton *cancel = choice.addButton(QStringLiteral("Cancel"), QMessageBox::RejectRole);
+        choice.setDefaultButton(stashAndPop);
+        choice.exec();
+        if (choice.clickedButton() == stashAndPop) dirtyAction = DirtyAction::StashAndPop;
+        else if (choice.clickedButton() == stashKeep) dirtyAction = DirtyAction::StashKeep;
+        else if (choice.clickedButton() == stageCommit) dirtyAction = DirtyAction::Commit;
+        else if (choice.clickedButton() == cancel) dirtyAction = DirtyAction::Cancel;
+        if (dirtyAction == DirtyAction::Cancel || dirtyAction == DirtyAction::None) return;
+    }
+
+    bool accepted = false;
+    QString commitMessage;
+    if (dirtyAction == DirtyAction::Commit) {
+        commitMessage = QInputDialog::getMultiLineText(this, QStringLiteral("Commit Before Accepting Branch"),
+            QStringLiteral("Commit message:"), QString(), &accepted).trimmed();
+        if (!accepted) return;
+        if (commitMessage.isEmpty()) {
+            QMessageBox::warning(this, QStringLiteral("Commit message required"),
+                QStringLiteral("Enter a commit message before accepting the branch."));
+            return;
+        }
+    }
+
+    if (!RepositoryOperationCoordinator::tryAcquire(repoPath)) {
+        QMessageBox::information(this, QStringLiteral("Repository is busy"),
+            QStringLiteral("Another Git operation is running in this repository."));
+        return;
+    }
+    QProgressDialog progress(QStringLiteral("Accepting %1…").arg(branch), QString(), 0, 0, this);
+    progress.setWindowTitle(QStringLiteral("Accept Temporary Branch"));
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setCancelButton(nullptr);
+    progress.setMinimumDuration(0);
+    setGitBusy(true, true);
+    progress.show();
+
+    const auto run = [this](const QStringList &arguments, QString *detail) {
+        QProcess process;
+        process.setProgram(gitExecutable());
+        process.setArguments(arguments);
+        process.setWorkingDirectory(repoPath);
+        process.start();
+        if (!process.waitForStarted(3000)) {
+            if (detail) *detail = process.errorString();
+            return false;
+        }
+        QByteArray standardOutput;
+        QByteArray standardError;
+        while (process.state() != QProcess::NotRunning) {
+            process.waitForFinished(100);
+            standardOutput += process.readAllStandardOutput();
+            standardError += process.readAllStandardError();
+            QCoreApplication::processEvents();
+        }
+        standardOutput += process.readAllStandardOutput();
+        standardError += process.readAllStandardError();
+        const bool succeeded = process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0;
+        if (!succeeded && detail) {
+            *detail = QString::fromLocal8Bit(standardError).trimmed();
+            if (detail->isEmpty()) *detail = QString::fromLocal8Bit(standardOutput).trimmed();
+            if (detail->isEmpty()) *detail = QStringLiteral("git %1 failed.").arg(arguments.join(QLatin1Char(' ')));
+        }
+        return succeeded;
+    };
+
+    QString failure;
+    QString stashObject;
+    if (dirtyAction == DirtyAction::StashAndPop || dirtyAction == DirtyAction::StashKeep) {
+        progress.setLabelText(QStringLiteral("Stashing changes from %1…").arg(branch));
+        if (run({QStringLiteral("stash"), QStringLiteral("push"), QStringLiteral("--include-untracked"),
+                 QStringLiteral("--message"), QStringLiteral("Shell Scratchpad accepting branch: %1").arg(branch)}, &failure)) {
+            stashObject = gitOutput({QStringLiteral("rev-parse"), QStringLiteral("--verify"), QStringLiteral("refs/stash")}).trimmed();
+            if (dirtyAction == DirtyAction::StashAndPop && stashObject.isEmpty())
+                failure = QStringLiteral("Git created a stash, but its saved changes could not be identified for automatic restoration. The stash is preserved.");
+        }
+    } else if (dirtyAction == DirtyAction::Commit) {
+        progress.setLabelText(QStringLiteral("Staging all changes…"));
+        if (run({QStringLiteral("add"), QStringLiteral("--all")}, &failure)) {
+            progress.setLabelText(QStringLiteral("Committing changes…"));
+            run({QStringLiteral("commit"), QStringLiteral("-m"), commitMessage}, &failure);
+        }
+    }
+
+    QString tempRemote = gitOutput({QStringLiteral("config"), QStringLiteral("--get"),
+        QStringLiteral("branch.%1.remote").arg(branch)}).trimmed();
+    if (tempRemote == QStringLiteral(".")) tempRemote.clear();
+    if (targetRemote.isEmpty()) targetRemote = tempRemote;
+    int localTargetExitCode = -1;
+    gitOutput({QStringLiteral("show-ref"), QStringLiteral("--verify"), QStringLiteral("--quiet"),
+        QStringLiteral("refs/heads/%1").arg(targetBranch)}, &localTargetExitCode);
+    const bool localTargetExists = localTargetExitCode == 0;
+    bool remoteTargetExists = false;
+    if (failure.isEmpty() && !targetRemote.isEmpty()) {
+        progress.setLabelText(QStringLiteral("Checking the target branch on %1…").arg(targetRemote));
+        int remoteTargetExitCode = -1;
+        const QString remoteTargetRefs = gitOutput({QStringLiteral("ls-remote"), QStringLiteral("--heads"), targetRemote,
+            QStringLiteral("refs/heads/%1").arg(targetRemoteBranch)}, &remoteTargetExitCode);
+        if (remoteTargetExitCode != 0) {
+            failure = remoteTargetRefs;
+        } else {
+            remoteTargetExists = !remoteTargetRefs.trimmed().isEmpty();
+            if (remoteTargetExists) {
+                progress.setLabelText(QStringLiteral("Fetching the target branch…"));
+                const QString refspec = QStringLiteral("+refs/heads/%1:refs/remotes/%2/%1").arg(targetRemoteBranch, targetRemote);
+                run({QStringLiteral("fetch"), targetRemote, refspec}, &failure);
+            } else if (!localTargetExists) {
+                failure = QStringLiteral("The target branch %1 is not available locally or on remote %2.")
+                              .arg(targetBranch, targetRemote);
+            }
+        }
+    }
+    if (failure.isEmpty()) {
+        if (localTargetExists) {
+            progress.setLabelText(QStringLiteral("Switching to target branch %1…").arg(targetBranch));
+            run({QStringLiteral("switch"), targetBranch}, &failure);
+        } else if (remoteTargetExists && !targetRemote.isEmpty()) {
+            progress.setLabelText(QStringLiteral("Creating local target branch %1…").arg(targetBranch));
+            run({QStringLiteral("switch"), QStringLiteral("--track"), QStringLiteral("--create"), targetBranch,
+                 QStringLiteral("refs/remotes/%1/%2").arg(targetRemote, targetRemoteBranch)}, &failure);
+        } else {
+            failure = QStringLiteral("The target branch %1 is not available locally and has no remote to restore it from.").arg(targetBranch);
+        }
+    }
+    if (failure.isEmpty()) {
+        if (!targetRemote.isEmpty() && remoteTargetExists) {
+            const QString remoteTargetRef = QStringLiteral("refs/remotes/%1/%2").arg(targetRemote, targetRemoteBranch);
+            progress.setLabelText(QStringLiteral("Updating target from %1…").arg(remoteTargetRef));
+            run({QStringLiteral("merge"), QStringLiteral("--no-edit"), remoteTargetRef}, &failure);
+        }
+    }
+    if (failure.isEmpty()) {
+        progress.setLabelText(QStringLiteral("Merging %1 into %2…").arg(branch, targetBranch));
+        run({QStringLiteral("merge"), QStringLiteral("--no-edit"), branch}, &failure);
+    }
+    if (failure.isEmpty() && !targetRemote.isEmpty()) {
+        progress.setLabelText(QStringLiteral("Pushing accepted target branch…"));
+        run({QStringLiteral("push"), QStringLiteral("--set-upstream"), targetRemote,
+             QStringLiteral("%1:%2").arg(targetBranch, targetRemoteBranch)}, &failure);
+    }
+
+    QString stashRestoreError;
+    if (failure.isEmpty() && dirtyAction == DirtyAction::StashAndPop && !stashObject.isEmpty()) {
+        QString stashReference;
+        const QString stashList = gitOutput({QStringLiteral("stash"), QStringLiteral("list"),
+            QStringLiteral("--format=%gd%x09%H")});
+        for (const QString &line : stashList.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
+            const QStringList fields = line.split(QLatin1Char('\t'));
+            if (fields.size() == 2 && fields.at(1).trimmed() == stashObject) {
+                stashReference = fields.at(0).trimmed();
+                break;
+            }
+        }
+        if (stashReference.isEmpty()) {
+            stashRestoreError = QStringLiteral("The target was merged, but the saved changes could not be located in the stash list.");
+        } else {
+            progress.setLabelText(QStringLiteral("Applying saved changes on %1…").arg(targetBranch));
+            run({QStringLiteral("stash"), QStringLiteral("pop"), QStringLiteral("--index"), stashReference}, &stashRestoreError);
+        }
+    }
+
+    QString cleanupError;
+    if (failure.isEmpty() && stashRestoreError.isEmpty()) {
+        if (tempRemote.isEmpty() && !targetRemote.isEmpty()) tempRemote = targetRemote;
+        if (!tempRemote.isEmpty()) {
+            progress.setLabelText(QStringLiteral("Checking for a remote temporary branch…"));
+            int remoteCheckExitCode = -1;
+            const QString remoteTempRefs = gitOutput({QStringLiteral("ls-remote"), QStringLiteral("--heads"), tempRemote,
+                QStringLiteral("refs/heads/%1").arg(branch)},
+                &remoteCheckExitCode);
+            if (remoteCheckExitCode != 0) {
+                cleanupError = remoteTempRefs;
+                // Preserve both the local branch and its saved workflow if the remote cannot be inspected.
+            } else if (!remoteTempRefs.trimmed().isEmpty()) {
+                progress.setLabelText(QStringLiteral("Removing temporary branch from %1…").arg(tempRemote));
+                run({QStringLiteral("push"), tempRemote, QStringLiteral("--delete"), branch}, &cleanupError);
+            }
+        }
+        if (cleanupError.isEmpty()) {
+            progress.setLabelText(QStringLiteral("Removing local temporary branch…"));
+            run({QStringLiteral("branch"), QStringLiteral("-d"), branch}, &cleanupError);
+        }
+        if (cleanupError.isEmpty()) {
+            QJsonObject updatedBranches = readTemporaryMergeBranches(repoPath);
+            updatedBranches.remove(branch);
+            if (!writeTemporaryMergeBranches(repoPath, updatedBranches))
+                cleanupError = QStringLiteral("The branches were merged and removed, but the saved workflow could not be cleared from app settings.");
+        }
+    }
+
+    progress.close();
+    setGitBusy(false);
+    RepositoryOperationCoordinator::release(repoPath);
+    refreshAll();
+    if (hasConflicts) showMergeConflictsDialog();
+
+    if (!failure.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("Temporary branch acceptance stopped"),
+            QStringLiteral("Could not finish accepting %1 into %2:\n\n%3\n\nThe temporary branch and saved workflow have been kept so you can retry.")
+                .arg(branch, targetBranch, failure));
+        return;
+    }
+    if (!stashRestoreError.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("Branch merged; saved changes need attention"),
+            QStringLiteral("Merged %1 into %2, but Git could not apply the saved changes:\n\n%3\n\nThe stash and temporary branch were kept.")
+                .arg(branch, targetBranch, stashRestoreError));
+        return;
+    }
+    if (!cleanupError.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("Branch merged; cleanup needs attention"),
+            QStringLiteral("Merged %1 into %2, but temporary branch cleanup did not finish:\n\n%3\n\nThe temporary branch and saved workflow were kept where possible.")
+                .arg(branch, targetBranch, cleanupError));
+        return;
+    }
+    QMessageBox::information(this, QStringLiteral("Temporary branch accepted"),
+        QStringLiteral("Merged %1 into %2, pushed the target when a remote was configured, and removed the temporary branch from local and remote repositories.")
+            .arg(branch, targetBranch));
 }
 
 void GitWorkspaceWindow::showBranchContextMenu(const QString &branch, bool remote, const QPoint &globalPosition)
@@ -3892,9 +4217,23 @@ void GitWorkspaceWindow::showBranchContextMenu(const QString &branch, bool remot
     if (branch.isEmpty()) return;
     QMenu menu(this);
     const QString currentBranch = gitOutput({QStringLiteral("branch"), QStringLiteral("--show-current")});
+    const QJsonObject temporaryBranches = readTemporaryMergeBranches(repoPath);
+    const bool isTemporaryMergeBranch = !remote && temporaryBranches.contains(branch);
+    if (isTemporaryMergeBranch) {
+        QAction *acceptTemporary = menu.addAction(QStringLiteral("Accept as Solid…"));
+        acceptTemporary->setToolTip(QStringLiteral("Merge this temporary branch into its saved target and clean up the temporary branches."));
+        acceptTemporary->setEnabled(branch == currentBranch);
+        connect(acceptTemporary, &QAction::triggered, this, [this, branch] { acceptTemporaryMergeBranch(branch); });
+        menu.addSeparator();
+    }
     QAction *createBranch = menu.addAction(QStringLiteral("Create New Branch from Here…"));
     connect(createBranch, &QAction::triggered, this, [this, branch, remote] {
         createBranchFromHere(branch, remote);
+    });
+    QAction *createTemporaryBranch = menu.addAction(QStringLiteral("Create Temporary Merge Branch from Here…"));
+    createTemporaryBranch->setToolTip(QStringLiteral("Create a branch with a saved target that can later be accepted and merged."));
+    connect(createTemporaryBranch, &QAction::triggered, this, [this, branch, remote] {
+        createBranchFromHere(branch, remote, true);
     });
     menu.addSeparator();
     const bool canMerge = branch != currentBranch;
