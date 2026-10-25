@@ -13,6 +13,7 @@
 #include <QAction>
 #include <QApplication>
 #include <QCoreApplication>
+#include <QCheckBox>
 #include <QDesktopServices>
 #include <QBuffer>
 #include <QClipboard>
@@ -1707,6 +1708,20 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     toolbar->addWidget(actionRepositoriesButton);
     toolbar->addStretch(1);
     toolbar->addWidget(new QLabel(QDir(repoPath).dirName(), root));
+    auto *openRepositoryFolderButton = new QToolButton(root);
+    openRepositoryFolderButton->setObjectName(QStringLiteral("openRepositoryFolderButton"));
+    openRepositoryFolderButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    openRepositoryFolderButton->setIcon(QIcon::fromTheme(QStringLiteral("folder-open")));
+    openRepositoryFolderButton->setText(QStringLiteral("Open Folder"));
+    openRepositoryFolderButton->setToolTip(QStringLiteral("Open this repository folder in the default file manager"));
+    connect(openRepositoryFolderButton, &QToolButton::clicked, this, [this] {
+        const QUrl folderUrl = QUrl::fromLocalFile(QDir(repoPath).absolutePath());
+        if (!QDesktopServices::openUrl(folderUrl)) {
+            QMessageBox::warning(this, QStringLiteral("Could not open repository folder"),
+                QStringLiteral("The default file manager could not open:\n%1").arg(repoPath));
+        }
+    });
+    toolbar->addWidget(openRepositoryFolderButton);
     layout->addLayout(toolbar);
 
     auto *mainSplitter = new QSplitter(Qt::Horizontal, root);
@@ -2776,7 +2791,7 @@ QString GitWorkspaceWindow::readStatusSnapshot() const
 
 void GitWorkspaceWindow::pollRepositoryStatus()
 {
-    if (commandProcess->state() != QProcess::NotRunning)
+    if (commandProcess->state() != QProcess::NotRunning || RepositoryOperationCoordinator::isBusy(repoPath))
         return;
     const QString snapshot = readStatusSnapshot();
     if (snapshot.isNull())
@@ -2877,6 +2892,23 @@ void GitWorkspaceWindow::refreshStatus()
 
 void GitWorkspaceWindow::refreshBranches()
 {
+    QHash<QString, bool> expandedStates;
+    const auto itemName = [](const QTreeWidgetItem *item) {
+        QString name = item->text(0);
+        if (name.startsWith(QStringLiteral("● "))) name.remove(0, 2);
+        return name;
+    };
+    std::function<void(QTreeWidgetItem *, const QString &)> saveExpansion;
+    saveExpansion = [&](QTreeWidgetItem *item, const QString &parentPath) {
+        const QString path = parentPath.isEmpty() ? itemName(item)
+            : parentPath + QLatin1Char('/') + itemName(item);
+        expandedStates.insert(path, item->isExpanded());
+        for (int i = 0; i < item->childCount(); ++i)
+            saveExpansion(item->child(i), path);
+    };
+    for (int i = 0; i < branchesList->topLevelItemCount(); ++i)
+        saveExpansion(branchesList->topLevelItem(i), QString());
+
     branchesList->clear();
     QTreeWidgetItem *localRoot = new QTreeWidgetItem(branchesList, {QStringLiteral("Local")});
     QTreeWidgetItem *remoteRoot = new QTreeWidgetItem(branchesList, {QStringLiteral("Remotes")});
@@ -2909,8 +2941,20 @@ void GitWorkspaceWindow::refreshBranches()
         if (name.contains(QStringLiteral(" -> "))) continue;
         insertBranch(remote ? remoteRoot : localRoot, name, name, remote, current);
     }
-    localRoot->setExpanded(true);
-    remoteRoot->setExpanded(true);
+    std::function<void(QTreeWidgetItem *, const QString &)> restoreExpansion;
+    restoreExpansion = [&](QTreeWidgetItem *item, const QString &parentPath) {
+        const QString path = parentPath.isEmpty() ? itemName(item)
+            : parentPath + QLatin1Char('/') + itemName(item);
+        // Keep established user choices. Newly discovered folders are opened
+        // by default so branches fetched during this refresh are easy to find.
+        item->setExpanded(expandedStates.contains(path)
+            ? expandedStates.value(path)
+            : (item->childCount() > 0));
+        for (int i = 0; i < item->childCount(); ++i)
+            restoreExpansion(item->child(i), path);
+    };
+    for (int i = 0; i < branchesList->topLevelItemCount(); ++i)
+        restoreExpansion(branchesList->topLevelItem(i), QString());
     hasRemote = !gitOutput({QStringLiteral("remote")}).isEmpty();
     const QString branch = gitOutput({QStringLiteral("branch"), QStringLiteral("--show-current")});
     const QString upstream = gitOutput({QStringLiteral("rev-parse"), QStringLiteral("--abbrev-ref"), QStringLiteral("@{upstream}")});
@@ -3239,7 +3283,20 @@ void GitWorkspaceWindow::createRemoteRepository()
     const QString head = gitOutput({QStringLiteral("rev-parse"), QStringLiteral("--verify"),
         QStringLiteral("--quiet"), QStringLiteral("HEAD")}, &headCheckExitCode);
     const bool hasCommits = headCheckExitCode == 0 && !head.isEmpty();
-    const int totalSteps = hasCommits ? 5 : 4;
+    const QStringList localBranches = gitOutput({QStringLiteral("for-each-ref"),
+        QStringLiteral("--format=%(refname:short)"), QStringLiteral("refs/heads")})
+        .split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    QStringList defaultPushBranches;
+    QStringList additionalBranches;
+    for (const QString &branch : localBranches) {
+        const QString name = branch.trimmed();
+        if (name == QStringLiteral("main") || name == QStringLiteral("master"))
+            defaultPushBranches.append(name);
+        else
+            additionalBranches.append(name);
+    }
+    const bool needsBranchSelection = hasCommits && !additionalBranches.isEmpty();
+    const int totalSteps = hasCommits && needsBranchSelection ? 5 : 4;
     const auto stepTitle = [totalSteps](const QString &number, const QString &label) {
         return QStringLiteral("Step %1 of %2 — %3").arg(number).arg(totalSteps).arg(label);
     };
@@ -3277,15 +3334,51 @@ void GitWorkspaceWindow::createRemoteRepository()
             QStringLiteral("A remote named %1 already exists. Choose another name or remove that remote first.").arg(remoteName));
         return;
     }
-    bool pushNow = false;
-    if (hasCommits) {
-        QMessageBox pushPrompt(this);
-        pushPrompt.setWindowTitle(stepTitle(QStringLiteral("5"), QStringLiteral("Push local commits")));
-        pushPrompt.setText(QStringLiteral("Push the current branch to the new GitHub repository after creating it?"));
-        pushPrompt.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
-        pushPrompt.setDefaultButton(QMessageBox::No);
-        pushNow = pushPrompt.exec() == QMessageBox::Yes;
+    QStringList branchesToPush = defaultPushBranches;
+    if (needsBranchSelection) {
+        QDialog branchDialog(this);
+        branchDialog.setWindowTitle(stepTitle(QStringLiteral("5"), QStringLiteral("Select local branches")));
+        auto *layout = new QVBoxLayout(&branchDialog);
+        auto *description = new QLabel(QStringLiteral("Choose which local branches to push to the new remote."), &branchDialog);
+        description->setWordWrap(true);
+        layout->addWidget(description);
+        auto *branchChecksLayout = new QVBoxLayout;
+        QList<QCheckBox *> branchChecks;
+        QHash<QString, QCheckBox *> checksByBranch;
+        for (const QString &branch : localBranches) {
+            auto *check = new QCheckBox(branch, &branchDialog);
+            check->setChecked(defaultPushBranches.contains(branch));
+            branchChecks.append(check);
+            checksByBranch.insert(branch, check);
+            branchChecksLayout->addWidget(check);
+        }
+        layout->addLayout(branchChecksLayout);
+        auto *quickActions = new QHBoxLayout;
+        auto *selectAllButton = new QPushButton(QStringLiteral("Select All"), &branchDialog);
+        auto *deselectAllButton = new QPushButton(QStringLiteral("Deselect All"), &branchDialog);
+        quickActions->addWidget(selectAllButton);
+        quickActions->addWidget(deselectAllButton);
+        quickActions->addStretch(1);
+        layout->addLayout(quickActions);
+        auto *branchDialogButtons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &branchDialog);
+        branchDialogButtons->button(QDialogButtonBox::Ok)->setText(QStringLiteral("Continue"));
+        layout->addWidget(branchDialogButtons);
+        connect(selectAllButton, &QPushButton::clicked, &branchDialog, [&branchChecks] {
+            for (QCheckBox *check : branchChecks) check->setChecked(true);
+        });
+        connect(deselectAllButton, &QPushButton::clicked, &branchDialog, [&branchChecks] {
+            for (QCheckBox *check : branchChecks) check->setChecked(false);
+        });
+        connect(branchDialogButtons, &QDialogButtonBox::accepted, &branchDialog, &QDialog::accept);
+        connect(branchDialogButtons, &QDialogButtonBox::rejected, &branchDialog, &QDialog::reject);
+        if (branchDialog.exec() != QDialog::Accepted) return;
+        branchesToPush.clear();
+        for (const QString &branch : localBranches) {
+            if (checksByBranch.value(branch) && checksByBranch.value(branch)->isChecked())
+                branchesToPush.append(branch);
+        }
     }
+
     if (gh.isEmpty()) {
         QMessageBox prompt(this);
         prompt.setIcon(QMessageBox::Information);
@@ -3303,11 +3396,37 @@ void GitWorkspaceWindow::createRemoteRepository()
             return;
         }
     }
-    QProgressDialog progress(QStringLiteral("Preparing GitHub repository…"), QStringLiteral("Cancel"), 0, 0, this);
+    const QString trackedLicense = gitOutput({QStringLiteral("ls-files"), QStringLiteral("--"),
+        QStringLiteral("LICENSE"), QStringLiteral("LICENSE.md"), QStringLiteral("LICENSE.txt"),
+        QStringLiteral("LICENCE"), QStringLiteral("LICENCE.md"), QStringLiteral("COPYING")});
+    const bool licenseAlreadyInLocalRepository = !trackedLicense.isEmpty();
+    const bool willCreateRemoteLicense = !license.isEmpty() && !licenseAlreadyInLocalRepository;
+    const int totalProgressSteps = 6
+        + (repositoryName.contains(QLatin1Char('/')) ? 0 : 1)
+        + (license.isEmpty() ? 0 : 1)
+        + (willCreateRemoteLicense ? 2 : 0)
+        + (hasCommits ? branchesToPush.size() : 0);
+    QProgressDialog progress(QStringLiteral("Preparing GitHub repository… (0%)"), QString(), 0, totalProgressSteps, this);
     progress.setWindowTitle(QStringLiteral("GitHub"));
     progress.setWindowModality(Qt::WindowModal);
     progress.setCancelButton(nullptr);
+    progress.setAutoClose(false);
+    progress.setAutoReset(false);
+    progress.setValue(0);
     progress.show();
+    int completedProgressSteps = 0;
+    QString currentProgressLabel = QStringLiteral("Preparing GitHub repository…");
+    const auto setProgressStep = [&progress, totalProgressSteps, &completedProgressSteps, &currentProgressLabel](const QString &label) {
+        currentProgressLabel = label;
+        const int percent = totalProgressSteps > 0 ? (completedProgressSteps * 100) / totalProgressSteps : 100;
+        progress.setLabelText(QStringLiteral("%1 (%2%)").arg(label).arg(percent));
+    };
+    const auto completeProgressStep = [&progress, totalProgressSteps, &completedProgressSteps, &currentProgressLabel] {
+        ++completedProgressSteps;
+        progress.setValue(completedProgressSteps);
+        const int percent = totalProgressSteps > 0 ? (completedProgressSteps * 100) / totalProgressSteps : 100;
+        progress.setLabelText(QStringLiteral("%1 (%2%)").arg(currentProgressLabel).arg(percent));
+    };
     auto runCommand = [this, &progress](const QString &program, const QStringList &arguments,
                                         QString *standardOutput, QString *standardError) {
         QProcess command;
@@ -3336,7 +3455,7 @@ void GitWorkspaceWindow::createRemoteRepository()
 
     QString repositorySlug = repositoryName;
     if (!repositoryName.contains(QLatin1Char('/'))) {
-        progress.setLabelText(QStringLiteral("Checking your GitHub account…"));
+        setProgressStep(QStringLiteral("Checking your GitHub account…"));
         QString login;
         QString error;
         if (!runCommand(gh, {QStringLiteral("api"), QStringLiteral("user"), QStringLiteral("--jq"), QStringLiteral(".login")}, &login, &error)
@@ -3345,6 +3464,7 @@ void GitWorkspaceWindow::createRemoteRepository()
             QMessageBox::critical(this, QStringLiteral("Could not determine GitHub account"), error);
             return;
         }
+        completeProgressStep();
         repositorySlug = login + QLatin1Char('/') + repositoryName;
     } else if (repositoryName.count(QLatin1Char('/')) != 1
                || repositoryName.startsWith(QLatin1Char('/')) || repositoryName.endsWith(QLatin1Char('/'))) {
@@ -3363,7 +3483,7 @@ void GitWorkspaceWindow::createRemoteRepository()
                 QStringLiteral("Use a GitHub license identifier such as MPL-2.0."));
             return;
         }
-        progress.setLabelText(QStringLiteral("Checking the %1 license template…").arg(license));
+        setProgressStep(QStringLiteral("Checking the %1 license template…").arg(license));
         QString error;
         if (!runCommand(gh, {QStringLiteral("api"), QStringLiteral("licenses/%1").arg(license.toLower()),
                              QStringLiteral("--jq"), QStringLiteral(".body")}, &licenseBody, &error)
@@ -3373,9 +3493,10 @@ void GitWorkspaceWindow::createRemoteRepository()
                 error.isEmpty() ? QStringLiteral("GitHub did not return a license template for %1.").arg(license) : error);
             return;
         }
+        completeProgressStep();
     }
 
-    progress.setLabelText(QStringLiteral("Creating GitHub repository…"));
+    setProgressStep(QStringLiteral("Creating GitHub repository…"));
     QStringList createArguments{QStringLiteral("repo"), QStringLiteral("create"), repositorySlug,
         visibility == QStringLiteral("Private") ? QStringLiteral("--private") : QStringLiteral("--public")};
     QString output;
@@ -3386,19 +3507,16 @@ void GitWorkspaceWindow::createRemoteRepository()
             error.isEmpty() ? output : error);
         return;
     }
+    completeProgressStep();
 
     const QString remoteUrl = QStringLiteral("https://github.com/%1.git").arg(repositorySlug);
-    progress.setLabelText(QStringLiteral("Adding remote %1…").arg(remoteName));
+    setProgressStep(QStringLiteral("Adding remote %1…").arg(remoteName));
     if (!runCommand(gitExecutable(), {QStringLiteral("remote"), QStringLiteral("add"), remoteName, remoteUrl}, nullptr, &error)) {
         progress.close();
         QMessageBox::critical(this, QStringLiteral("Repository created, but remote setup failed"), error);
         return;
     }
-
-    const QString trackedLicense = gitOutput({QStringLiteral("ls-files"), QStringLiteral("--"),
-        QStringLiteral("LICENSE"), QStringLiteral("LICENSE.md"), QStringLiteral("LICENSE.txt"),
-        QStringLiteral("LICENCE"), QStringLiteral("LICENCE.md"), QStringLiteral("COPYING")});
-    const bool licenseAlreadyInLocalRepository = !trackedLicense.isEmpty();
+    completeProgressStep();
     QString licenseError;
     QString remoteBranch;
     if (!licenseBody.isEmpty() && !licenseAlreadyInLocalRepository) {
@@ -3406,15 +3524,17 @@ void GitWorkspaceWindow::createRemoteRepository()
             QStringLiteral("--method"), QStringLiteral("PUT"),
             QStringLiteral("--field"), QStringLiteral("message=Add %1 license").arg(license),
             QStringLiteral("--field"), QStringLiteral("content=%1").arg(QString::fromLatin1(licenseBody.toUtf8().toBase64()))};
-        progress.setLabelText(QStringLiteral("Adding the %1 license…").arg(license));
+        setProgressStep(QStringLiteral("Adding the %1 license…").arg(license));
         if (!runCommand(gh, licenseArguments, nullptr, &licenseError)) {
             if (licenseError.isEmpty()) licenseError = QStringLiteral("GitHub could not add the selected license file.");
         } else {
+            completeProgressStep();
+            setProgressStep(QStringLiteral("Checking the remote default branch…"));
             if (!runCommand(gh, {QStringLiteral("api"), QStringLiteral("repos/%1").arg(repositorySlug),
                                  QStringLiteral("--jq"), QStringLiteral(".default_branch")}, &remoteBranch, &licenseError)
                 || remoteBranch.isEmpty()) {
                 if (licenseError.isEmpty()) licenseError = QStringLiteral("GitHub did not return the repository's default branch.");
-            }
+            } else completeProgressStep();
         }
     }
 
@@ -3422,11 +3542,16 @@ void GitWorkspaceWindow::createRemoteRepository()
     // history. This also works for an unborn local branch: the pull establishes
     // its first commit, while a push is intentionally skipped below.
     QString pullError;
+    bool pullPhaseCompleted = false;
     if (licenseError.isEmpty()) {
         QString remoteHeads;
+        setProgressStep(QStringLiteral("Checking remote branches…"));
         if (!runCommand(gitExecutable(), {QStringLiteral("ls-remote"), QStringLiteral("--heads"), remoteName}, &remoteHeads, &pullError)) {
             if (pullError.isEmpty()) pullError = remoteHeads;
-        } else if (!remoteHeads.trimmed().isEmpty()) {
+        } else {
+            completeProgressStep();
+        }
+        if (pullError.isEmpty() && !remoteHeads.trimmed().isEmpty()) {
             if (remoteBranch.isEmpty()) {
                 const QStringList refs = remoteHeads.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
                 const QString ref = refs.isEmpty() ? QString() : refs.first().section(QLatin1Char('\t'), 1).trimmed();
@@ -3435,31 +3560,89 @@ void GitWorkspaceWindow::createRemoteRepository()
             if (remoteBranch.isEmpty()) {
                 pullError = QStringLiteral("The remote has commits, but its branch could not be determined.");
             } else {
-                progress.setLabelText(QStringLiteral("Pulling remote changes into the local repository…"));
-                QStringList pullArguments{QStringLiteral("pull"), QStringLiteral("--no-edit"), remoteName, remoteBranch};
-                if (hasCommits)
+                setProgressStep(QStringLiteral("Pulling remote changes into the local repository…"));
+                // This repository may inherit a user-wide pull.rebase or
+                // pull.ff setting. Force a merge here: the remote license
+                // commit and existing local history can be divergent.
+                QStringList pullArguments{QStringLiteral("pull"), QStringLiteral("--no-rebase"),
+                    QStringLiteral("--no-edit"), remoteName, remoteBranch};
+                if (hasCommits) {
                     pullArguments.insert(1, QStringLiteral("--allow-unrelated-histories"));
-                else
+                    // --ff explicitly overrides a pull.ff=only preference
+                    // while still fast-forwarding whenever that is possible.
+                    pullArguments.insert(1, QStringLiteral("--ff"));
+                } else {
                     pullArguments.insert(1, QStringLiteral("--ff-only"));
+                }
                 if (!runCommand(gitExecutable(), pullArguments, &output, &pullError))
                     pullError = QStringLiteral("Could not pull remote changes into the local repository: %1")
                                     .arg(pullError.isEmpty() ? output : pullError);
+                else {
+                    completeProgressStep();
+                    pullPhaseCompleted = true;
+                }
             }
+        } else if (pullError.isEmpty()) {
+            completeProgressStep();
+            pullPhaseCompleted = true;
+        }
+        // Count the pull phase even when the newly created remote has no refs.
+        if (pullError.isEmpty() && !pullPhaseCompleted)
+            completeProgressStep();
+    }
+
+    QStringList pushErrors;
+    QStringList pushedBranches;
+    if (pullError.isEmpty() && licenseError.isEmpty() && hasCommits) {
+        for (const QString &branch : branchesToPush) {
+            setProgressStep(QStringLiteral("Pushing branch %1…").arg(branch));
+            QString branchError;
+            if (!runCommand(gitExecutable(), {QStringLiteral("push"), QStringLiteral("--set-upstream"), remoteName, branch}, &output, &branchError)) {
+                if (branchError.isEmpty()) branchError = output;
+                pushErrors.append(QStringLiteral("%1: %2").arg(branch, branchError));
+                completeProgressStep();
+                continue;
+            }
+            pushedBranches.append(branch);
+            completeProgressStep();
         }
     }
 
-    QString pushError;
-    if (pullError.isEmpty() && licenseError.isEmpty() && pushNow && hasCommits) {
-        progress.setLabelText(QStringLiteral("Pushing local commits…"));
-        if (!runCommand(gitExecutable(), {QStringLiteral("push"), QStringLiteral("--set-upstream"), remoteName, QStringLiteral("HEAD")}, &output, &pushError))
-            pushError = pushError.isEmpty() ? output : pushError;
+    QString fetchError;
+    if (pullError.isEmpty() && licenseError.isEmpty()) {
+        setProgressStep(QStringLiteral("Fetching all remotes…"));
+        if (!runCommand(gitExecutable(), {QStringLiteral("fetch"), QStringLiteral("--all"), QStringLiteral("--prune")},
+                        &output, &fetchError)
+            && fetchError.isEmpty())
+            fetchError = output;
+        completeProgressStep();
+
+        // Explicitly refresh the new remote's branch refs as well. This avoids
+        // depending on a user's customized remote.fetch refspec for visibility
+        // in the Branches panel after a push.
+        QString targetFetchError;
+        setProgressStep(QStringLiteral("Refreshing branches from %1…").arg(remoteName));
+        const QString refspec = QStringLiteral("+refs/heads/*:refs/remotes/%1/*").arg(remoteName);
+        if (!runCommand(gitExecutable(), {QStringLiteral("fetch"), QStringLiteral("--prune"), remoteName, refspec},
+                        &output, &targetFetchError)
+            && targetFetchError.isEmpty())
+            targetFetchError = output;
+        if (!targetFetchError.isEmpty()) {
+            if (!fetchError.isEmpty()) fetchError += QLatin1Char('\n');
+            fetchError += targetFetchError;
+        }
+        completeProgressStep();
     }
 
     progress.close();
-    refreshRemotes();
-    if (!pushError.isEmpty() || !licenseError.isEmpty() || !pullError.isEmpty()) {
+    refreshAll();
+    if (!pushErrors.isEmpty() || !licenseError.isEmpty() || !pullError.isEmpty() || !fetchError.isEmpty()) {
         QStringList details;
-        if (!pushError.isEmpty()) details.append(QStringLiteral("Push failed: %1").arg(pushError));
+        if (!pushErrors.isEmpty()) details.append(QStringLiteral("Some branches could not be pushed:\n%1")
+            .arg(pushErrors.join(QLatin1Char('\n'))));
+        if (!pushedBranches.isEmpty()) details.append(QStringLiteral("Pushed successfully: %1")
+            .arg(pushedBranches.join(QStringLiteral(", "))));
+        if (!fetchError.isEmpty()) details.append(QStringLiteral("Could not fetch all remotes after pushing: %1").arg(fetchError));
         if (!licenseError.isEmpty()) details.append(QStringLiteral("License file could not be added: %1").arg(licenseError));
         if (!pullError.isEmpty()) details.append(pullError);
         QMessageBox::warning(this, QStringLiteral("Repository created with follow-up needed"),
@@ -3471,6 +3654,8 @@ void GitWorkspaceWindow::createRemoteRepository()
     if (!license.isEmpty()) summary += QStringLiteral(" Added the %1 license.").arg(license);
     if (licenseAlreadyInLocalRepository) summary += QStringLiteral(" Kept the existing local license file.");
     if (!hasCommits) summary += QStringLiteral(" No commits were found, so nothing was pushed. Commit your files before pushing.");
+    else if (pushedBranches.isEmpty()) summary += QStringLiteral(" No branches were selected, so nothing was pushed.");
+    else if (!pushedBranches.isEmpty()) summary += QStringLiteral(" Pushed: %1.").arg(pushedBranches.join(QStringLiteral(", ")));
     QMessageBox::information(this, QStringLiteral("Repository created"), summary);
 }
 
@@ -3515,11 +3700,203 @@ void GitWorkspaceWindow::switchToBranch(const QString &branch, bool remote)
         runGit({QStringLiteral("switch"), QStringLiteral("--track"), QStringLiteral("-c"), localName, branch});
 }
 
+void GitWorkspaceWindow::createBranchFromHere(const QString &branch, bool remote)
+{
+    bool accepted = false;
+    const QString name = QInputDialog::getText(this, QStringLiteral("Create Branch from Here"),
+        QStringLiteral("New branch name (starting from %1):").arg(branch),
+        QLineEdit::Normal, QString(), &accepted).trimmed();
+    if (!accepted || name.isEmpty()) return;
+
+    int checkExitCode = -1;
+    gitOutput({QStringLiteral("check-ref-format"), QStringLiteral("--branch"), name}, &checkExitCode);
+    if (checkExitCode != 0) {
+        QMessageBox::warning(this, QStringLiteral("Invalid branch name"),
+            QStringLiteral("“%1” is not a valid Git branch name.").arg(name));
+        return;
+    }
+    gitOutput({QStringLiteral("show-ref"), QStringLiteral("--verify"), QStringLiteral("--quiet"),
+               QStringLiteral("refs/heads/%1").arg(name)}, &checkExitCode);
+    if (checkExitCode == 0) {
+        QMessageBox::warning(this, QStringLiteral("Branch already exists"),
+            QStringLiteral("A local branch named %1 already exists.").arg(name));
+        return;
+    }
+
+    if (commandProcess->state() != QProcess::NotRunning || RepositoryOperationCoordinator::isBusy(repoPath)) {
+        QMessageBox::information(this, QStringLiteral("Git is busy"),
+            QStringLiteral("Wait for the current repository operation to finish before creating a branch."));
+        return;
+    }
+
+    enum class DirtyAction { None, StashAndPop, StashKeep, Commit, Cancel };
+    DirtyAction dirtyAction = DirtyAction::None;
+    const QString status = gitOutput({QStringLiteral("status"), QStringLiteral("--porcelain=v1")});
+    if (!status.isEmpty()) {
+        QMessageBox choice(this);
+        choice.setIcon(QMessageBox::Question);
+        choice.setWindowTitle(QStringLiteral("Changes on Current Branch"));
+        choice.setText(QStringLiteral("There are staged, unstaged, or untracked changes on the current branch."));
+        choice.setInformativeText(QStringLiteral("Choose how to handle all changes before switching to %1 and creating %2.")
+                                      .arg(branch, name));
+        QPushButton *stashAndPop = choice.addButton(QStringLiteral("Stash and Apply on New Branch"), QMessageBox::AcceptRole);
+        QPushButton *stashKeep = choice.addButton(QStringLiteral("Stash and Keep Stashed"), QMessageBox::ActionRole);
+        QPushButton *stageCommit = choice.addButton(QStringLiteral("Stage All and Commit…"), QMessageBox::ActionRole);
+        QPushButton *cancel = choice.addButton(QStringLiteral("Cancel"), QMessageBox::RejectRole);
+        choice.setDefaultButton(stashAndPop);
+        choice.exec();
+        if (choice.clickedButton() == stashAndPop) dirtyAction = DirtyAction::StashAndPop;
+        else if (choice.clickedButton() == stashKeep) dirtyAction = DirtyAction::StashKeep;
+        else if (choice.clickedButton() == stageCommit) dirtyAction = DirtyAction::Commit;
+        else if (choice.clickedButton() == cancel) dirtyAction = DirtyAction::Cancel;
+        if (dirtyAction == DirtyAction::Cancel || dirtyAction == DirtyAction::None) return;
+    }
+
+    QString commitMessage;
+    if (dirtyAction == DirtyAction::Commit) {
+        commitMessage = QInputDialog::getMultiLineText(this, QStringLiteral("Commit Changes Before Branching"),
+            QStringLiteral("Commit message:"), QString(), &accepted).trimmed();
+        if (!accepted) return;
+        if (commitMessage.isEmpty()) {
+            QMessageBox::warning(this, QStringLiteral("Commit message required"),
+                QStringLiteral("Enter a commit message before creating the branch."));
+            return;
+        }
+    }
+
+    if (!RepositoryOperationCoordinator::tryAcquire(repoPath)) {
+        QMessageBox::information(this, QStringLiteral("Repository is busy"),
+            QStringLiteral("Another Git operation is running in this repository."));
+        return;
+    }
+
+    QProgressDialog progress(QStringLiteral("Preparing branch…"), QString(), 0, 0, this);
+    progress.setWindowTitle(QStringLiteral("Create Branch"));
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setCancelButton(nullptr);
+    progress.setMinimumDuration(0);
+    setGitBusy(true, true);
+    progress.show();
+
+    const auto run = [this, &progress](const QStringList &arguments, QString *detail) {
+        QProcess process;
+        process.setProgram(gitExecutable());
+        process.setArguments(arguments);
+        process.setWorkingDirectory(repoPath);
+        process.start();
+        if (!process.waitForStarted(3000)) {
+            if (detail) *detail = process.errorString();
+            return false;
+        }
+        QByteArray standardOutput;
+        QByteArray standardError;
+        while (process.state() != QProcess::NotRunning) {
+            process.waitForFinished(100);
+            standardOutput += process.readAllStandardOutput();
+            standardError += process.readAllStandardError();
+            QCoreApplication::processEvents();
+        }
+        standardOutput += process.readAllStandardOutput();
+        standardError += process.readAllStandardError();
+        const bool succeeded = process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0;
+        if (!succeeded && detail) {
+            *detail = QString::fromLocal8Bit(standardError).trimmed();
+            if (detail->isEmpty()) *detail = QString::fromLocal8Bit(standardOutput).trimmed();
+            if (detail->isEmpty()) *detail = QStringLiteral("git %1 failed.").arg(arguments.join(QLatin1Char(' ')));
+        }
+        return succeeded;
+    };
+
+    QString failure;
+    QString stashObject;
+    if (dirtyAction == DirtyAction::StashAndPop || dirtyAction == DirtyAction::StashKeep) {
+        progress.setLabelText(QStringLiteral("Stashing staged, unstaged, and untracked changes…"));
+        if (!run({QStringLiteral("stash"), QStringLiteral("push"), QStringLiteral("--include-untracked"),
+                  QStringLiteral("--message"), QStringLiteral("Shell Scratchpad branch creation: %1").arg(name)}, &failure)) {
+            // No branch switch has happened, so the user's working tree is unchanged.
+        } else {
+            stashObject = gitOutput({QStringLiteral("rev-parse"), QStringLiteral("--verify"), QStringLiteral("refs/stash")}).trimmed();
+            if (dirtyAction == DirtyAction::StashAndPop && stashObject.isEmpty())
+                failure = QStringLiteral("Git created a stash, but its saved changes could not be identified for automatic restoration. The stash is preserved.");
+        }
+    } else if (dirtyAction == DirtyAction::Commit) {
+        progress.setLabelText(QStringLiteral("Staging all changes…"));
+        if (run({QStringLiteral("add"), QStringLiteral("--all")}, &failure)) {
+            progress.setLabelText(QStringLiteral("Committing changes…"));
+            run({QStringLiteral("commit"), QStringLiteral("-m"), commitMessage}, &failure);
+        }
+    }
+
+    const QString currentBranch = gitOutput({QStringLiteral("branch"), QStringLiteral("--show-current")}).trimmed();
+    if (failure.isEmpty() && !remote && currentBranch != branch) {
+        progress.setLabelText(QStringLiteral("Switching to %1…").arg(branch));
+        run({QStringLiteral("switch"), branch}, &failure);
+    } else if (failure.isEmpty() && remote) {
+        progress.setLabelText(QStringLiteral("Switching to remote branch %1…").arg(branch));
+        run({QStringLiteral("switch"), QStringLiteral("--detach"),
+             QStringLiteral("refs/remotes/%1").arg(branch)}, &failure);
+    }
+
+    bool branchCreated = false;
+    if (failure.isEmpty()) {
+        progress.setLabelText(QStringLiteral("Creating and switching to %1…").arg(name));
+        branchCreated = run({QStringLiteral("switch"), QStringLiteral("--create"), name}, &failure);
+    }
+
+    QString stashRestoreError;
+    if (branchCreated && dirtyAction == DirtyAction::StashAndPop && !stashObject.isEmpty()) {
+        QString stashReference;
+        const QString stashList = gitOutput({QStringLiteral("stash"), QStringLiteral("list"),
+            QStringLiteral("--format=%gd%x09%H")});
+        for (const QString &line : stashList.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
+            const QStringList fields = line.split(QLatin1Char('\t'));
+            if (fields.size() == 2 && fields.at(1).trimmed() == stashObject) {
+                stashReference = fields.at(0).trimmed();
+                break;
+            }
+        }
+        if (stashReference.isEmpty()) {
+            stashRestoreError = QStringLiteral("The branch was created, but the saved changes could not be located in the stash list.");
+        } else {
+            progress.setLabelText(QStringLiteral("Applying saved changes on %1…").arg(name));
+            run({QStringLiteral("stash"), QStringLiteral("pop"), QStringLiteral("--index"), stashReference}, &stashRestoreError);
+        }
+    }
+
+    progress.close();
+    setGitBusy(false);
+    RepositoryOperationCoordinator::release(repoPath);
+    refreshAll();
+
+    if (!failure.isEmpty()) {
+        QString message = QStringLiteral("Could not create branch %1 from %2:\n\n%3").arg(name, branch, failure);
+        if (!stashObject.isEmpty())
+            message += QStringLiteral("\n\nYour changes remain safely saved in Git stash.");
+        QMessageBox::warning(this, QStringLiteral("Branch creation failed"), message);
+        return;
+    }
+    if (!stashRestoreError.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("Branch created; saved changes need attention"),
+            QStringLiteral("Created and switched to %1, but Git could not apply the saved changes:\n\n%2\n\nThe stash was kept; you can apply it from the stash controls.")
+                .arg(name, stashRestoreError));
+        return;
+    }
+    if (dirtyAction == DirtyAction::StashKeep)
+        statusBar()->showMessage(QStringLiteral("Created and switched to %1. Your changes remain in Git stash.").arg(name), 8000);
+    else
+        statusBar()->showMessage(QStringLiteral("Created and switched to branch %1.").arg(name), 6000);
+}
+
 void GitWorkspaceWindow::showBranchContextMenu(const QString &branch, bool remote, const QPoint &globalPosition)
 {
     if (branch.isEmpty()) return;
     QMenu menu(this);
     const QString currentBranch = gitOutput({QStringLiteral("branch"), QStringLiteral("--show-current")});
+    QAction *createBranch = menu.addAction(QStringLiteral("Create New Branch from Here…"));
+    connect(createBranch, &QAction::triggered, this, [this, branch, remote] {
+        createBranchFromHere(branch, remote);
+    });
+    menu.addSeparator();
     const bool canMerge = branch != currentBranch;
     QMenu *mergeMenu = menu.addMenu(QStringLiteral("Merge into Current Branch"));
     QAction *merge = mergeMenu->addAction(QStringLiteral("Merge"));

@@ -160,6 +160,7 @@ private:
     void showHistoryOverview();
     void refreshRemotes();
     void refreshIdentity();
+    void createBranchFromHere(const QString &branch, bool remote);
     void switchToBranch(const QString &branch, bool remote);
     void showBranchContextMenu(const QString &branch, bool remote, const QPoint &globalPosition);
     void showHistoryContextMenu(QListWidgetItem *item, const QPoint &globalPosition);
