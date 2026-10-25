@@ -3,7 +3,7 @@ Type=Service
 Name=Shell Scratchpad
 Comment=Open Shell Scratchpad in the selected directory
 MimeType=inode/directory;
-Actions=openShellScratchpad;cloneGitRepository;
+Actions=openShellScratchpad;initGitRepository;cloneGitRepository;
 Icon=shell-scratchpad
 
 [Desktop Action openShellScratchpad]
@@ -15,3 +15,8 @@ Exec=shell-scratchpad --working-directory %f
 Name=Clone Git Repository Here…
 Icon=folder-download
 Exec=shell-scratchpad --clone-repository-into %f
+
+[Desktop Action initGitRepository]
+Name=Create Git Repository Here…
+Icon=git-init
+Exec=shell-scratchpad --init-repository-in %f

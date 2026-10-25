@@ -20,6 +20,7 @@ A small Qt 6 desktop app for KDE/Linux that runs multiline Bash scripts from an 
 - Working-directory picker and `--working-directory <directory>` command-line option
 - A KDE/Dolphin context-menu action, **Open Shell Scratchpad**, installed by `setup.sh`; right-click a directory or a directory icon on the desktop to open the app with that directory selected
 - A KDE/Dolphin **Actions → Clone Git Repository Here…** action opens a clone dialog and clones the entered repository into a new subfolder of the selected directory, then opens it in Git Workspace
+- A KDE/Dolphin **Actions → Create Git Repository Here…** action initializes a Git repository in the selected directory and opens it in Git Workspace
 - A KDE/Dolphin **Open Folder With → Shell Scratchpad** application association, installed by `setup.sh`, to open a directory in folder mode with the file browser
 - A KDE/Dolphin context-menu action, **Open in Shell Scratchpad**, for `.sh` files; script paths can also be passed on the command line
 - `Ctrl+Enter` runs the script while the editor is focused
@@ -36,6 +37,7 @@ A small Qt 6 desktop app for KDE/Linux that runs multiline Bash scripts from an 
 - **Tools → Run History…** opens the latest run's top-level commands in a separate window, with `sudo` requests marked and kept out of normal output
 - **Tools → Git Workspace…** opens a built-in repository manager with change status, per-file stage/unstage/discard actions, diffs, branch switching, commit history, fetch/pull/push, and a raw Git command console
 - Git Workspace has its own application-menu entry and can be opened with `shell-scratchpad --git-workspace [repository-folder]`; it is another window mode of the same executable
+- The Remotes panel can create a GitHub repository with the GitHub CLI (`gh`), add it as a local remote, and optionally push the current branch; the provider selector is designed to accommodate other Git services later
 - The Git command console uses the app's editor suggestions, including Git subcommands and command-specific option hints. Credential setup configures a Git credential helper, and entered tokens are handed directly to that helper instead of being stored in Shell Scratchpad settings
 - Right-click a file or folder in the folder browser to add its repository-root-relative path to `.gitignore`, or remove the exact entry previously added there
 

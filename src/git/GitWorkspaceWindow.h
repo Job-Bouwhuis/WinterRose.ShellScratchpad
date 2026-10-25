@@ -46,6 +46,7 @@ public:
     explicit GitWorkspaceWindow(const QString &repositoryPath, QWidget *parent = nullptr);
     static bool isGitRepository(const QString &path);
     static bool showCloneDialog(const QString &parentDirectory, QWidget *parent = nullptr);
+    static bool showInitDialog(const QString &directory, QWidget *parent = nullptr);
 
 private:
     QString repoPath;
@@ -166,6 +167,7 @@ private:
     void showMergeConflictsDialog();
     void showCommitDialog();
     void addRemote();
+    void createRemoteRepository();
     void changeRemoteUrl(const QString &name);
     void removeRemote(const QString &name);
     void pullCurrentBranch();

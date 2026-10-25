@@ -43,6 +43,7 @@
 #include <QRegularExpression>
 #include <QStatusBar>
 #include <QProgressBar>
+#include <QProgressDialog>
 #include <QSplitter>
 #include <QStandardPaths>
 #include <QSize>
@@ -1190,6 +1191,46 @@ bool GitWorkspaceWindow::showCloneDialog(const QString &directory, QWidget *pare
     return false;
 }
 
+bool GitWorkspaceWindow::showInitDialog(const QString &directory, QWidget *parent)
+{
+    const QString path = QDir(directory).absolutePath();
+    if (!QFileInfo(path).isDir()) {
+        QMessageBox::warning(parent, QStringLiteral("Folder unavailable"),
+                             QStringLiteral("The selected folder does not exist."));
+        return false;
+    }
+    QProcess rootCheck;
+    rootCheck.setProgram(gitExecutable());
+    rootCheck.setArguments({QStringLiteral("-C"), path, QStringLiteral("rev-parse"), QStringLiteral("--show-toplevel")});
+    rootCheck.start();
+    const bool alreadyRepositoryRoot = rootCheck.waitForFinished(2000) && rootCheck.exitCode() == 0
+        && QFileInfo(QString::fromLocal8Bit(rootCheck.readAllStandardOutput()).trimmed()).canonicalFilePath()
+            == QFileInfo(path).canonicalFilePath();
+    if (alreadyRepositoryRoot) {
+        QMessageBox::information(parent, QStringLiteral("Already a repository"),
+                                 QStringLiteral("This folder is already inside a Git repository."));
+        return false;
+    }
+    if (QMessageBox::question(parent, QStringLiteral("Create Git repository"),
+            QStringLiteral("Initialize a new Git repository in %1?").arg(path),
+            QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Yes) != QMessageBox::Yes)
+        return false;
+    QProcess process;
+    process.setProgram(gitExecutable());
+    process.setArguments({QStringLiteral("-C"), path, QStringLiteral("init")});
+    process.start();
+    if (!process.waitForFinished(-1) || process.exitCode() != 0) {
+        QMessageBox::critical(parent, QStringLiteral("Could not initialize repository"),
+            QString::fromLocal8Bit(process.readAllStandardError()).trimmed());
+        return false;
+    }
+    auto *window = new GitWorkspaceWindow(path);
+    window->show();
+    window->raise();
+    window->activateWindow();
+    return true;
+}
+
 GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *parent)
     : QMainWindow(parent), repoPath(RepositoryWorkspaceStore::repositoryRoot(repositoryPath))
 {
@@ -1743,14 +1784,17 @@ GitWorkspaceWindow::GitWorkspaceWindow(const QString &repositoryPath, QWidget *p
     auto *addRemoteButton = new QPushButton(QStringLiteral("Add Remote…"), remotesPanel);
     auto *editRemoteButton = new QPushButton(QStringLiteral("Change URL…"), remotesPanel);
     auto *removeRemoteButton = new QPushButton(QStringLiteral("Remove Remote…"), remotesPanel);
+    auto *createRepositoryButton = new QPushButton(QStringLiteral("Create Repository on Remote…"), remotesPanel);
     remoteActions->addWidget(addRemoteButton);
     remoteActions->addWidget(editRemoteButton);
     remoteActions->addWidget(removeRemoteButton);
+    remoteActions->addWidget(createRepositoryButton);
     remoteActions->addStretch(1);
     remotesLayout->addLayout(remoteActions);
     rightTabs->addTab(commandPanel, QStringLiteral("Git Command"));
     rightTabs->addTab(remotesPanel, QStringLiteral("Remotes"));
     connect(addRemoteButton, &QPushButton::clicked, this, [this] { addRemote(); });
+    connect(createRepositoryButton, &QPushButton::clicked, this, [this] { createRemoteRepository(); });
     connect(editRemoteButton, &QPushButton::clicked, this, [this] {
         if (remotesList->currentItem()) changeRemoteUrl(remotesList->currentItem()->data(Qt::UserRole).toString());
     });
@@ -2977,6 +3021,80 @@ void GitWorkspaceWindow::addRemote()
     const QString url = QInputDialog::getText(this, QStringLiteral("Add Git remote"), QStringLiteral("Fetch URL:"),
         QLineEdit::Normal, QString(), &accepted).trimmed();
     if (accepted && !url.isEmpty()) runGit({QStringLiteral("remote"), QStringLiteral("add"), name, url});
+}
+
+void GitWorkspaceWindow::createRemoteRepository()
+{
+    // Keep provider selection explicit so additional Git hosting services can be
+    // added here without tying this workflow to GitHub's command line.
+    const QStringList providers{QStringLiteral("GitHub")};
+    bool accepted = false;
+    const QString provider = QInputDialog::getItem(this, QStringLiteral("Create remote repository"),
+        QStringLiteral("Git service:"), providers, 0, false, &accepted);
+    if (!accepted || provider.isEmpty()) return;
+    const QString gh = QStandardPaths::findExecutable(QStringLiteral("gh"));
+    if (gh.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("GitHub CLI required"),
+            QStringLiteral("Install the GitHub CLI (gh) and sign in with “gh auth login” to create GitHub repositories."));
+        return;
+    }
+    const QString suggestedName = QFileInfo(repoPath).fileName();
+    const QString repositoryName = QInputDialog::getText(this, QStringLiteral("Create GitHub repository"),
+        QStringLiteral("Repository name (or owner/name):"), QLineEdit::Normal, suggestedName, &accepted).trimmed();
+    if (!accepted || repositoryName.isEmpty()) return;
+    const QStringList visibilityOptions{QStringLiteral("Private"), QStringLiteral("Public")};
+    const QString visibility = QInputDialog::getItem(this, QStringLiteral("Repository visibility"),
+        QStringLiteral("Visibility:"), visibilityOptions, 0, false, &accepted);
+    if (!accepted) return;
+    const QStringList existingRemotes = gitOutput({QStringLiteral("remote")}).split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    const QString suggestedRemote = existingRemotes.contains(QStringLiteral("origin"))
+        ? QStringLiteral("github") : QStringLiteral("origin");
+    const QString remoteName = QInputDialog::getText(this, QStringLiteral("Add GitHub remote"),
+        QStringLiteral("Local remote name:"), QLineEdit::Normal, suggestedRemote, &accepted).trimmed();
+    if (!accepted || remoteName.isEmpty()) return;
+    if (existingRemotes.contains(remoteName)) {
+        QMessageBox::warning(this, QStringLiteral("Remote already exists"),
+            QStringLiteral("A remote named %1 already exists. Choose another name or remove that remote first.").arg(remoteName));
+        return;
+    }
+    const bool pushNow = QMessageBox::question(this, QStringLiteral("Push local branch"),
+        QStringLiteral("Push the current branch to the new GitHub repository after creating it?"),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes;
+    QStringList arguments{QStringLiteral("repo"), QStringLiteral("create"), repositoryName,
+        visibility == QStringLiteral("Private") ? QStringLiteral("--private") : QStringLiteral("--public"),
+        QStringLiteral("--source"), repoPath, QStringLiteral("--remote"), remoteName};
+    if (pushNow) arguments.append(QStringLiteral("--push"));
+    QProgressDialog progress(QStringLiteral("Creating GitHub repository…"), QStringLiteral("Cancel"), 0, 0, this);
+    progress.setWindowTitle(QStringLiteral("GitHub"));
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setCancelButton(nullptr);
+    progress.show();
+    QProcess process;
+    process.setProgram(gh);
+    process.setArguments(arguments);
+    process.setWorkingDirectory(repoPath);
+    process.start();
+    if (!process.waitForStarted(3000)) {
+        progress.close();
+        QMessageBox::critical(this, QStringLiteral("Could not start GitHub CLI"), process.errorString());
+        return;
+    }
+    while (process.state() != QProcess::NotRunning) {
+        process.waitForFinished(100);
+        QCoreApplication::processEvents();
+    }
+    progress.close();
+    const QString output = QString::fromLocal8Bit(process.readAllStandardOutput()).trimmed();
+    const QString error = QString::fromLocal8Bit(process.readAllStandardError()).trimmed();
+    if (process.exitCode() != 0) {
+        QMessageBox::critical(this, QStringLiteral("GitHub repository creation failed"),
+            error.isEmpty() ? output : error);
+        return;
+    }
+    appendOutput(output.isEmpty() ? QStringLiteral("Created GitHub repository %1").arg(repositoryName) : output);
+    refreshRemotes();
+    QMessageBox::information(this, QStringLiteral("Repository created"),
+        QStringLiteral("Created %1 on GitHub and added it as remote %2.").arg(repositoryName, remoteName));
 }
 
 void GitWorkspaceWindow::changeRemoteUrl(const QString &name)

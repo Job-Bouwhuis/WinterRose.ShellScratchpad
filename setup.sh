@@ -348,6 +348,10 @@ if [[ -x "${APP_EXECUTABLE}" && -f "${SERVICE_MENU_FILE}" ]]; then
             print "Exec=\"" exec_path "\" --clone-repository-into %f"
             next
         }
+        /^Exec=shell-scratchpad --init-repository-in %f$/ {
+            print "Exec=\"" exec_path "\" --init-repository-in %f"
+            next
+        }
         { print }
     ' "${SERVICE_MENU_FILE}" > "${SERVICE_MENU_TEMP}"
     install -m 0755 "${SERVICE_MENU_TEMP}" "${SERVICE_MENU_FILE}"

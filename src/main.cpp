@@ -6358,6 +6358,11 @@ int main(int argc, char *argv[])
         QStringLiteral("Clone a Git repository into a new subfolder of the selected directory."),
         QStringLiteral("directory"));
     parser.addOption(cloneRepositoryOption);
+    QCommandLineOption initRepositoryOption(
+        QStringLiteral("init-repository-in"),
+        QStringLiteral("Create a new Git repository in the selected directory."),
+        QStringLiteral("directory"));
+    parser.addOption(initRepositoryOption);
     parser.addPositionalArgument(QStringLiteral("script"),
                                  QStringLiteral("Open a Bash script file."));
     parser.process(application);
@@ -6394,6 +6399,17 @@ int main(int argc, char *argv[])
         else if (targetDirectory.startsWith(QStringLiteral("~/")))
             targetDirectory = QDir::home().filePath(targetDirectory.mid(2));
         if (!ShellScratchpad::Git::GitWorkspaceWindow::showCloneDialog(targetDirectory))
+            return 0;
+        return application.exec();
+    }
+
+    if (parser.isSet(initRepositoryOption)) {
+        QString targetDirectory = parser.value(initRepositoryOption).trimmed();
+        if (targetDirectory == QStringLiteral("~"))
+            targetDirectory = QDir::homePath();
+        else if (targetDirectory.startsWith(QStringLiteral("~/")))
+            targetDirectory = QDir::home().filePath(targetDirectory.mid(2));
+        if (!ShellScratchpad::Git::GitWorkspaceWindow::showInitDialog(targetDirectory))
             return 0;
         return application.exec();
     }
