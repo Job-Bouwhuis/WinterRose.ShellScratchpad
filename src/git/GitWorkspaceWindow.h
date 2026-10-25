@@ -160,7 +160,8 @@ private:
     void showHistoryOverview();
     void refreshRemotes();
     void refreshIdentity();
-    void createBranchFromHere(const QString &branch, bool remote, bool temporaryMerge = false);
+    void createBranchFromHere(const QString &branch, bool remote, bool temporaryMerge = false,
+                              const QString &sourceToMerge = QString());
     void acceptTemporaryMergeBranch(const QString &branch);
     void switchToBranch(const QString &branch, bool remote);
     void showBranchContextMenu(const QString &branch, bool remote, const QPoint &globalPosition);
